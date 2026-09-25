@@ -1,0 +1,109 @@
+"""Human-readable reports, without terminal or filesystem side effects."""
+
+from .application import Inspection, StoryStatus
+from .state import PublicationStatus
+from .browser.substack import AuthenticationState, SessionResult
+
+
+def format_substack_session(result: SessionResult) -> str:
+    labels = {
+        AuthenticationState.AUTHENTICATED: "Authenticated",
+        AuthenticationState.NOT_AUTHENTICATED: "Not authenticated",
+        AuthenticationState.UNKNOWN: "Unknown (could not verify authentication)",
+    }
+    lines = ["Substack session", "", "Publication:", result.publication_url, "",
+             f"Authentication: {labels[result.authentication]}", "",
+             "Browser profile:", str(result.profile)]
+    if result.authentication == AuthenticationState.AUTHENTICATED:
+        lines += ["", "A reusable authenticated browser session was detected."]
+    else:
+        lines += ["", "Run:", "", "publish-to-all substack-login", "",
+                  "to authenticate manually and check again."]
+    if result.diagnostics is not None:
+        diagnostic = result.diagnostics
+        lines += ["", "Final URL (sensitive components redacted):", diagnostic.final_url,
+                  "", "Page title:", diagnostic.title, "", "Visible controls:",
+                  *[f"- {label}" for label in diagnostic.controls]]
+        if not diagnostic.controls:
+            lines += ["- No recognized controls"]
+        lines += ["", "Diagnostic screenshot (text and images redacted):",
+                  str(diagnostic.screenshot) if diagnostic.screenshot else "Unavailable (capture failed)"]
+    return "\n".join([*lines, "", "No draft was created.", "Nothing was published."])
+
+
+def _warnings(result: Inspection) -> list[str]:
+    return [f"Warning: {warning}" for warning in result.story.warnings]
+
+
+def format_check(result: Inspection) -> str:
+    story = result.story
+    status = " with warnings" if story.warnings else ""
+    config_status = "OK" if result.config.publication_url else "Not configured (offline check)"
+    lines = [
+        f"Story check passed{status}", "",
+        f"Story: {story.source.name}", f"Title: {story.metadata.title}",
+        f"Image: {story.image.name if story.image else 'none'}",
+        f"Words: {story.word_count}", f"Content hash: {story.source_hash}", "",
+        f"Substack configuration: {config_status}",
+    ]
+    if story.warnings:
+        lines += ["", *_warnings(result)]
+    return "\n".join([*lines, "", "No files were modified.", "Nothing was published."])
+
+
+def format_preview(result: Inspection) -> str:
+    story = result.story
+    metadata = story.metadata
+    lines = ["Story detected", "", f"File: {story.source.name}", f"Title: {metadata.title}"]
+    for field in ("subtitle", "description", "series", "episode", "tags"):
+        value = getattr(metadata, field)
+        if value is not None and value != ():
+            value = ", ".join(value) if field == "tags" else value
+            lines.append(f"{field.capitalize()}: {value}")
+    lines += [f"Words: {story.word_count}", f"Image: {story.image.name if story.image else 'none'}",
+              "", "Destination", "", "Substack"]
+    if result.config.publication_url:
+        lines += [f"Publication: {result.config.publication_url}", "Status: Ready (local validation only)"]
+    else:
+        lines += ["Status: Not configured (offline preview)"]
+    lines += ["", "Content hash:", story.source_hash]
+    if story.warnings:
+        lines += ["", *_warnings(result)]
+    return "\n".join([*lines, "", "Nothing was published."])
+
+
+STATUS_LABELS = {
+    PublicationStatus.NOT_STARTED: "Not started",
+    PublicationStatus.DRAFT_CREATING: "Draft creation in progress (reconciliation required before retry)",
+    PublicationStatus.DRAFT_CREATED: "Draft created",
+    PublicationStatus.PUBLISHING: "Publishing in progress (reconciliation required before retry)",
+    PublicationStatus.PUBLISHED: "Published",
+    PublicationStatus.FAILED: "Failed",
+}
+
+
+def format_substack_draft(result: StoryStatus) -> str:
+    return "\n".join([
+        "Substack draft created", "", "Story:", result.story.metadata.title, "",
+        "Added:", "Title", "", "Not added yet:", "Story body", "Image", "",
+        "Draft URL:", result.substack.draft_url or "Not available", "",
+        "Status:", "Draft created", "", "Nothing was published.",
+    ])
+
+
+def format_status(result: StoryStatus) -> str:
+    story, record = result.story, result.substack
+    status = record.status if record else PublicationStatus.NOT_STARTED
+    lines = ["Story status", "", f"File: {story.source.name}",
+             f"Title: {story.metadata.title}", f"Hash: {story.source_hash}", "",
+             f"Substack: {STATUS_LABELS[status]}"]
+    if record:
+        if record.draft_url:
+            lines.append(f"Draft: {record.draft_url}")
+        if record.published_url:
+            lines.append(f"Published: {record.published_url}")
+        if record.error_message:
+            lines.append(f"Error: {record.error_message}")
+        if record.needs_reconciliation:
+            lines.append("Reconciliation required before retrying: a remote draft may exist.")
+    return "\n".join([*lines, "", "Nothing was published by this command."])
