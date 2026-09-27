@@ -4,12 +4,12 @@ A local Python utility for preparing a finished Markdown story and its cover
 image for publishing destinations. Phase 1 targets Substack drafts for manual
 review, with no automatic final publication.
 
-**Current milestone: title-only Substack drafts.** Local checks, preview,
-versioned SQLite publication state, manual login, and saved-session verification
-are implemented. `publish-to-all substack` creates a draft containing **title
-only**. It deliberately does not add the story body or image and never publishes,
-sends, schedules, or configures publication settings. A live draft has not been
-created during development of this stage.
+**Current milestone: guarded title, body, and cover stages for a linked Substack draft.**
+`publish-to-all substack` still creates a title-only draft. The separate
+`publish-to-all substack-title` command repairs an empty title on an existing
+linked draft, `publish-to-all substack-body` adds the parsed story body, and
+`publish-to-all substack-image` uploads its matching cover. None publishes,
+sends, schedules, or configures publication settings.
 
 ## Structure
 
@@ -28,7 +28,10 @@ src/publish_to_all/
     browser/session.py        # persistent Chromium lifecycle and failure screenshots
     browser/substack.py       # manual login and conservative authentication checks
     browser/editor.py         # guarded new-post navigation, title entry, save confirmation
-    publishers/substack.py    # title-only adapter and failure recovery
+    browser/body.py           # body inspection, formatted insertion, save confirmation
+    browser/image.py          # cover inspection, file selection, save confirmation
+    browser/title.py          # empty-title inspection, insertion, save confirmation
+    publishers/substack.py    # draft, title, body, and cover workflows
     publishers/base.py        # abstract provider contract using validated Story
 tests/                       # configuration, story, state, and CLI tests
 config.example.toml
@@ -104,8 +107,9 @@ malformed YAML, invalid UTF-8, and empty article bodies produce clear errors.
 Paragraphs, headings, emphasis, block quotes, ordered/unordered lists,
 horizontal rules, and links are parsed into Markdown tokens and rendered as
 HTML. Raw HTML is escaped. Word counts are approximate counts of parsed text,
-excluding markup and link destinations. Rendering here does not yet establish
-how formatting will transfer into the live Substack editor.
+excluding markup and link destinations. The body command inserts this rendered
+representation in one editor operation instead of typing a long story one
+character at a time.
 
 An existing invalid or unreadable cover is an error. Its contents must match its
 extension. Validation does not fetch links or embedded Markdown images.
@@ -169,7 +173,7 @@ automatically when opening the database repository. Browser commands create the
 Substack profile directory; diagnostics are created on browser failure if a page
 can be captured. The logs directory remains reserved.
 
-The current schema version is **2**, stored in SQLite's `PRAGMA user_version`.
+The current schema version is **5**, stored in SQLite's `PRAGMA user_version`.
 Ordered migrations run transactionally when opening the database; a newer,
 unsupported version fails clearly without downgrading it. Tests use temporary
 databases and isolated XDG directories, never the user's application database.
@@ -177,13 +181,17 @@ databases and isolated XDG directories, never the user's application database.
 Story rows contain an internal ID, latest observed source filename/title, unique
 source hash, creation time, and last-seen time. Publication rows represent
 individual attempts with a story ID, destination, status, optional draft and
-published URLs, creation/update/attempt timestamps, and an optional sanitized
-error, and a reconciliation-required flag. Version 2 adds that flag while
-preserving existing records. Timestamps are UTC ISO 8601 values. Attempt time is when that attempt was
+published URLs, creation/update/attempt timestamps, body and image stage state
+and timestamps, optional sanitized errors, and a reconciliation-required flag.
+Version 3 adds body-insertion tracking. Version 4 adds an audit table for
+cross-version publication reassociations while preserving existing records.
+Version 5 adds cover-image upload tracking.
+Timestamps are UTC ISO 8601 values. Attempt time is when that attempt was
 reserved; transitions update its update time. Retries create new attempt rows,
 preserving history. No unused destination records are created. The generic
 destination field can later support `medium`, `royalroad`, or `hugo` as well as
-`substack`; the Substack provider currently prepares title-only drafts.
+`substack`; the Substack provider prepares title-only drafts and can add the
+body to an already-linked draft in a separate guarded step.
 
 The Markdown file remains canonical. The database stores no story body,
 passwords, cookies, tokens, credentials, or browser-session data. Future adapters
@@ -212,10 +220,21 @@ retains known URLs, which continue to block duplicate creation. Reconciliation
 can record a recovered draft or publication on the original failed attempt.
 These are local bookkeeping operations only; none performs a network request.
 
+Body insertion has its own `not_started`, `body_inserting`, `body_inserted`, and
+`body_insertion_failed` state on the same publication record. The exact draft URL
+and story hash association remain intact. An uncertain body result sets the
+reconciliation flag and blocks another automatic insertion; the full body is
+never stored in SQLite.
+
+Cover upload has its own `image_not_started`, `image_uploading`, `image_uploaded`,
+and `image_upload_failed` state. An upload is eligible only after body insertion
+is complete. Once file selection begins, any uncertain outcome requires manual
+inspection and blocks automatic re-upload. SQLite stores no image bytes.
+
 The abstract publisher contract consumes the existing validated `Story`, a
 reserved publication record, and the repository. Draft preparation and final
 publication are separate methods so future providers can be implemented
-independently. No draft has been created by this application.
+independently. Final publication remains disabled.
 
 ## Installing Playwright
 
@@ -229,7 +248,7 @@ python -m playwright install chromium
 
 The dependency installation includes the Python Playwright package; the second
 command downloads its matching Chromium runtime. Repeat the browser installation
-when upgrading Playwright. All three Substack commands require a graphical desktop
+when upgrading Playwright. Substack browser commands require a graphical desktop
 because they launch a visible browser. On supported Linux systems, missing system
 libraries can be installed with `python -m playwright install-deps chromium`
 (this may require administrator privileges). See the official
@@ -420,8 +439,134 @@ UI. Custom-domain redirects to a different editor host also stop until that host
 can be safely tied to the configured publication. Live UI compatibility still
 requires your manual test; automated tests never use your real account or profile.
 
+## Reassociate an untouched draft after a local correction
+
+If a local title correction changes the story hash after an empty draft was
+created, explicitly transfer that untouched draft association to the current
+story version with the exact old hash:
+
+```bash
+publish-to-all substack-reassociate-version \
+  --from-hash OLD_EXACT_STORY_HASH
+```
+
+This is a local SQLite transaction. It does not open a browser or contact
+Substack. It requires exactly one old Substack record in `draft_created`, a
+numeric draft editor URL, untouched body state, no publication, in-progress,
+error, or reconciliation state, no Substack record on the current hash, and one
+local owner for the draft URL. The publication row moves to the current story
+version; the old story row remains and a separate audit row records the transfer.
+The new version keeps duplicate protection and the old version no longer owns
+the active draft association. Any failed precondition rolls the transaction back.
+
+## Repair an empty title on the linked Substack draft
+
+Use the dedicated repair command when the exact current story already owns a
+numeric `draft_created` URL but that draft's title is empty:
+
+```bash
+publish-to-all substack-title
+```
+
+The command recalculates the current Markdown hash, loads only its existing
+Substack record, and opens only the stored numeric editor URL through the saved
+authenticated profile. It refuses missing, stale, failed, ambiguous, published,
+or reconciliation-required state. It never enters the new-post creation flow.
+
+Before editing, it requires stable evidence of the intended authenticated draft
+editor and confirms that both the editable title and body are empty. It inserts
+the exact parsed front-matter title without changing the Markdown source. A
+nonempty title is reported and never overwritten. Existing or uncertain body
+content also stops the command for manual review.
+
+The repair stays on the same editor page and requires the exact visible title
+plus a fresh bounded autosave signal. It does not reload, reopen, or navigate
+away after insertion. It does not touch the body, upload an image, change any
+settings, or click Continue, Publish, Send, or Schedule. Nothing is published.
+Rate limiting stops the command immediately without retrying. If rate limiting
+or another failure occurs after editing begins, the retained draft association
+is marked for manual reconciliation because the title may or may not have saved.
+
+## Add the body to the linked Substack draft
+
+Run this only after the exact current story has a reconciled `draft_created`
+record with a numeric editor URL:
+
+```bash
+publish-to-all substack-body
+```
+
+This command never uses the new-post flow. It validates the current Markdown,
+recalculates its exact source hash, loads the matching publication record, and
+requires a linked URL with no failed or reconciliation-required condition. It
+opens exactly that URL with the saved persistent browser profile and requires a
+stable authenticated draft editor, the configured publication host, an editable
+title and body, multiple creator controls, and the exact visible story title.
+
+Before writing, it classifies the existing rendered body. An empty editor may
+proceed. Minimal, substantial, unknown, or already matching body content stops
+the command for manual review, so it neither appends a duplicate nor clears or
+overwrites remote text. The parsed Markdown body excludes YAML front matter and
+is inserted as rendered HTML, preserving paragraphs, headings, bold, italics,
+block quotes, lists, horizontal rules, and links. The source Markdown is not
+changed.
+
+After the one-shot insertion, the command waits on the same page for an exact
+rendered-body check and a fresh `Saving` to `Saved` transition or equivalent
+fresh saved state. It does not reload, reopen the editor, navigate away, retry,
+or click Continue, Publish, Send, or Schedule. It does not upload the cover
+image or change the title, audience, or publication settings. Nothing is
+published.
+
+HTTP 429 or an exact rendered `Too many requests` signal stops the command
+immediately without navigation or retry. If insertion has begun, the draft may
+contain some or all of the story; local state is marked conservatively to block
+another automatic insertion. Use `substack-inspect-draft` with the retained URL
+to inspect an uncertain result before any recovery.
+
+## Upload the cover image to the linked Substack draft
+
+Run the dedicated cover stage only after the story body has been inserted:
+
+```bash
+publish-to-all substack-image
+```
+
+The command operates only on the numeric draft URL already linked to the exact
+current Markdown hash. It requires `draft_created`, `body_inserted`, a readable
+same-stem image, one unique local owner for the URL, no unresolved error or
+reconciliation condition, and an authenticated persistent Substack session. It
+opens that stored draft directly and never enters new-post creation.
+
+Before file selection, it verifies the exact visible title, a substantially
+populated editable body, stable draft-editor controls, and the configured host.
+It inspects only the main post cover/hero area. An existing cover is never
+replaced, and an uncertain cover state stops for manual review. Inline-body and
+social-preview upload controls are not used.
+
+The original matching image is selected unchanged through the editor's semantic
+cover file control. The command stays on the same draft while it confirms cover
+appearance, the preserved title and body, and a fresh `Saved` signal. It never
+clicks Continue, Publish, Send, or Schedule and does not publish. Confirmed
+success prevents a second upload. Any uncertain failure after file selection,
+including HTTP 429, retains the draft and body state while blocking automatic
+retry until the remote cover is inspected manually.
+
 
 ### Reconcile an uncertain Substack attempt
+
+Inspect any known numeric draft editor URL without changing the draft or SQLite:
+
+```bash
+publish-to-all substack-inspect-draft --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/123456"
+```
+
+The report includes the visible title, an `empty`/`minimal`/`partial`/`substantial`
+classification of editable body text, whether an editor or cover image is visible,
+the visible save state, conservative draft-editor verification, and allowlisted
+URL/title diagnostics. Run it once for each draft you want to compare. It does not
+type, click editor controls, upload, reload, or access SQLite. HTTP 429 and rendered
+`Too many requests` evidence stop inspection immediately without retrying.
 
 From the project directory, with the virtual environment active, run:
 
@@ -465,9 +610,23 @@ explicit draft-editor evidence before linking the existing failed attempt. It ne
 edits the page or clicks Publish, Send, Schedule, or similar controls. Malformed,
 different-domain, public-post, inaccessible, published, and ambiguous pages leave
 SQLite unchanged. A successful link records the sanitized editor URL, moves the
-same attempt to `draft_created`, clears its reconciliation-required flag, preserves
-its failure history and original attempt timestamps, updates its modification
+same attempt to `draft_created`, clears its reconciliation-required flag and
+resolved current error, preserves its original attempt timestamps, updates its modification
 timestamp, and keeps duplicate protection active.
+
+When the exact current story already has a linked `draft_created` record, supplying
+another verified URL alone leaves that association unchanged. Replace only the
+local association with the explicit flag:
+
+```bash
+publish-to-all substack-reconcile \
+  --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/654321" \
+  --replace-linked-draft
+```
+
+This compare-and-set update applies only to the current story hash and its existing
+Substack record. It does not modify or delete either remote draft, and the updated
+record continues to block duplicate creation.
 
 The `Open new-post editor` step recognizes exact accessible creation labels
 including `New post`, `Create post`, `Create`, `Write`, `Write a post`, and

@@ -73,6 +73,24 @@ def test_status_database_error_without_traceback(project, capsys):
     assert not output.out
 
 
+def test_status_after_reconciliation_omits_resolved_error(project, capsys):
+    story = load_story(project / "In")
+    repository = PublicationRepository(runtime_paths(project).database)
+    attempt = repository.begin_attempt(story, "substack")
+    failed = repository.mark_failed(
+        attempt.id, "Confirm draft save failed", needs_reconciliation=True,
+    )
+    repository.reconcile_failed_draft(failed, "https://example.com/publish/post/123")
+
+    assert main(["status"]) == 0
+    output = capsys.readouterr().out
+    assert "Substack: Draft created" in output
+    assert "Draft: https://example.com/publish/post/123" in output
+    assert "Error:" not in output
+    assert "Reconciliation required" not in output
+    assert output.endswith("Nothing was published by this command.\n")
+
+
 @pytest.mark.parametrize("command", ["check", "preview"])
 def test_readonly_commands_do_not_create_runtime_state(project, command):
     paths = runtime_paths(project)

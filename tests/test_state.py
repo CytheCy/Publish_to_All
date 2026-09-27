@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from publish_to_all.state import (
-    DuplicatePublicationError, PublicationRepository, PublicationStatus as Status,
+    BodyStatus, DuplicatePublicationError, PublicationRepository, PublicationStatus as Status,
     SCHEMA_VERSION, StateError,
 )
 from publish_to_all.story import load_story
@@ -26,12 +26,182 @@ def repository(tmp_path):
 
 def test_initialize_and_reopen(repository):
     with sqlite3.connect(repository.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
         assert connection.execute("SELECT count(*) FROM stories").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM publications").fetchone()[0] == 0
         columns = {row[1] for row in connection.execute("PRAGMA table_info(stories)")}
         assert "markdown" not in columns and "body" not in columns
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'publication_reassociations'"
+        ).fetchone() is not None
     PublicationRepository(repository.path)
+
+
+def test_safe_draft_version_reassociation_preserves_history_and_duplicate_protection(
+        repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    corrected = replace(
+        story, source_hash='corrected-hash',
+        metadata=replace(story.metadata, title='Corrected title'),
+    )
+
+    result = repository.reassociate_draft_version(story.source_hash, corrected, 'substack')
+
+    assert result.publication.id == draft.id
+    assert result.publication.story_id == result.to_story.id
+    assert result.from_story.source_hash == story.source_hash
+    assert result.to_story.source_hash == corrected.source_hash
+    assert repository.get_story(story.source_hash) == result.from_story
+    assert repository.get_publication(story.source_hash, 'substack') is None
+    assert repository.get_publication(corrected.source_hash, 'substack') == result.publication
+    assert repository.find_duplicate(corrected.source_hash, 'substack') == result.publication
+    with pytest.raises(DuplicatePublicationError):
+        repository.begin_attempt(corrected, 'substack')
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute(
+            'SELECT count(*) FROM stories WHERE source_hash IN (?, ?)',
+            (story.source_hash, corrected.source_hash),
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            'SELECT count(*) FROM publications WHERE rtrim(draft_url, "/") = ?',
+            (draft.draft_url,),
+        ).fetchone()[0] == 1
+        audit = connection.execute(
+            '''SELECT publication_id, from_story_id, to_story_id, destination, draft_url
+               FROM publication_reassociations'''
+        ).fetchone()
+        assert audit == (
+            draft.id, result.from_story.id, result.to_story.id, 'substack', draft.draft_url,
+        )
+
+
+@pytest.mark.parametrize('unsafe_state,message', [
+    ('body_started', 'body is not untouched'),
+    ('published', 'must be draft_created'),
+    ('reconciliation', 'requires reconciliation'),
+])
+def test_draft_version_reassociation_refuses_unsafe_old_state(
+        repository, story, unsafe_state, message):
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    if unsafe_state == 'body_started':
+        repository.mark_body_inserting(draft)
+    elif unsafe_state == 'published':
+        repository.mark_published(draft.id, 'https://example.substack.com/p/story')
+    else:
+        with sqlite3.connect(repository.path) as connection:
+            connection.execute(
+                'UPDATE publications SET needs_reconciliation = 1 WHERE id = ?', (draft.id,),
+            )
+    corrected = replace(story, source_hash='corrected-hash')
+
+    with pytest.raises(StateError, match=message):
+        repository.reassociate_draft_version(story.source_hash, corrected, 'substack')
+
+    assert repository.get_publication(story.source_hash, 'substack') is not None
+    assert repository.get_story(corrected.source_hash) is None
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute('SELECT count(*) FROM publication_reassociations').fetchone()[0] == 0
+
+
+def test_draft_version_reassociation_refuses_existing_new_record(repository, story):
+    old = repository.begin_attempt(story, 'substack')
+    repository.mark_draft_created(old.id, 'https://example.substack.com/publish/post/123')
+    corrected = replace(story, source_hash='corrected-hash')
+    existing = repository.begin_attempt(corrected, 'substack')
+    repository.mark_failed(existing.id, 'No remote draft was created')
+
+    with pytest.raises(StateError, match='current story version already has'):
+        repository.reassociate_draft_version(story.source_hash, corrected, 'substack')
+
+    assert repository.get_publication(story.source_hash, 'substack').id == old.id
+
+
+def test_draft_version_reassociation_refuses_ambiguous_old_records(repository, story):
+    historical = repository.begin_attempt(story, 'substack')
+    repository.mark_failed(historical.id, 'No remote draft was created')
+    current = repository.begin_attempt(story, 'substack')
+    repository.mark_draft_created(current.id, 'https://example.substack.com/publish/post/123')
+
+    with pytest.raises(StateError, match='exactly one.*found 2'):
+        repository.reassociate_draft_version(
+            story.source_hash, replace(story, source_hash='corrected-hash'), 'substack',
+        )
+
+
+def test_draft_version_reassociation_requires_distinct_explicit_hash(repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    repository.mark_draft_created(attempt.id, 'https://example.substack.com/publish/post/123')
+    with pytest.raises(StateError, match='supplied explicitly'):
+        repository.reassociate_draft_version('', replace(story, source_hash='new'), 'substack')
+    with pytest.raises(StateError, match='identical'):
+        repository.reassociate_draft_version(story.source_hash, story, 'substack')
+
+
+def test_body_insertion_lifecycle_retains_link_and_duplicate_protection(repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    assert repository.require_body_candidate(story.source_hash, 'substack') == draft
+    active = repository.mark_body_inserting(draft)
+    assert active.body_status == BodyStatus.INSERTING
+    inserted = repository.mark_body_inserted(active.id)
+    assert inserted.body_status == BodyStatus.INSERTED
+    assert inserted.draft_url == draft.draft_url
+    assert inserted.body_started_at and inserted.body_inserted_at
+    assert repository.find_duplicate(story.source_hash, 'substack') == inserted
+    with pytest.raises(StateError, match='already recorded'):
+        repository.require_body_candidate(story.source_hash, 'substack')
+
+
+def test_uncertain_body_insertion_blocks_retry(repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    active = repository.mark_body_inserting(draft)
+    failed = repository.mark_body_insertion_failed(active.id, 'Uncertain remote body')
+    assert failed.body_status == BodyStatus.FAILED
+    assert failed.needs_reconciliation
+    assert failed.draft_url == draft.draft_url
+    assert failed.body_error_message == 'Uncertain remote body'
+    with pytest.raises(StateError, match='reconciliation'):
+        repository.require_body_candidate(story.source_hash, 'substack')
+
+
+@pytest.mark.parametrize('condition,message', [
+    ('wrong_status', 'draft_created'), ('missing_url', 'no linked draft URL'),
+    ('reconciliation', 'requires reconciliation'), ('failed', 'unresolved failed attempt'),
+])
+def test_body_candidate_preflight_refusals(repository, story, condition, message):
+    attempt = repository.begin_attempt(story, 'substack')
+    if condition == 'wrong_status':
+        pass
+    else:
+        draft = repository.mark_draft_created(
+            attempt.id, None if condition == 'missing_url' else 'https://example.substack.com/publish/post/123',
+        )
+        if condition in {'reconciliation', 'failed'}:
+            with sqlite3.connect(repository.path) as connection:
+                connection.execute(
+                    'UPDATE publications SET needs_reconciliation = ?, error_message = ? WHERE id = ?',
+                    (condition == 'reconciliation', 'old failure' if condition == 'failed' else None, draft.id),
+                )
+    with pytest.raises(StateError, match=message):
+        repository.require_body_candidate(story.source_hash, 'substack')
+
+
+def test_body_candidate_requires_exact_hash(repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    repository.mark_draft_created(attempt.id, 'https://example.substack.com/publish/post/123')
+    with pytest.raises(StateError, match='exact story version'):
+        repository.require_body_candidate('different-hash', 'substack')
 
 
 def test_registration_hash_identity_and_timestamps(repository, story):
@@ -104,6 +274,35 @@ def test_failed_publish_preserves_remote_copy(repository, story):
         repository.begin_attempt(story, "substack")
     recovered = repository.mark_draft_created(attempt.id, failed.draft_url)
     assert recovered.error_message is None
+
+
+def test_successful_reconciliation_clears_current_error_and_preserves_history(
+        repository, story):
+    historical = repository.begin_attempt(story, "substack")
+    historical = repository.mark_failed(historical.id, "Earlier failure")
+    attempt = repository.begin_attempt(story, "substack")
+    failed = repository.mark_failed(
+        attempt.id, "Confirm draft save failed", needs_reconciliation=True,
+    )
+    assert failed.error_message == "Confirm draft save failed"
+
+    recovered = repository.reconcile_failed_draft(
+        failed, "https://example.substack.com/publish/post/123",
+    )
+
+    assert recovered.status == Status.DRAFT_CREATED
+    assert recovered.error_message is None
+    assert recovered.draft_url == "https://example.substack.com/publish/post/123"
+    assert not recovered.needs_reconciliation
+    assert repository.get_publication(story.source_hash, "substack") == recovered
+    assert repository.find_duplicate(story.source_hash, "substack") == recovered
+    with pytest.raises(DuplicatePublicationError):
+        repository.begin_attempt(story, "substack")
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute(
+            "SELECT status, error_message FROM publications WHERE id = ?",
+            (historical.id,),
+        ).fetchone() == ("failed", "Earlier failure")
 
 
 def test_duplicate_checks_all_attempts(repository, story):

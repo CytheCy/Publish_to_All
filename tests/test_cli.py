@@ -6,6 +6,9 @@ from PIL import Image
 import pytest
 
 from publish_to_all.cli import main
+from publish_to_all.config import runtime_paths
+from publish_to_all.state import PublicationRepository
+from publish_to_all.story import load_story
 
 
 @pytest.fixture
@@ -109,3 +112,42 @@ def test_console_entry_point(project):
             assert "check" in result.stdout and "preview" in result.stdout
     (project / "In/date.md").write_text("No title")
     assert subprocess.run([executable, "check"], capture_output=True).returncode == 1
+
+
+def test_substack_reassociate_version_is_local_only(project, monkeypatch, capsys):
+    monkeypatch.setenv('XDG_DATA_HOME', str(project.parent / f'{project.name}-runtime-data'))
+    monkeypatch.setenv('XDG_STATE_HOME', str(project.parent / f'{project.name}-runtime-state'))
+    old_story = load_story(project / 'In')
+    repository = PublicationRepository(runtime_paths(project).database)
+    attempt = repository.begin_attempt(old_story, 'substack')
+    draft_url = 'https://example.substack.com/publish/post/123'
+    repository.mark_draft_created(attempt.id, draft_url)
+    (project / 'In/date.md').write_text(
+        '---\ntitle: The Last Tree, Corrected\n---\nHello world.'
+    )
+    current_story = load_story(project / 'In')
+    assert current_story.source_hash != old_story.source_hash
+
+    def remote_call_forbidden(*args, **kwargs):
+        raise AssertionError('purely local reassociation attempted a browser call')
+
+    monkeypatch.setattr('publish_to_all.application.persistent_browser', remote_call_forbidden)
+    monkeypatch.setattr('publish_to_all.application.verify_page', remote_call_forbidden)
+
+    assert main([
+        'substack-reassociate-version', '--from-hash', old_story.source_hash,
+    ]) == 0
+
+    output = capsys.readouterr()
+    assert not output.err
+    for text in (
+        'Substack draft reassociated to corrected story version',
+        f'Old hash:\n{old_story.source_hash}',
+        f'New hash:\n{current_story.source_hash}',
+        f'Draft:\n{draft_url}',
+        'Remote draft was not modified.',
+        'Nothing was published.',
+    ):
+        assert text in output.out
+    assert repository.get_publication(old_story.source_hash, 'substack') is None
+    assert repository.find_duplicate(current_story.source_hash, 'substack').draft_url == draft_url

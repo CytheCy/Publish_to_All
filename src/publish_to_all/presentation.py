@@ -1,7 +1,7 @@
 """Human-readable reports, without terminal or filesystem side effects."""
 
 from .application import Inspection, StoryStatus
-from .state import PublicationStatus
+from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationStatus
 from .browser.substack import AuthenticationState, SessionResult
 
 
@@ -99,6 +99,43 @@ def format_substack_draft(result: StoryStatus) -> str:
     ])
 
 
+def format_substack_body(result: StoryStatus) -> str:
+    return "\n".join([
+        "Substack draft body added", "", "Story:", result.story.metadata.title, "",
+        "Draft:", result.substack.draft_url, "", "Added:", "Story body", "",
+        "Not added yet:", "Cover image", "", "Status:", "Body inserted", "",
+        "Nothing was published.",
+    ])
+
+
+def format_substack_image(result: StoryStatus) -> str:
+    return "\n".join([
+        "Substack draft cover image uploaded", "", "Story:", result.story.metadata.title, "",
+        "Draft:", result.substack.draft_url, "", "Image:", result.story.image.name, "",
+        "Title:", "Preserved", "", "Body:", "Preserved", "", "Status:",
+        "Image uploaded", "", "Nothing was published.",
+    ])
+
+
+def format_substack_title(result: StoryStatus) -> str:
+    return "\n".join([
+        "Substack draft title repaired", "", "Story:", result.story.metadata.title, "",
+        "Draft:", result.substack.draft_url, "", "Title:", result.story.metadata.title, "",
+        "Body:", "Still empty", "", "Nothing was published.",
+    ])
+
+
+def format_substack_reassociation(result: PublicationReassociation) -> str:
+    return "\n".join([
+        "Substack draft reassociated to corrected story version", "",
+        "Old hash:", result.from_story.source_hash, "",
+        "New hash:", result.to_story.source_hash, "",
+        "Draft:", result.publication.draft_url, "",
+        "Remote draft was not modified.",
+        "Nothing was published.",
+    ])
+
+
 def format_status(result: StoryStatus) -> str:
     story, record = result.story, result.substack
     status = record.status if record else PublicationStatus.NOT_STARTED
@@ -114,4 +151,22 @@ def format_status(result: StoryStatus) -> str:
             lines.append(f"Error: {record.error_message}")
         if record.needs_reconciliation:
             lines.append("Reconciliation required before retrying: a remote draft may exist.")
+        if record.body_status != BodyStatus.NOT_STARTED:
+            body_labels = {
+                BodyStatus.INSERTING: 'Insertion in progress; inspect the draft before retrying',
+                BodyStatus.INSERTED: 'Inserted',
+                BodyStatus.FAILED: 'Insertion failed; inspect the draft before retrying',
+            }
+            lines.append(f"Body: {body_labels[record.body_status]}")
+        if record.body_error_message:
+            lines.append(f"Body error: {record.body_error_message}")
+        if record.image_status != ImageStatus.NOT_STARTED:
+            image_labels = {
+                ImageStatus.UPLOADING: 'Upload in progress; inspect the draft before retrying',
+                ImageStatus.UPLOADED: 'Uploaded',
+                ImageStatus.FAILED: 'Upload failed; inspect the draft before retrying',
+            }
+            lines.append(f"Image: {image_labels[record.image_status]}")
+        if record.image_error_message:
+            lines.append(f"Image error: {record.image_error_message}")
     return "\n".join([*lines, "", "Nothing was published by this command."])

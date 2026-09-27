@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlsplit
 from playwright.sync_api import Error as PlaywrightError
 
 from . import editor
+from . import image as cover_image
 from .session import safe_screenshot
 from .substack import AUTH_PATHS, authentication_evidence, rate_limit_evidence, trusted_page
 from ..errors import BrowserSessionError
@@ -26,6 +27,22 @@ class SuppliedDraftEvidence:
     reason: str
     rate_limited: bool = False
     diagnostics: 'SuppliedDraftDiagnostics | None' = None
+    inspection: 'DraftInspection | None' = None
+
+
+@dataclass(frozen=True)
+class DraftInspection:
+    draft_url: str
+    visible_title: str
+    body_classification: str
+    image_present: bool
+    editor_state: tuple[str, ...]
+    definitely_draft_editor: bool
+    final_url: str
+    page_title: str
+    controls: tuple[str, ...]
+    cover_state: str = 'unknown'
+    cover_diagnostics: cover_image.CoverDiagnostics = cover_image.CoverDiagnostics()
 
 
 @dataclass(frozen=True)
@@ -45,6 +62,11 @@ class _EditorSnapshot:
     title_field_present: bool = False
     editor_surface_present: bool = False
     controls: tuple[str, ...] = ()
+    visible_title: str | None = None
+    body_classification: str | None = None
+    image_present: bool = False
+    cover_state: str = 'unknown'
+    cover_diagnostics: cover_image.CoverDiagnostics = cover_image.CoverDiagnostics()
 
 
 def validate_supplied_draft_url(value: str, publication_url: str) -> str:
@@ -77,6 +99,7 @@ def _visible_text(page, pattern) -> bool:
 CONTROL_SIGNALS = (
     ('Draft', re.compile(r'^Draft$', re.I)),
     ('Saved', re.compile(r'^(Saved|Draft saved|All changes saved|Saved to drafts)$', re.I)),
+    ('Saving', re.compile(r'^Saving(?: changes)?(?:\.{3}|…)?$', re.I)),
     ('Preview', re.compile(r'^Preview$', re.I)),
     ('Continue', re.compile(r'^Continue$', re.I)),
     ('Publish', re.compile(r'^Publish(?: post)?$', re.I)),
@@ -96,7 +119,7 @@ def _visible_control_labels(page) -> tuple[str, ...]:
                    .or_(page.get_by_role('link', name=pattern))
                    .or_(page.get_by_role('menuitem', name=pattern)))
         role_visible = any(item.is_visible() for item in locator.all())
-        text_visible = label in {'Draft', 'Saved'} and _visible_text(page, pattern)
+        text_visible = label in {'Draft', 'Saved', 'Saving'} and _visible_text(page, pattern)
         if role_visible or text_visible:
             labels.append(label)
     return tuple(labels)
@@ -108,6 +131,42 @@ def _visible_editor_surface(page) -> bool:
         '[contenteditable="true"][role="textbox"]'
     )
     return any(item.is_visible() and item.is_editable() for item in surfaces.all())
+
+
+def classify_body(text: str) -> str:
+    """Classify normalized editable body text using deliberately broad bands."""
+    length = len(' '.join(text.split()))
+    if length == 0:
+        return 'empty'
+    if length <= 100:
+        return 'minimal'
+    if length <= 1000:
+        return 'partial'
+    return 'substantial'
+
+
+def _editor_contents(page, fields) -> tuple[str | None, str | None, bool]:
+    titles = {
+        editor.title_value(field).strip()
+        for field in fields if field.is_editable()
+    }
+    visible_title = next(iter(titles)) if len(titles) == 1 else None
+    surfaces = [
+        item for item in page.locator(
+            '.ProseMirror, [data-lexical-editor="true"], '
+            '[contenteditable="true"][role="textbox"]'
+        ).all()
+        if item.is_visible() and item.is_editable()
+    ]
+    bodies = [' '.join(surface.inner_text().split()) for surface in surfaces]
+    body = max(bodies, key=len) if bodies else None
+    images = page.locator(
+        '.ProseMirror img, [data-lexical-editor="true"] img, '
+        '[contenteditable="true"][role="textbox"] img, '
+        '[data-testid*="cover" i] img, [class*="cover" i] img'
+    )
+    image_present = any(item.is_visible() for item in images.all())
+    return visible_title, classify_body(body) if body is not None else None, image_present
 
 
 def _supplied_draft_snapshot(page, publication_url: str, draft_url: str) -> _EditorSnapshot:
@@ -130,6 +189,9 @@ def _supplied_draft_snapshot(page, publication_url: str, draft_url: str) -> _Edi
         editor_surface = _visible_editor_surface(page)
         controls = _visible_control_labels(page)
         published = _visible_text(page, re.compile(r'^(Published|Sent)$', re.I))
+        visible_title, body_classification, _body_or_cover_image = _editor_contents(page, fields)
+        cover = cover_image.inspect_cover(page)
+        image_present = cover.state == cover_image.CoverState.PRESENT
     except (BrowserSessionError, PlaywrightError) as exc:
         # Playwright locator errors are verification uncertainty, never grounds
         # for changing local state. Do not include page data in the error.
@@ -139,10 +201,11 @@ def _supplied_draft_snapshot(page, publication_url: str, draft_url: str) -> _Edi
     if published:
         return _EditorSnapshot(
             SuppliedDraftEvidence(False, 'The editor shows published-post status.'),
-            title_field, editor_surface, controls,
+            title_field, editor_surface, controls, visible_title, body_classification,
+            image_present, cover.state.value, cover.diagnostics,
         )
     categories = {
-        'status' if label in {'Draft', 'Saved'} else
+        'status' if label in {'Draft', 'Saved', 'Saving'} else
         'workflow' if label in {'Continue', 'Publish', 'Send', 'Schedule'} else
         'preview' if label == 'Preview' else
         'configuration' if label in {'Settings', 'Style', 'Audience'} else
@@ -152,11 +215,13 @@ def _supplied_draft_snapshot(page, publication_url: str, draft_url: str) -> _Edi
     if not (title_field or editor_surface) or len(categories) < 2:
         return _EditorSnapshot(
             SuppliedDraftEvidence(False, 'The page lacks enough corroborating draft-editor evidence.'),
-            title_field, editor_surface, controls,
+            title_field, editor_surface, controls, visible_title, body_classification,
+            image_present, cover.state.value, cover.diagnostics,
         )
     return _EditorSnapshot(
         SuppliedDraftEvidence(True, 'Editable post content and multiple creator controls are visible.'),
-        title_field, editor_surface, controls,
+        title_field, editor_surface, controls, visible_title, body_classification,
+        image_present, cover.state.value, cover.diagnostics,
     )
 
 
@@ -207,19 +272,29 @@ def supplied_draft_diagnostics(
     )
 
 
+def _wait_for_stable_editor(page, publication_url: str, rate_limit_monitor=None) -> bool:
+    """Settle in short intervals so a trusted 429 stops inspection promptly."""
+    if rate_limit_monitor is None:
+        page.wait_for_timeout(1500)
+        return not rate_limit_evidence(page, publication_url)
+    for _ in range(15):
+        if ((rate_limit_monitor is not None and rate_limit_monitor.encountered)
+                or rate_limit_evidence(page, publication_url)):
+            return False
+        page.wait_for_timeout(100)
+    return True
+
+
 def verify_supplied_draft(
     page, publication_url: str, draft_url: str, diagnostics_directory: Path | None = None,
+    *, rate_limit_monitor=None,
 ) -> SuppliedDraftEvidence:
     """Open and inspect an existing editor without clicking or editing anything."""
     response = page.goto(draft_url, wait_until='domcontentloaded')
     response_url = getattr(response, 'url', page.url) if response is not None else page.url
     if (response is not None and getattr(response, 'status', None) == 429
             and trusted_page(response_url, publication_url)):
-        evidence = SuppliedDraftEvidence(False, 'Substack returned HTTP 429.', rate_limited=True)
-        return SuppliedDraftEvidence(
-            False, evidence.reason, True,
-            supplied_draft_diagnostics(page, publication_url, diagnostics_directory),
-        )
+        return SuppliedDraftEvidence(False, 'Substack returned HTTP 429.', rate_limited=True)
     if response is not None and getattr(response, 'ok', True) is False:
         evidence = SuppliedDraftEvidence(False, 'The supplied editor URL was inaccessible.')
         return SuppliedDraftEvidence(
@@ -227,26 +302,40 @@ def verify_supplied_draft(
                 page, publication_url, diagnostics_directory,
             ),
         )
-    page.wait_for_timeout(1500)
+    if rate_limit_evidence(page, publication_url):
+        return SuppliedDraftEvidence(
+            False, 'Substack returned a rate-limit page.', rate_limited=True,
+        )
+    if not _wait_for_stable_editor(page, publication_url, rate_limit_monitor):
+        return SuppliedDraftEvidence(
+            False, 'Substack returned a rate-limit response or page.', rate_limited=True,
+        )
     first = _supplied_draft_snapshot(page, publication_url, draft_url)
     if first.evidence.rate_limited:
+        return SuppliedDraftEvidence(False, first.evidence.reason, True)
+    if not _wait_for_stable_editor(page, publication_url, rate_limit_monitor):
         return SuppliedDraftEvidence(
-            False, first.evidence.reason, True,
-            supplied_draft_diagnostics(page, publication_url, diagnostics_directory, first),
+            False, 'Substack returned a rate-limit response or page.', rate_limited=True,
         )
-    page.wait_for_timeout(1500)
     second = _supplied_draft_snapshot(page, publication_url, draft_url)
     if second.evidence.rate_limited:
-        return SuppliedDraftEvidence(
-            False, second.evidence.reason, True,
-            supplied_draft_diagnostics(page, publication_url, diagnostics_directory, second),
-        )
+        return SuppliedDraftEvidence(False, second.evidence.reason, True)
     if first != second:
         evidence = SuppliedDraftEvidence(False, 'Editor evidence changed while being inspected.')
     else:
         evidence = second.evidence
     if evidence.verified:
-        return evidence
+        final_url, page_title = _safe_page_identity(page, publication_url)
+        inspection = None
+        if second.visible_title is not None and second.body_classification is not None:
+            inspection = DraftInspection(
+                draft_url, second.visible_title, second.body_classification,
+                second.image_present,
+                tuple(label for label in second.controls if label in {'Draft', 'Saved', 'Saving'}),
+                True, final_url, page_title, second.controls, second.cover_state,
+                second.cover_diagnostics,
+            )
+        return SuppliedDraftEvidence(True, evidence.reason, inspection=inspection)
     return SuppliedDraftEvidence(
         False, evidence.reason, diagnostics=supplied_draft_diagnostics(
             page, publication_url, diagnostics_directory, second,

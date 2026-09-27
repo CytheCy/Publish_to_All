@@ -4,10 +4,18 @@ import argparse
 from pathlib import Path
 import sys
 
-from .application import inspect_project, inspect_status, prepare_substack_draft, reconcile_substack
+from .application import (
+    add_substack_body, add_substack_image, inspect_project, inspect_status,
+    inspect_substack_draft, prepare_substack_draft, repair_substack_title,
+    reassociate_substack_version, reconcile_substack,
+)
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
-from .presentation import format_check, format_preview, format_status, format_substack_session, format_substack_draft
+from .presentation import (
+    format_check, format_preview, format_status, format_substack_body, format_substack_image,
+    format_substack_title,
+    format_substack_reassociation, format_substack_session, format_substack_draft,
+)
 
 
 def _complete_manual_login() -> None:
@@ -29,20 +37,67 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("status", help="Show local publication state for the current story version.")
     command.set_defaults(formatter=format_status)
     commands.add_parser("substack", help="Create a Substack draft containing only the title; never publish.")
+    commands.add_parser(
+        "substack-body",
+        help="Insert the story body into the already-linked Substack draft; never publish.",
+    )
+    commands.add_parser(
+        "substack-image",
+        help="Upload the matching cover image to the populated linked Substack draft; never publish.",
+    )
+    commands.add_parser(
+        "substack-title",
+        help="Repair an empty title on the already-linked Substack draft; never publish.",
+    )
+    command = commands.add_parser(
+        "substack-inspect-draft", help="Inspect one supplied Substack draft editor without changing it.",
+    )
+    command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
     command = commands.add_parser("substack-reconcile", help="Inspect existing drafts without remote changes.")
     reconciliation = command.add_mutually_exclusive_group()
     reconciliation.add_argument("--link", action="store_true", help="Link locally only with exact title, Draft status, and matching recorded attempt URL.")
     reconciliation.add_argument("--draft-url", help="Verify and link a user-supplied existing Substack draft editor URL.")
+    command.add_argument(
+        "--replace-linked-draft", action="store_true",
+        help="Explicitly replace the current story's local draft association after verification.",
+    )
+    command = commands.add_parser(
+        "substack-reassociate-version",
+        help="Locally move one untouched draft association to the current story version.",
+    )
+    command.add_argument(
+        "--from-hash", required=True,
+        help="Exact prior story hash that currently owns the untouched draft.",
+    )
     commands.add_parser("substack-login", help="Log into Substack manually in a visible browser.")
     command = commands.add_parser("substack-session", help="Check the saved Substack browser session.")
     command.add_argument("--debug", action="store_true", help="Show redacted session diagnostics for any result.")
     args = parser.parse_args(argv)
     try:
+        if args.command == "substack-reassociate-version":
+            result = reassociate_substack_version(Path("."), args.from_hash)
+            print(format_substack_reassociation(result))
+            return 0
         if args.command == "substack-reconcile":
-            print(reconcile_substack(Path("."), link=args.link, draft_url=args.draft_url))
+            print(reconcile_substack(
+                Path("."), link=args.link, draft_url=args.draft_url,
+                replace_linked_draft=args.replace_linked_draft,
+            ))
+            return 0
+        if args.command == "substack-inspect-draft":
+            print(inspect_substack_draft(Path("."), args.draft_url))
             return 0
         if args.command == "substack":
             print(format_substack_draft(prepare_substack_draft(Path("."))))
+            return 0
+        if args.command == "substack-body":
+            print(format_substack_body(add_substack_body(Path("."))))
+            return 0
+        if args.command == "substack-image":
+            print(format_substack_image(add_substack_image(Path("."))))
+            return 0
+        if args.command == "substack-title":
+            print(format_substack_title(repair_substack_title(Path("."))))
             return 0
         if args.command in ("substack-login", "substack-session"):
             result = inspect_substack_session(

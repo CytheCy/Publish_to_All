@@ -422,7 +422,7 @@ def test_reconcile_command_preserves_uncertain_attempts(project, browser, action
     saved = record(project)
     if linked:
         assert saved.status == Status.DRAFT_CREATED and not saved.needs_reconciliation
-        assert saved.error_message == failed.error_message
+        assert saved.error_message is None
     else:
         assert saved == failed
         assert ('Unknown' in output) if not (matches == (DRAFT,) and known == DRAFT) else ('--link' in output)
@@ -573,6 +573,24 @@ def test_http_429_supplied_editor_stops_immediately(monkeypatch):
     snapshot.assert_not_called()
 
 
+def test_immediate_rendered_rate_limit_does_not_wait_or_inspect(monkeypatch):
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    page.goto.return_value.ok = True
+    page.goto.return_value.status = 200
+    page.goto.return_value.url = DRAFT
+    snapshot = MagicMock()
+    monkeypatch.setattr(reconcile, 'rate_limit_evidence', lambda *_: True)
+    monkeypatch.setattr(reconcile, '_supplied_draft_snapshot', snapshot)
+
+    evidence = reconcile.verify_supplied_draft(page, URL, DRAFT)
+
+    assert evidence.rate_limited and not evidence.verified
+    page.goto.assert_called_once_with(DRAFT, wait_until='domcontentloaded')
+    page.wait_for_timeout.assert_not_called()
+    snapshot.assert_not_called()
+
+
 def test_rendered_rate_limit_stops_without_second_inspection(monkeypatch):
     from publish_to_all.browser import reconcile
     page = MagicMock(url=DRAFT)
@@ -680,7 +698,7 @@ def test_supplied_verified_draft_links_failed_attempt_only(
     assert saved.draft_url == DRAFT
     assert saved.created_at == saved.last_attempt_at == failed.created_at
     assert saved.updated_at >= failed.updated_at
-    assert saved.error_message == failed.error_message
+    assert saved.error_message is None
     assert not saved.needs_reconciliation
     assert repo.find_duplicate(story.source_hash, 'substack') == saved
     with pytest.raises(DuplicatePublicationError):
@@ -736,3 +754,167 @@ def test_reconcile_failed_draft_accepts_previously_missing_url_and_rejects_repla
     )
     assert replaced.status == Status.DRAFT_CREATED
     assert replaced.draft_url == 'https://example.com/different'
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('', 'empty'), ('A short note.', 'minimal'), ('x' * 101, 'partial'),
+    ('x' * 1001, 'substantial'),
+])
+def test_draft_body_classification(text, expected):
+    from publish_to_all.browser.reconcile import classify_body
+    assert classify_body(text) == expected
+
+
+@pytest.mark.parametrize('image_visible,expected', [(True, True), (False, False)])
+def test_editor_content_extracts_visible_title_and_image(monkeypatch, image_visible, expected):
+    from publish_to_all.browser import reconcile
+    field = MagicMock()
+    field.is_editable.return_value = True
+    surface = MagicMock()
+    surface.is_visible.return_value = True
+    surface.is_editable.return_value = True
+    surface.inner_text.return_value = 'Body text'
+    image = MagicMock()
+    image.is_visible.return_value = image_visible
+    page = MagicMock()
+    page.locator.side_effect = [MagicMock(all=lambda: [surface]), MagicMock(all=lambda: [image])]
+    monkeypatch.setattr(editor, 'title_value', lambda _: 'Visible title')
+
+    title, body, present = reconcile._editor_contents(page, [field])
+
+    assert title == 'Visible title'
+    assert body == 'minimal'
+    assert present is expected
+
+
+def test_inspect_two_drafts_is_read_only_and_reports_details(
+        project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    story = load_story(project / 'In')
+    repo = repository(project)
+    attempt = repo.begin_attempt(story, 'substack')
+    linked = repo.mark_draft_created(attempt.id, DRAFT)
+    database = runtime_paths(project).database
+    before = database.read_bytes()
+    second = URL + '/publish/post/456'
+
+    def verified(_page, _publication, draft_url, _diagnostics, *, rate_limit_monitor):
+        assert rate_limit_monitor is not None
+        return reconcile.SuppliedDraftEvidence(
+            True, 'Verified.', inspection=reconcile.DraftInspection(
+                draft_url, 'Visible title', 'empty', False, ('Saved',), True,
+                draft_url, 'Editing post - Substack', ('Saved', 'Preview', 'Continue'),
+                'none',
+            ),
+        )
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', verified)
+
+    assert main(['substack-inspect-draft', '--draft-url', DRAFT]) == 0
+    first_output = capsys.readouterr().out
+    assert main(['substack-inspect-draft', '--draft-url', second]) == 0
+    second_output = capsys.readouterr().out
+
+    for output, draft_url in ((first_output, DRAFT), (second_output, second)):
+        assert 'Verified numeric draft URL: ' + draft_url in output
+        assert 'Visible title: Visible title' in output
+        assert 'Editable body: empty' in output
+        assert 'Cover/image appears present: No' in output
+        assert 'Cover image state: None' in output
+        assert 'Definitely a draft editor: Yes' in output
+    assert database.read_bytes() == before
+    assert record(project) == linked
+    browser[2].click.assert_not_called()
+    browser[2].fill.assert_not_called()
+
+
+def test_unknown_cover_inspection_reports_only_safe_cover_diagnostics(
+        project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import image, reconcile
+    diagnostics = image.CoverDiagnostics(
+        image_labels=('Thumbnail', 'Upload'),
+        cover_like_controls=('1 File Settings thumbnail item(s)',),
+        cover_preview_present=False,
+        cover_add_control_present=False,
+        inline_image_controls_excluded=1,
+        social_preview_controls_excluded=2,
+    )
+    monkeypatch.setattr(
+        reconcile, 'verify_supplied_draft',
+        lambda _page, _publication, draft_url, _directory, **_kwargs: reconcile.SuppliedDraftEvidence(
+            True, 'Verified.', inspection=reconcile.DraftInspection(
+                draft_url, 'Visible title', 'substantial', False, ('Saved',), True,
+                draft_url, 'Editing post - Substack', ('Saved', 'Preview', 'Continue'),
+                'unknown', diagnostics,
+            ),
+        ),
+    )
+
+    assert main(['substack-inspect-draft', '--draft-url', DRAFT]) == 0
+    output = capsys.readouterr().out
+
+    for text in (
+        'Cover image state: Unknown', 'Relevant image labels: Thumbnail, Upload',
+        'Cover-like controls: 1 File Settings thumbnail item(s)',
+        'Cover preview present: No', 'Cover add/upload control present: No',
+        'Inline body-image controls excluded: 1', 'Social-preview controls excluded: 2',
+    ):
+        assert text in output
+
+
+def test_inspection_ambiguity_preserves_sqlite(project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    linked = repo.mark_draft_created(repo.begin_attempt(story, 'substack').id, DRAFT)
+    database = runtime_paths(project).database
+    before = database.read_bytes()
+    monkeypatch.setattr(
+        reconcile, 'verify_supplied_draft',
+        lambda *_, **__: reconcile.SuppliedDraftEvidence(False, 'Ambiguous editor evidence.'),
+    )
+
+    assert main(['substack-inspect-draft', '--draft-url', URL + '/publish/post/456']) == 0
+
+    assert 'Unable to verify supplied draft URL safely.' in capsys.readouterr().out
+    assert database.read_bytes() == before
+    assert record(project) == linked
+
+
+def test_linked_draft_reassociation_requires_flag_and_preserves_duplicate_protection(
+        project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    linked = repo.mark_draft_created(repo.begin_attempt(story, 'substack').id, DRAFT)
+    second = URL + '/publish/post/456'
+    monkeypatch.setattr(
+        reconcile, 'verify_supplied_draft',
+        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'),
+    )
+
+    assert main(['substack-reconcile', '--draft-url', second]) == 0
+    assert record(project) == linked
+    assert 'Local association unchanged.' in capsys.readouterr().out
+
+    assert main([
+        'substack-reconcile', '--draft-url', second, '--replace-linked-draft',
+    ]) == 0
+    replaced = record(project)
+    assert replaced.id == linked.id
+    assert replaced.draft_url == second
+    assert replaced.status == Status.DRAFT_CREATED
+    assert repo.find_duplicate(story.source_hash, 'substack') == replaced
+    with pytest.raises(DuplicatePublicationError):
+        repo.begin_attempt(story, 'substack')
+    assert 'No remote draft was modified or deleted.' in capsys.readouterr().out
+
+
+def test_replace_linked_draft_flag_requires_url(project, browser, capsys):
+    story = load_story(project / 'In')
+    linked = repository(project).mark_draft_created(
+        repository(project).begin_attempt(story, 'substack').id, DRAFT,
+    )
+    assert main(['substack-reconcile', '--replace-linked-draft']) == 1
+    assert record(project) == linked
+    assert 'requires --draft-url' in capsys.readouterr().err
+    browser[0].assert_not_called()
