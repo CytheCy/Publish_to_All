@@ -10,25 +10,33 @@ def format_substack_session(result: SessionResult) -> str:
         AuthenticationState.AUTHENTICATED: "Authenticated",
         AuthenticationState.NOT_AUTHENTICATED: "Not authenticated",
         AuthenticationState.UNKNOWN: "Unknown (could not verify authentication)",
+        AuthenticationState.RATE_LIMITED: "Temporarily rate limited",
     }
     lines = ["Substack session", "", "Publication:", result.publication_url, "",
              f"Authentication: {labels[result.authentication]}", "",
              "Browser profile:", str(result.profile)]
     if result.authentication == AuthenticationState.AUTHENTICATED:
         lines += ["", "A reusable authenticated browser session was detected."]
+    elif result.authentication == AuthenticationState.RATE_LIMITED:
+        lines += ["", "Substack is refusing requests from this browser session right now.", "",
+                  "Retry manually later with:", "", "publish-to-all substack-session"]
     else:
         lines += ["", "Run:", "", "publish-to-all substack-login", "",
                   "to authenticate manually and check again."]
     if result.diagnostics is not None:
         diagnostic = result.diagnostics
         lines += ["", "Final URL (sensitive components redacted):", diagnostic.final_url,
-                  "", "Page title:", diagnostic.title, "", "Visible controls:",
+                  "", "Page title:", diagnostic.title]
+        if diagnostic.rate_limited:
+            lines += ["", "Rate limiting detected:", "Yes"]
+        lines += ["", "Visible controls:",
                   *[f"- {label}" for label in diagnostic.controls]]
         if not diagnostic.controls:
             lines += ["- No recognized controls"]
         lines += ["", "Diagnostic screenshot (text and images redacted):",
                   str(diagnostic.screenshot) if diagnostic.screenshot else "Unavailable (capture failed)"]
-    return "\n".join([*lines, "", "No draft was created.", "Nothing was published."])
+    return "\n".join([*lines, "", "No local publication state was changed.",
+                      "No draft was created.", "Nothing was published."])
 
 
 def _warnings(result: Inspection) -> list[str]:

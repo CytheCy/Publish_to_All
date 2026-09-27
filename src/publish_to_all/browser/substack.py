@@ -18,6 +18,7 @@ class AuthenticationState(str, Enum):
     AUTHENTICATED = "authenticated"
     NOT_AUTHENTICATED = "not_authenticated"
     UNKNOWN = "unknown"
+    RATE_LIMITED = "rate_limited"
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class SessionDiagnostics:
     title: str
     controls: tuple[str, ...]
     screenshot: Path | None
+    rate_limited: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,9 +81,12 @@ SAFE_LABELS = (
 class Evidence:
     positive: bool = False
     negative: bool = False
+    rate_limited: bool = False
 
     @property
     def state(self) -> AuthenticationState:
+        if self.rate_limited:
+            return AuthenticationState.RATE_LIMITED
         if self.positive and not self.negative:
             return AuthenticationState.AUTHENTICATED
         if self.negative and not self.positive:
@@ -89,10 +94,28 @@ class Evidence:
         return AuthenticationState.UNKNOWN
 
 
+def rate_limit_evidence(page: Page, publication_url: str) -> bool:
+    """Recognize only an exact rendered rate-limit message on a trusted page."""
+    try:
+        if not trusted_page(page.url, publication_url):
+            return False
+        message = page.get_by_text(re.compile(r"^\s*too many requests\s*$", re.IGNORECASE))
+        if any(item.is_visible() for item in message.all()):
+            return True
+        title = page.title().strip()
+        return isinstance(title, str) and bool(re.fullmatch(
+            r"too many requests(?:\s*[|–—-]\s*substack)?", title, re.IGNORECASE,
+        ))
+    except (PlaywrightError, AttributeError, TypeError):
+        return False
+
+
 def authentication_evidence(page: Page, publication_url: str) -> Evidence:
     """Read rendered controls only. A dashboard URL alone never proves access."""
     if not trusted_page(page.url, publication_url):
         return Evidence()
+    if rate_limit_evidence(page, publication_url):
+        return Evidence(rate_limited=True)
     controls = page.get_by_role("navigation").or_(page.get_by_role("menu"))
 
     def has(pattern: str) -> bool:
@@ -137,16 +160,40 @@ def _settle(page: Page, publication_url: str, timeout: float) -> Evidence:
     # during hydration, and client-side redirects may follow DOMContentLoaded.
     while True:
         evidence = authentication_evidence(page, publication_url)
-        if monotonic() >= deadline:
+        if evidence.rate_limited or monotonic() >= deadline:
             return evidence
         page.wait_for_timeout(250)
 
 
-def verify_page(page: Page, publication_url: str, *, timeout: float = 10) -> AuthenticationState:
-    page.goto(publication_url, wait_until="domcontentloaded")
-    first = _settle(page, publication_url, timeout)
-    page.goto(publication_url + "/publish/home", wait_until="domcontentloaded")
-    second = _settle(page, publication_url, timeout)
+def _navigate_and_settle(page: Page, url: str, publication_url: str, timeout: float) -> Evidence:
+    response = page.goto(url, wait_until="domcontentloaded")
+    response_url = getattr(response, "url", page.url) if response is not None else page.url
+    if (response is not None and getattr(response, "status", None) == 429
+            and trusted_page(response_url, publication_url)):
+        return Evidence(rate_limited=True)
+    return _settle(page, publication_url, timeout)
+
+
+def verify_page(
+    page: Page, publication_url: str, timeout: float = 10, publisher_only: bool = False,
+) -> AuthenticationState:
+    """Verify a session, stopping immediately on the first rate-limit signal.
+
+    Draft preflight uses one direct publisher-dashboard request. The standalone
+    session check keeps its broader two-page corroboration.
+    """
+    if publisher_only:
+        return _navigate_and_settle(
+            page, publication_url + "/publish/home", publication_url, timeout,
+        ).state
+    first = _navigate_and_settle(page, publication_url, publication_url, timeout)
+    if first.rate_limited:
+        return AuthenticationState.RATE_LIMITED
+    second = _navigate_and_settle(
+        page, publication_url + "/publish/home", publication_url, timeout,
+    )
+    if second.rate_limited:
+        return AuthenticationState.RATE_LIMITED
     # Preserve contradictions within a page as well as between the two visits.
     if any(e.positive and e.negative for e in (first, second)):
         return AuthenticationState.UNKNOWN
@@ -156,7 +203,9 @@ def verify_page(page: Page, publication_url: str, *, timeout: float = 10) -> Aut
     return AuthenticationState.UNKNOWN
 
 
-def collect_diagnostics(page: Page, publication_url: str, directory: Path) -> SessionDiagnostics:
+def collect_diagnostics(
+    page: Page, publication_url: str, directory: Path, *, rate_limited: bool = False,
+) -> SessionDiagnostics:
     # Do not echo query strings, fragments, account identifiers, or arbitrary labels.
     url = "[unrecognized URL redacted]"
     title = "[nonstandard page title redacted]"
@@ -170,7 +219,7 @@ def collect_diagnostics(page: Page, publication_url: str, directory: Path) -> Se
             url = f"https://{parsed.hostname}" + (path if path in allowed or re.fullmatch(r"/publish/post/[1-9][0-9]*", path) else "/[path redacted]")
         raw_title = page.title().strip()
         # Allow only fixed UI vocabulary; publication/account names are not logged.
-        if isinstance(raw_title, str) and re.fullmatch(r"(?:Substack|Home|Dashboard|Sign in|Log in|Login|Publish|Posts)(?: [|–—-] (?:Substack|Home|Dashboard))*", raw_title, re.I):
+        if isinstance(raw_title, str) and re.fullmatch(r"(?:Substack|Home|Dashboard|Sign in|Log in|Login|Publish|Posts|Too many requests)(?: [|–—-] (?:Substack|Home|Dashboard))*", raw_title, re.I):
             title = raw_title
         for label in SAFE_LABELS:
             if any(_visible(page, role, "^" + re.escape(label) + "$")
@@ -180,7 +229,9 @@ def collect_diagnostics(page: Page, publication_url: str, directory: Path) -> Se
                     break
     except PlaywrightError:
         pass
-    return SessionDiagnostics(url, title, tuple(labels), safe_screenshot(page, directory))
+    return SessionDiagnostics(
+        url, title, tuple(labels), safe_screenshot(page, directory), rate_limited,
+    )
 
 
 def inspect_substack_session(
@@ -199,6 +250,12 @@ def inspect_substack_session(
             # Manual login can open additional tabs; verify in a new, known page.
             page = context.new_page()
         state = verify_page(page, publication_url)
-        diagnostics = (collect_diagnostics(page, publication_url, paths.diagnostics)
-                       if debug or state == AuthenticationState.UNKNOWN else None)
+        diagnostics = (
+            collect_diagnostics(
+                page, publication_url, paths.diagnostics,
+                rate_limited=state == AuthenticationState.RATE_LIMITED,
+            )
+            if debug or state in (AuthenticationState.UNKNOWN, AuthenticationState.RATE_LIMITED)
+            else None
+        )
     return SessionResult(publication_url, profile, state, diagnostics)

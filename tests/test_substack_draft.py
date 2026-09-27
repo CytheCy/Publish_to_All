@@ -12,7 +12,9 @@ from publish_to_all.cli import main
 from publish_to_all.config import runtime_paths
 from publish_to_all.errors import BrowserSessionError, PublishToAllError
 from publish_to_all.publishers.substack import SubstackPublisher
-from publish_to_all.state import PublicationRepository, PublicationStatus as Status, MIGRATIONS
+from publish_to_all.state import (
+    DuplicatePublicationError, MIGRATIONS, PublicationRepository, PublicationStatus as Status,
+)
 from publish_to_all.story import load_story
 
 URL = 'https://example.substack.com'
@@ -91,6 +93,39 @@ def test_authentication_precedes_attempt(project, browser, actions, monkeypatch,
     assert record(project) is None
     actions['open_new_post'].assert_not_called()
     assert 'substack-login' in capsys.readouterr().err
+
+
+def test_rate_limit_stops_before_attempt_and_leaves_sqlite_unchanged(
+        project, browser, actions, monkeypatch, capsys):
+    repo = repository(project)
+    database = runtime_paths(project).database
+    before = database.read_bytes()
+    check = MagicMock(return_value=Auth.RATE_LIMITED)
+    monkeypatch.setattr(application, 'verify_page', check)
+
+    assert main(['substack']) == 1
+
+    assert database.read_bytes() == before
+    assert repo.get_publication(load_story(project / 'In').source_hash, 'substack') is None
+    check.assert_called_once_with(browser[2], URL, 10, True)
+    actions['navigate_dashboard'].assert_not_called()
+    actions['open_new_post'].assert_not_called()
+    output = capsys.readouterr().err
+    for text in ('temporarily rate limited', 'Rate limiting detected: Yes',
+                 'Retry manually later', 'No local publication state was changed',
+                 'No draft was created', 'Nothing was published'):
+        assert text in output
+
+
+def test_first_run_rate_limit_does_not_create_sqlite(
+        project, browser, actions, monkeypatch, capsys):
+    database = runtime_paths(project).database
+    assert not database.exists()
+    monkeypatch.setattr(application, 'verify_page', lambda *_: Auth.RATE_LIMITED)
+    assert main(['substack']) == 1
+    assert not database.exists()
+    actions['open_new_post'].assert_not_called()
+    assert 'Retry manually later' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('status', ['draft', 'published', 'in_progress', 'uncertain'])
@@ -434,3 +469,270 @@ def test_reconcile_missing_listing_is_unknown(project, browser, monkeypatch, cap
     assert main(['substack-reconcile', '--link']) == 0
     assert 'Unknown' in capsys.readouterr().out
     assert record(project) == failed
+
+
+@pytest.mark.parametrize('value', [
+    'not a URL',
+    'http://example.substack.com/publish/post/123',
+    'https://example.com/publish/post/123',
+    'https://other.substack.com/publish/post/123',
+    'https://example.substack.com/p/story-slug',
+    'https://user:secret@example.substack.com/publish/post/123',
+    'https://example.substack.com:8443/publish/post/123',
+])
+def test_supplied_draft_url_rejects_malformed_nonpublication_and_public_urls(value):
+    from publish_to_all.browser.reconcile import validate_supplied_draft_url
+    with pytest.raises(BrowserSessionError, match='Local state unchanged'):
+        validate_supplied_draft_url(value, URL)
+
+
+def test_supplied_draft_url_is_normalized_without_sensitive_components():
+    from publish_to_all.browser.reconcile import validate_supplied_draft_url
+    assert validate_supplied_draft_url(DRAFT + '/?token=secret#private', URL) == DRAFT
+
+
+def test_invalid_supplied_url_does_not_open_browser_or_change_state(project, browser, actions, capsys):
+    repo = repository(project)
+    attempt = repo.begin_attempt(load_story(project / 'In'), 'substack')
+    failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
+    assert main(['substack-reconcile', '--draft-url', 'https://example.com/publish/post/123']) == 1
+    assert record(project) == failed
+    assert 'Local state unchanged' in capsys.readouterr().err
+    browser[0].assert_not_called()
+    actions['open_new_post'].assert_not_called()
+
+
+@pytest.mark.parametrize('title_field,editor_surface,controls,verified', [
+    (True, True, ('Saved', 'Preview', 'Continue', 'Style', 'Settings'), True),
+    (False, True, ('Saved', 'Preview', 'Continue'), True),
+    (True, False, ('Draft', 'Preview', 'Settings'), True),
+    (True, True, ('Preview',), False),
+    (False, False, ('Saved', 'Preview', 'Continue', 'Settings'), False),
+])
+def test_rendered_supplied_editor_accepts_corroborating_current_ui_variants(
+        monkeypatch, title_field, editor_surface, controls, verified):
+    from types import SimpleNamespace
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    field_items = [MagicMock(is_visible=MagicMock(return_value=True),
+                             is_editable=MagicMock(return_value=True))] if title_field else []
+    monkeypatch.setattr(editor, 'title_fields', lambda *_: MagicMock(all=lambda: field_items))
+    monkeypatch.setattr(reconcile, 'authentication_evidence', lambda *_: SimpleNamespace(negative=False))
+    monkeypatch.setattr(reconcile, 'rate_limit_evidence', lambda *_: False)
+    monkeypatch.setattr(reconcile, '_visible_editor_surface', lambda *_: editor_surface)
+    monkeypatch.setattr(reconcile, '_visible_control_labels', lambda *_: controls)
+    monkeypatch.setattr(reconcile, '_visible_text', lambda *_: False)
+    snapshot = reconcile._supplied_draft_snapshot(page, URL, DRAFT)
+    assert snapshot.evidence.verified is verified
+
+
+def test_rendered_supplied_editor_rejects_published_and_unauthenticated_pages(monkeypatch):
+    from types import SimpleNamespace
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    field = MagicMock(is_visible=MagicMock(return_value=True), is_editable=MagicMock(return_value=True))
+    monkeypatch.setattr(editor, 'title_fields', lambda *_: MagicMock(all=lambda: [field]))
+    monkeypatch.setattr(reconcile, 'rate_limit_evidence', lambda *_: False)
+    monkeypatch.setattr(reconcile, '_visible_editor_surface', lambda *_: True)
+    monkeypatch.setattr(reconcile, '_visible_control_labels',
+                        lambda *_: ('Saved', 'Preview', 'Continue'))
+    monkeypatch.setattr(reconcile, '_visible_text', lambda *_: True)
+    monkeypatch.setattr(reconcile, 'authentication_evidence',
+                        lambda *_: SimpleNamespace(negative=False))
+    assert not reconcile._supplied_draft_snapshot(page, URL, DRAFT).evidence.verified
+
+    monkeypatch.setattr(reconcile, '_visible_text', lambda *_: False)
+    monkeypatch.setattr(reconcile, 'authentication_evidence',
+                        lambda *_: SimpleNamespace(negative=True))
+    snapshot = reconcile._supplied_draft_snapshot(page, URL, DRAFT)
+    assert not snapshot.evidence.verified and 'authentication' in snapshot.evidence.reason
+
+
+def test_inaccessible_supplied_editor_response_is_unverified(monkeypatch):
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    page.goto.return_value.ok = False
+    snapshot = MagicMock()
+    monkeypatch.setattr(reconcile, '_supplied_draft_snapshot', snapshot)
+    evidence = reconcile.verify_supplied_draft(page, URL, DRAFT)
+    assert not evidence.verified and 'inaccessible' in evidence.reason
+    snapshot.assert_not_called()
+
+
+def test_http_429_supplied_editor_stops_immediately(monkeypatch):
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    page.goto.return_value.status = 429
+    page.goto.return_value.url = DRAFT
+    snapshot = MagicMock()
+    monkeypatch.setattr(reconcile, '_supplied_draft_snapshot', snapshot)
+    evidence = reconcile.verify_supplied_draft(page, URL, DRAFT)
+    assert evidence.rate_limited and not evidence.verified
+    page.goto.assert_called_once_with(DRAFT, wait_until='domcontentloaded')
+    page.wait_for_timeout.assert_not_called()
+    snapshot.assert_not_called()
+
+
+def test_rendered_rate_limit_stops_without_second_inspection(monkeypatch):
+    from publish_to_all.browser import reconcile
+    page = MagicMock(url=DRAFT)
+    page.goto.return_value.ok = True
+    page.goto.return_value.status = 200
+    page.goto.return_value.url = DRAFT
+    snapshot = MagicMock(return_value=reconcile._EditorSnapshot(
+        reconcile.SuppliedDraftEvidence(False, 'rate limited', rate_limited=True),
+    ))
+    monkeypatch.setattr(reconcile, '_supplied_draft_snapshot', snapshot)
+    evidence = reconcile.verify_supplied_draft(page, URL, DRAFT)
+    assert evidence.rate_limited
+    page.goto.assert_called_once()
+    page.wait_for_timeout.assert_called_once_with(1500)
+    snapshot.assert_called_once()
+
+
+@pytest.mark.parametrize('kind', ['inaccessible', 'published', 'ambiguous'])
+def test_supplied_draft_verification_uncertainty_leaves_state_unchanged(
+        project, browser, actions, monkeypatch, capsys, kind):
+    from publish_to_all.browser import reconcile
+    from playwright.sync_api import Error as PlaywrightError
+    repo = repository(project)
+    attempt = repo.begin_attempt(load_story(project / 'In'), 'substack')
+    failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
+    if kind == 'inaccessible':
+        monkeypatch.setattr(reconcile, 'verify_supplied_draft', MagicMock(side_effect=PlaywrightError('unavailable')))
+    else:
+        reason = 'The editor shows published-post status.' if kind == 'published' else 'Ambiguous editor evidence.'
+        monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_: reconcile.SuppliedDraftEvidence(False, reason))
+    assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
+    assert record(project) == failed
+    output = capsys.readouterr().out
+    assert 'Unable to verify supplied draft URL safely.' in output
+    assert 'Local state unchanged.' in output and 'Nothing was published.' in output
+    actions['open_new_post'].assert_not_called()
+    actions['enter_title'].assert_not_called()
+    browser[2].click.assert_not_called()
+    browser[2].fill.assert_not_called()
+
+
+def test_supplied_draft_failure_reports_safe_diagnostics_and_preserves_state(
+        project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
+    diagnostic = reconcile.SuppliedDraftDiagnostics(
+        DRAFT, 'Editing newsletter - Substack', True, True,
+        ('Saved', 'Preview', 'Continue', 'Settings'), False,
+        runtime_paths(project).diagnostics / 'safe.png',
+    )
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_: reconcile.SuppliedDraftEvidence(
+        False, 'Insufficient corroboration.', diagnostics=diagnostic,
+    ))
+    assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
+    assert record(project) == failed
+    output = capsys.readouterr().out
+    for text in (
+        'Final URL: ' + DRAFT, 'Page title: Editing newsletter - Substack',
+        'Editable title field: Yes', 'Editable post editor: Yes',
+        'Visible editor controls: Saved, Preview, Continue, Settings',
+        'Publish/Send control present: No', 'Diagnostic screenshot:',
+    ):
+        assert text in output
+    assert 'secret' not in output
+
+
+def test_supplied_draft_rate_limit_skips_auth_navigation_and_preserves_state(
+        project, browser, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
+    check = MagicMock(return_value=reconcile.SuppliedDraftEvidence(
+        False, 'Substack returned HTTP 429.', rate_limited=True,
+    ))
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', check)
+    assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
+    assert record(project) == failed
+    check.assert_called_once()
+    application.verify_page.assert_not_called()
+    output = capsys.readouterr().out
+    assert output.startswith('RATE_LIMITED\n')
+    assert 'Local state unchanged.' in output and 'Nothing was published.' in output
+
+
+def test_supplied_verified_draft_links_failed_attempt_only(
+        project, browser, actions, monkeypatch, capsys):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    unrelated = repo.begin_attempt(story, 'medium')
+    unrelated = repo.mark_failed(unrelated.id, 'Unrelated failure', needs_reconciliation=True)
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft',
+                        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
+    assert main(['substack-reconcile', '--draft-url', DRAFT + '?tracking=removed']) == 0
+    saved = record(project)
+    assert saved.id == failed.id
+    assert saved.status == Status.DRAFT_CREATED
+    assert saved.draft_url == DRAFT
+    assert saved.created_at == saved.last_attempt_at == failed.created_at
+    assert saved.updated_at >= failed.updated_at
+    assert saved.error_message == failed.error_message
+    assert not saved.needs_reconciliation
+    assert repo.find_duplicate(story.source_hash, 'substack') == saved
+    with pytest.raises(DuplicatePublicationError):
+        repo.begin_attempt(story, 'substack')
+    assert repo.get_publication(story.source_hash, 'medium') == unrelated
+    output = capsys.readouterr().out
+    for text in ('Substack reconciliation complete', story.metadata.title, DRAFT,
+                 'Local state:\nDraft created', 'Duplicate protection remains active.', 'Nothing was published.'):
+        assert text in output
+    actions['open_new_post'].assert_not_called()
+    actions['enter_title'].assert_not_called()
+    browser[2].click.assert_not_called()
+    browser[2].fill.assert_not_called()
+
+
+def test_supplied_verified_draft_replaces_only_same_unresolved_attempt_url(
+        project, browser, monkeypatch):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(
+        attempt.id, 'Original failure', draft_url=URL + '/publish/post/999',
+        needs_reconciliation=True,
+    )
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft',
+                        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
+    assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
+    saved = record(project)
+    assert saved.id == failed.id
+    assert saved.status == Status.DRAFT_CREATED
+    assert saved.draft_url == DRAFT
+    assert not saved.needs_reconciliation
+    with pytest.raises(DuplicatePublicationError):
+        repo.begin_attempt(story, 'substack')
+
+
+def test_reconcile_failed_draft_accepts_previously_missing_url_and_rejects_replacement(project):
+    from publish_to_all.state import StateError
+    repo = repository(project)
+    story = load_story(project / 'In')
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(attempt.id, 'Unknown outcome', needs_reconciliation=True)
+    saved = repo.reconcile_failed_draft(failed, DRAFT)
+    assert saved.status == Status.DRAFT_CREATED and saved.draft_url == DRAFT
+    other_attempt = repo.begin_attempt(story, 'medium')
+    known = repo.mark_failed(other_attempt.id, 'Unknown', draft_url='https://example.com/original',
+                             needs_reconciliation=True)
+    with pytest.raises(StateError, match='insufficient'):
+        repo.reconcile_failed_draft(known, 'https://example.com/different')
+    replaced = repo.reconcile_failed_draft(
+        known, 'https://example.com/different', verified_manual_url=True,
+    )
+    assert replaced.status == Status.DRAFT_CREATED
+    assert replaced.draft_url == 'https://example.com/different'

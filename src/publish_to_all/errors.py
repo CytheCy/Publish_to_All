@@ -15,3 +15,7 @@ class StoryError(PublishToAllError):
 
 class BrowserSessionError(PublishToAllError):
     """Sanitized browser error, optionally with a local diagnostic path."""
+
+
+class SubstackRateLimitError(BrowserSessionError):
+    """Substack temporarily refused browser requests before any remote mutation."""

@@ -117,6 +117,13 @@ def test_diagnostics_redact_secrets_and_include_relevant_controls(tmp_path, monk
     assert substack.collect_diagnostics(page, URL, tmp_path).title == '[nonstandard page title redacted]'
 
 
+def test_dashboard_navigation_reuses_authenticated_page(monkeypatch):
+    page = Page([])
+    monkeypatch.setattr(editor, 'detect_authentication', lambda *_: substack.AuthenticationState.AUTHENTICATED)
+    editor.navigate_dashboard(page, URL)
+    page.goto.assert_not_called()
+
+
 def row(title, url, status='Draft'):
     return Node('row', '', children=[Node('link', title, url), Node('text', status)])
 

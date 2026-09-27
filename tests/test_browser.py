@@ -107,15 +107,23 @@ def test_browser_paths_reject_symlink_into_project(tmp_path, monkeypatch, child)
 @pytest.mark.parametrize("state,label", [
     (Auth.AUTHENTICATED, "Authenticated"), (Auth.NOT_AUTHENTICATED, "Not authenticated"),
     (Auth.UNKNOWN, "Unknown (could not verify authentication)"),
+    (Auth.RATE_LIMITED, "Temporarily rate limited"),
 ])
 def test_session_format(state, label, tmp_path):
-    result = SessionResult(URL, tmp_path / "profile", state)
+    diagnostics = None
+    if state == Auth.RATE_LIMITED:
+        diagnostics = substack.SessionDiagnostics(
+            URL + "/publish/home", "Too many requests", (), None, True,
+        )
+    result = SessionResult(URL, tmp_path / "profile", state, diagnostics)
     output = format_substack_session(result)
     assert f"Authentication: {label}" in output
     assert URL in output and str(result.profile) in output
     assert "No draft was created.\nNothing was published." in output
-    assert ("substack-login" in output) == (state != Auth.AUTHENTICATED)
+    assert ("substack-login" in output) == (state in (Auth.UNKNOWN, Auth.NOT_AUTHENTICATED))
     assert ("reusable authenticated" in output) == (state == Auth.AUTHENTICATED)
+    assert ("Substack is refusing requests" in output) == (state == Auth.RATE_LIMITED)
+    assert ("Rate limiting detected:\nYes" in output) == (state == Auth.RATE_LIMITED)
     assert Auth(state.value) is state
 
 
@@ -259,6 +267,44 @@ def test_verify_bounded_wait(monkeypatch, state):
     page = MagicMock()
     assert substack.verify_page(page, URL, timeout=0) == state
     page.wait_for_timeout.assert_not_called()
+
+
+def test_http_429_stops_without_retry():
+    page = MagicMock(url=URL + "/publish/home")
+    response = MagicMock(status=429, url=URL + "/publish/home")
+    page.goto.return_value = response
+    assert substack.verify_page(page, URL, timeout=0) == Auth.RATE_LIMITED
+    page.goto.assert_called_once_with(URL, wait_until="domcontentloaded")
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_rendered_too_many_requests_stops_without_retry():
+    page = MagicMock(url=URL)
+    response = MagicMock(status=200, url=URL)
+    page.goto.return_value = response
+    message = MagicMock(is_visible=MagicMock(return_value=True))
+    page.get_by_text.return_value.all.return_value = [message]
+    page.title.return_value = "Too many requests"
+    assert substack.verify_page(page, URL, timeout=0) == Auth.RATE_LIMITED
+    assert page.goto.call_count == 1
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_generic_error_page_remains_unknown():
+    page = MagicMock(url=URL + "/publish/home")
+    page.goto.return_value = MagicMock(status=500, url=URL + "/publish/home")
+    page.get_by_text.return_value.all.return_value = []
+    page.title.return_value = "Internal Server Error"
+    assert substack.verify_page(page, URL, timeout=0, publisher_only=True) == Auth.UNKNOWN
+    assert page.goto.call_count == 1
+
+
+def test_publisher_preflight_uses_one_dashboard_navigation(monkeypatch):
+    page = MagicMock()
+    evidence = substack.Evidence(positive=True)
+    monkeypatch.setattr(substack, "authentication_evidence", MagicMock(return_value=evidence))
+    assert substack.verify_page(page, URL, timeout=0, publisher_only=True) == Auth.AUTHENTICATED
+    page.goto.assert_called_once_with(URL + "/publish/home", wait_until="domcontentloaded")
 
 
 def test_help_lists_all_commands(capsys):

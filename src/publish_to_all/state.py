@@ -258,15 +258,22 @@ class PublicationRepository:
                                 {PublicationStatus.DRAFT_CREATING, PublicationStatus.PUBLISHING}, error=error_message,
                                 draft_url=draft_url, needs_reconciliation=needs_reconciliation)
 
-    def reconcile_failed_draft(self, expected: PublicationRecord, draft_url: str) -> PublicationRecord:
-        """Compare-and-set: preserve the failure history and block duplicate creation."""
+    def reconcile_failed_draft(
+        self, expected: PublicationRecord, draft_url: str, *, verified_manual_url: bool = False,
+    ) -> PublicationRecord:
+        """Compare-and-set: preserve failure history and keep duplicate creation blocked.
+
+        A manually supplied URL may replace earlier uncertain URL evidence only
+        after the caller has conservatively verified that exact editor page.
+        """
         with self._connection(write=True) as connection:
             current = self._record(connection.execute(
                 "SELECT * FROM publications WHERE id = ?", (expected.id,)
             ).fetchone())
             if (current != expected or current.status != PublicationStatus.FAILED
                     or not current.needs_reconciliation or current.published_url
-                    or not current.draft_url or current.draft_url.rstrip('/') != draft_url):
+                    or (not verified_manual_url and current.draft_url is not None
+                        and current.draft_url.rstrip('/') != draft_url)):
                 raise StateError('Reconciliation evidence is stale or insufficient. State unchanged.')
             connection.execute(
                 """UPDATE publications SET status = ?, draft_url = ?, needs_reconciliation = 0,

@@ -30,14 +30,16 @@ def main(argv: list[str] | None = None) -> int:
     command.set_defaults(formatter=format_status)
     commands.add_parser("substack", help="Create a Substack draft containing only the title; never publish.")
     command = commands.add_parser("substack-reconcile", help="Inspect existing drafts without remote changes.")
-    command.add_argument("--link", action="store_true", help="Link locally only with exact title, Draft status, and matching recorded attempt URL.")
+    reconciliation = command.add_mutually_exclusive_group()
+    reconciliation.add_argument("--link", action="store_true", help="Link locally only with exact title, Draft status, and matching recorded attempt URL.")
+    reconciliation.add_argument("--draft-url", help="Verify and link a user-supplied existing Substack draft editor URL.")
     commands.add_parser("substack-login", help="Log into Substack manually in a visible browser.")
     command = commands.add_parser("substack-session", help="Check the saved Substack browser session.")
     command.add_argument("--debug", action="store_true", help="Show redacted session diagnostics for any result.")
     args = parser.parse_args(argv)
     try:
         if args.command == "substack-reconcile":
-            print(reconcile_substack(Path("."), link=args.link))
+            print(reconcile_substack(Path("."), link=args.link, draft_url=args.draft_url))
             return 0
         if args.command == "substack":
             print(format_substack_draft(prepare_substack_draft(Path("."))))

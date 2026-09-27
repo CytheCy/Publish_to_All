@@ -30,6 +30,14 @@ def require_publication(page: Page, publication_url: str) -> None:
 
 
 def navigate_dashboard(page: Page, publication_url: str) -> None:
+    # Draft preflight may already have established this exact dashboard page.
+    # Reuse it to avoid a duplicate Substack request within the same command.
+    try:
+        require_publication(page, publication_url)
+        if detect_authentication(page, publication_url) == AuthenticationState.AUTHENTICATED:
+            return
+    except BrowserSessionError:
+        pass
     page.goto(publication_url + '/publish/home', wait_until='domcontentloaded')
     deadline = monotonic() + 10
     while True:

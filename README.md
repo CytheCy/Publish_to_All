@@ -271,13 +271,19 @@ publish-to-all substack-session
 
 This opens headed Chromium with the same profile, visits the configured publication,
 then navigates to its `/publish/home` dashboard entry page. It reports
-`Authenticated`, `Not authenticated`, or `Unknown`. Both visits allow ten seconds
+`Authenticated`, `Not authenticated`, `Unknown`, or `Temporarily rate limited`. Both visits allow ten seconds
 for hydration and redirects after navigation (navigation has a 30-second limit).
 The checker combines visible account/profile controls, dashboard links, reader
 navigation, publisher navigation, login forms, and login redirects. Access to the
 configured publication's dashboard with multiple creator controls is strong
 authentication evidence. A URL, avatar, or Dashboard link alone is insufficient.
 Contradictory evidence within or between pages returns `Unknown`.
+
+An HTTP 429 response, an exact visible `Too many requests` message, or the same
+recognized Substack error-page title returns `Temporarily rate limited`. The
+checker stops at the first such signal and does not refresh or retry. It reports
+the redacted final URL, the allowlisted page title, and that rate limiting was
+detected. Retry `publish-to-all substack-session` manually later.
 
 When the result is `Unknown`, the command automatically prints the final URL,
 page title, up to 16 recognized visible control labels, and a diagnostic screenshot
@@ -297,7 +303,8 @@ require a detector update. Authentication does not establish ownership or write
 permissions. HTTPS redirects among the configured publication/custom domain and
 Substack hosts are accepted for classification. No controls are clicked and no
 undocumented API calls are made. Exit status is `0` only for Authenticated and `1`
-for Not authenticated, Unknown, cancellation, or a configuration/browser error.
+for Not authenticated, Unknown, Temporarily rate limited, cancellation, or a
+configuration/browser error.
 
 The profile is stored at:
 
@@ -357,8 +364,15 @@ The command reads and validates `config.toml`, the single Markdown story in `In/
 and any matching cover, and calculates the existing exact-source SHA-256 hash.
 It checks duplicate state and requires an existing browser profile before opening
 headed Chromium. A saved profile alone is not proof of authentication: the command
-verifies the live session before reserving an attempt or creating a post. If login
-cannot be confirmed, run `publish-to-all substack-login` and try again.
+verifies the live session before reserving an attempt or creating a post. This
+preflight goes directly to `/publish/home`, and the editor workflow reuses that
+verified page instead of loading the dashboard again. If login cannot be confirmed,
+run `publish-to-all substack-login` and try again.
+
+If the preflight receives HTTP 429 or recognized rendered rate-limit evidence, it
+stops without reserving an attempt, creating a first-run database, opening an
+editor, or changing publication state. It does not retry automatically. Run
+`publish-to-all substack-session` manually later to check whether the limit cleared.
 
 The browser uses the configured publication's dashboard and visible creation
 controls (Create → Article, or the older New post workflow), following
@@ -437,6 +451,23 @@ draft. Therefore no visible match means **Unknown**, never proof of absence.
 This command does not clear failed attempts or authorize a fresh creation. If it
 reports Unknown, inspect the publication's drafts manually before any further
 reconciliation work; do not retry `substack` or delete local state to bypass the block.
+
+If you manually identify the draft left by an unresolved attempt, supply its
+numeric editor URL directly:
+
+```bash
+publish-to-all substack-reconcile --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/123456"
+```
+
+This mode accepts only an HTTPS numeric editor URL on the configured publication.
+It opens that URL with the saved authenticated browser profile and requires stable,
+explicit draft-editor evidence before linking the existing failed attempt. It never
+edits the page or clicks Publish, Send, Schedule, or similar controls. Malformed,
+different-domain, public-post, inaccessible, published, and ambiguous pages leave
+SQLite unchanged. A successful link records the sanitized editor URL, moves the
+same attempt to `draft_created`, clears its reconciliation-required flag, preserves
+its failure history and original attempt timestamps, updates its modification
+timestamp, and keeps duplicate protection active.
 
 The `Open new-post editor` step recognizes exact accessible creation labels
 including `New post`, `Create post`, `Create`, `Write`, `Write a post`, and
