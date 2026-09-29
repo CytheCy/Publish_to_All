@@ -6,14 +6,18 @@ import sys
 
 from .application import (
     add_substack_body, add_substack_image, inspect_project, inspect_status,
-    inspect_substack_draft, prepare_substack_draft, repair_substack_title,
-    reassociate_substack_version, reconcile_substack,
+    inspect_substack_draft, inspect_substack_social_preview, observe_substack_image,
+    prepare_substack_draft, repair_substack_title,
+    reassociate_substack_version, reconcile_substack, reconcile_substack_image,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
 from .presentation import (
     format_check, format_preview, format_status, format_substack_body, format_substack_image,
     format_substack_title,
+    format_social_preview_inspection,
+    format_substack_image_observation,
+    format_substack_image_reconciliation,
     format_substack_reassociation, format_substack_session, format_substack_draft,
 )
 
@@ -43,7 +47,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     commands.add_parser(
         "substack-image",
-        help="Upload the matching cover image to the populated linked Substack draft; never publish.",
+        help="Upload the story's Social Preview image to the populated linked draft; never publish.",
+    )
+    commands.add_parser(
+        "substack-image-observe",
+        help="Observe one manual social/post-preview image upload; never select a file or publish.",
+    )
+    command = commands.add_parser(
+        "substack-image-reconcile",
+        help="Reconcile one uncertain Social Preview image upload; never upload or publish.",
+    )
+    command.add_argument(
+        "--story-hash", required=True,
+        help="Exact current story hash whose linked draft may be inspected.",
     )
     commands.add_parser(
         "substack-title",
@@ -51,6 +67,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     command = commands.add_parser(
         "substack-inspect-draft", help="Inspect one supplied Substack draft editor without changing it.",
+    )
+    command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
+    command = commands.add_parser(
+        "substack-social-preview-inspect",
+        help="Navigate to one draft's Social Preview editor without changing it.",
     )
     command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
     command = commands.add_parser("substack-reconcile", help="Inspect existing drafts without remote changes.")
@@ -87,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "substack-inspect-draft":
             print(inspect_substack_draft(Path("."), args.draft_url))
             return 0
+        if args.command == "substack-social-preview-inspect":
+            print(format_social_preview_inspection(
+                inspect_substack_social_preview(Path("."), args.draft_url)
+            ))
+            return 0
         if args.command == "substack":
             print(format_substack_draft(prepare_substack_draft(Path("."))))
             return 0
@@ -95,6 +121,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "substack-image":
             print(format_substack_image(add_substack_image(Path("."))))
+            return 0
+        if args.command == "substack-image-observe":
+            print(format_substack_image_observation(observe_substack_image(Path("."))))
+            return 0
+        if args.command == "substack-image-reconcile":
+            print(format_substack_image_reconciliation(
+                reconcile_substack_image(Path("."), args.story_hash)
+            ))
             return 0
         if args.command == "substack-title":
             print(format_substack_title(repair_substack_title(Path("."))))

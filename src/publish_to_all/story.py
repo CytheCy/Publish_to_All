@@ -58,6 +58,17 @@ class Story:
     word_count: int
     image: Path | None
     warnings: tuple[str, ...]
+    substack_image: Path | None = None
+    substack_image_fallback: bool = False
+    substack_image_info: "ImageInfo | None" = None
+
+
+@dataclass(frozen=True)
+class ImageInfo:
+    width: int
+    height: int
+    mime_type: str
+    size_bytes: int
 
 
 IMAGE_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
@@ -128,8 +139,9 @@ def parse_front_matter(text: str) -> tuple[Metadata, str]:
     return Metadata(title.strip(), **optional, episode=episode, tags=tuple(t.strip() for t in tags)), body
 
 
-def validate_image(path: Path) -> None:
+def validate_image(path: Path) -> ImageInfo:
     try:
+        size_bytes = path.stat().st_size
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(path) as image:
@@ -138,6 +150,11 @@ def validate_image(path: Path) -> None:
                 image.verify()
             with Image.open(path) as image:
                 image.load()
+                width, height = image.size
+                mime_type = Image.MIME.get(image.format or "", "")
+        if size_bytes < 1 or width < 1 or height < 1 or not mime_type.startswith("image/"):
+            raise StoryError(f"Image has invalid properties: {path}")
+        return ImageInfo(width, height, mime_type, size_bytes)
     except (OSError, UnidentifiedImageError, SyntaxError, ValueError,
             Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise StoryError(f"Cannot read a valid image: {path}") from exc
@@ -180,9 +197,20 @@ def load_story(input_dir: Path) -> Story:
         validate_image(inputs.image)
     else:
         notices.append("No matching image was found.")
+    dedicated_substack_image = input_dir / "Social.png"
+    substack_image = dedicated_substack_image if dedicated_substack_image.exists() else inputs.image
+    substack_image_fallback = substack_image is not None and substack_image != dedicated_substack_image
+    substack_image_info = validate_image(substack_image) if substack_image is not None else None
+    if (substack_image == dedicated_substack_image and substack_image_info is not None
+            and (substack_image_info.width < 600 or substack_image_info.height < 315)):
+        notices.append(
+            "Dedicated Substack Social Preview image is unusually small "
+            f"({substack_image_info.width}x{substack_image_info.height})."
+        )
     return Story(
         inputs.source, metadata, body, tuple(tokens),
         parser.renderer.render(tokens, parser.options, {}), content_hash(source),
         count_words(tokens),
-        inputs.image, tuple(notices),
+        inputs.image, tuple(notices), substack_image, substack_image_fallback,
+        substack_image_info,
     )

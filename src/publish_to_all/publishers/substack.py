@@ -8,9 +8,10 @@ from ..browser import editor
 from ..browser import body as body_editor
 from ..browser import title as title_editor
 from ..browser import image as image_editor
+from ..browser import image_observe as social_preview_image
 from ..browser.session import safe_screenshot
 from ..browser.substack import collect_diagnostics
-from ..errors import PublishToAllError, SubstackRateLimitError
+from ..errors import BrowserSessionError, PublishToAllError, SubstackRateLimitError
 from ..state import StateError
 from .base import Publisher
 
@@ -299,15 +300,16 @@ class SubstackTitleRepairPublisher(Publisher):
 
 
 class SubstackImagePublisher(Publisher):
-    """Upload one cover to a verified, populated, already linked draft."""
+    """Upload one Social Preview image to a verified, populated linked draft."""
 
     name = 'substack'
 
-    def __init__(self, repository, page, publication_url, monitor):
+    def __init__(self, repository, page, publication_url, monitor, diagnostics=None):
         super().__init__(repository)
         self.page = page
         self.publication_url = publication_url
         self.monitor = monitor
+        self.diagnostics = diagnostics
 
     def prepare_draft(self, story, attempt):
         raise PublishToAllError('This workflow only edits an already-linked draft. Nothing was published.')
@@ -315,23 +317,28 @@ class SubstackImagePublisher(Publisher):
     def publish(self, story, draft):
         raise PublishToAllError('Publishing is not implemented. Nothing was published.')
 
-    def _refuse_before_upload(self, reason):
+    def _refuse_before_upload(self, reason, step='Verify title/body'):
+        screenshot = safe_screenshot(self.page, self.diagnostics) if self.diagnostics else None
         raise PublishToAllError(
-            'Substack draft image was not changed.\n\nReason:\n' + reason + '\n\n'
+            'Substack draft image was not changed.\n\nStep:\n' + step +
+            '\n\nReason:\n' + reason + '\n\n'
+            'Redacted diagnostic screenshot:\n' +
+            (str(screenshot) if screenshot else 'Unavailable') + '\n\n'
             'Manual review is required before automatic upload.\n\nNothing was published.'
         )
 
     def upload_image(self, story, record):
-        if story.image is None:
+        if story.substack_image is None:
             raise PublishToAllError(
-                'No matching cover image exists for the current story. Nothing was changed.'
+                'No matching story image exists for the current story. Nothing was changed.'
             )
         try:
-            source_digest = hashlib.sha256(story.image.read_bytes()).digest()
+            source_digest = hashlib.sha256(story.substack_image.read_bytes()).digest()
         except OSError:
             raise PublishToAllError(
-                'The matching cover image is not readable. Nothing was changed.'
+                'The matching story image is not readable. Nothing was changed.'
             ) from None
+        image_editor.validate_upload_image(story.substack_image)
 
         self.monitor.require_clear(self.page)
         try:
@@ -354,50 +361,99 @@ class SubstackImagePublisher(Publisher):
         if body_editor.classify_body_text(body_text) != body_editor.BodyClassification.SUBSTANTIAL:
             self._refuse_before_upload('The draft body is not substantially populated.')
 
-        cover = image_editor.inspect_cover(self.page)
-        self.monitor.require_clear(self.page)
-        if cover.state == image_editor.CoverState.PRESENT:
-            self._refuse_before_upload('The draft already appears to contain a cover image.')
-        if cover.state != image_editor.CoverState.NONE or cover.control is None:
-            self._refuse_before_upload('The draft cover-image state is uncertain.')
+        trace = social_preview_image.UploadTrace()
         try:
-            previously_saved = editor.save_visible(self.page)
-        except PlaywrightError:
-            self._refuse_before_upload('The editor save state could not be inspected safely.')
+            inspection = social_preview_image.inspect_social_preview_image(
+                self.page, self.monitor, trace=trace,
+            )
+        except (PlaywrightError, BrowserSessionError):
+            self._refuse_before_upload(
+                'The Social Preview image control could not be opened unambiguously.', trace.current,
+            )
+        if inspection.state == social_preview_image.SocialPreviewState.PRESENT:
+            self._refuse_before_upload(
+                'The draft already appears to have a Social Preview image.', trace.current,
+            )
+        if (inspection.state != social_preview_image.SocialPreviewState.NONE
+                or inspection.target is None):
+            self._refuse_before_upload(
+                'The Social Preview image state is uncertain.', trace.current,
+            )
         self.monitor.require_clear(self.page)
 
-        active = self.repository.mark_image_uploading(record)
+        active = None
+
+        def begin_selection():
+            nonlocal active
+            # Compare-and-set immediately before the one remote file-selection action.
+            active = self.repository.mark_image_uploading(record)
+
         try:
             self.monitor.require_clear(self.page)
-            image_editor.upload_cover(self.page, cover.control, story.image)
-            self.monitor.require_clear(self.page)
-            image_editor.confirm_cover_and_save(
-                self.page, title_field, story.metadata.title, body_surface, body_text,
-                self.publication_url, record.draft_url.rstrip('/'), self.monitor,
-                previously_saved=previously_saved,
+            social_preview_image.supply_social_preview_file(
+                self.page, inspection.target, story.substack_image, self.monitor, trace=trace,
+                before_selection=begin_selection,
             )
-            if hashlib.sha256(story.image.read_bytes()).digest() != source_digest:
+            social_preview_image.save_social_preview(self.page, self.monitor, trace=trace)
+            trace.start('Verify title/body')
+            if editor.extract_draft_url(self.page, self.publication_url) != record.draft_url.rstrip('/'):
+                raise BrowserSessionError('The editor URL changed after the Social Preview save.')
+            final_title = editor.unique_visible(editor.title_fields(self.page))
+            final_body = body_editor.locate_body_surface(self.page)
+            if (final_title is None
+                    or editor.title_value(final_title).strip() != story.metadata.title):
+                raise BrowserSessionError('The draft title changed during Social Preview upload.')
+            final_body_text = ' '.join(final_body.inner_text().split())
+            if (body_editor.classify_body_text(final_body_text)
+                    != body_editor.BodyClassification.SUBSTANTIAL
+                    or final_body_text != body_text):
+                raise BrowserSessionError('The draft body changed during Social Preview upload.')
+            trace.complete('Verify title/body')
+            trace.start('Verify local source image unchanged')
+            if hashlib.sha256(story.substack_image.read_bytes()).digest() != source_digest:
                 raise PublishToAllError('The local source image changed during upload.')
+            trace.complete('Verify local source image unchanged')
             return self.repository.mark_image_uploaded(active)
         except (Exception, KeyboardInterrupt) as exc:
+            if active is None:
+                if isinstance(exc, SubstackRateLimitError):
+                    raise SubstackRateLimitError(
+                        'Substack rate limit encountered before file selection. '
+                        'Local image state is unchanged. Nothing was published.'
+                    ) from None
+                self._refuse_before_upload(
+                    'The Social Preview upload stopped before file selection began.', trace.current,
+                )
             rate_limited = isinstance(exc, SubstackRateLimitError)
+            failed_step = trace.current
+            screenshot = safe_screenshot(self.page, self.diagnostics) if self.diagnostics else None
             message = (
-                'Substack rate limit encountered after image upload began; remote image is uncertain.'
+                f'Substack rate limit encountered at step: {failed_step}; remote image is uncertain.'
                 if rate_limited else
-                'Substack image upload or save confirmation failed; remote image is uncertain.'
+                f'Substack image upload failed at step: {failed_step}; remote image is uncertain.'
             )
+            if screenshot:
+                message += f' Diagnostic screenshot: {screenshot}'
+            message += '\n' + trace.text()
             try:
-                self.repository.mark_image_upload_failed(active, message)
+                self.repository.mark_image_upload_failed(
+                    active, message, failed_step=failed_step,
+                    diagnostic_screenshot=str(screenshot) if screenshot else None,
+                )
             except StateError:
                 pass
             if rate_limited:
                 raise PublishToAllError(
                     'Substack rate limit encountered during image upload or save confirmation.\n\n'
+                    f'Failed step:\n{failed_step}\n\n'
                     'The remote draft may or may not contain the image.\n\n'
                     'Local state has been protected against automatic retry.\n\nNothing was published.'
                 ) from None
             raise PublishToAllError(
-                'Substack draft cover image upload did not complete safely.\n\n'
+                'Substack Social Preview image upload did not complete safely.\n\n'
+                f'Failed step:\n{failed_step}\n\n'
+                f'{trace.text()}\n\n'
+                f'Diagnostic screenshot:\n{screenshot or "Unavailable (capture failed or diagnostics disabled)"}\n\n'
                 'The remote draft may or may not contain the image.\n\n'
                 'Local state has been protected against automatic retry. Inspect the linked draft '
                 'before any recovery.\n\nNothing was published.'

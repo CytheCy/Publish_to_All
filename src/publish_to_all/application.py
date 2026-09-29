@@ -32,6 +32,37 @@ class StoryStatus:
     substack: PublicationRecord | None
 
 
+@dataclass(frozen=True)
+class ImageReconciliationResult:
+    story: Story
+    substack: PublicationRecord
+    remote_social_preview_state: str
+
+
+@dataclass(frozen=True)
+class ImageObservationResult:
+    story: Story
+    substack: PublicationRecord
+    draft_url: str
+    target_feature: str
+    dom: object
+    network_responses: int
+    successful_network_responses: int
+    failed_network_responses: int
+    final_url_unchanged: bool
+    title_preserved: bool
+    body_preserved: bool
+    local_state_unchanged: bool
+
+
+@dataclass(frozen=True)
+class SocialPreviewReadOnlyResult:
+    draft_url: str
+    image_state: str
+    local_save_count: int
+    local_save_enabled: bool
+
+
 def inspect_status(root: Path) -> StoryStatus:
     """Read exact-version state, initializing only the schema if necessary."""
     story = load_story(root / "In")
@@ -147,25 +178,20 @@ def add_substack_body(root: Path) -> StoryStatus:
 
 
 def add_substack_image(root: Path) -> StoryStatus:
-    """Upload the matching cover to the exact populated, already-linked draft."""
+    """Upload the current story image only through the article Social Preview editor."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.image import validate_upload_image
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
 
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
     story = inspection.story
-    if story.image is None:
+    if story.substack_image is None:
         raise BrowserSessionError(
-            'No matching cover image exists for the current story. Nothing was changed.'
+            'No matching story image exists for the current story. Nothing was changed.'
         )
-    try:
-        with story.image.open('rb') as source:
-            source.read(1)
-    except OSError:
-        raise BrowserSessionError(
-            'The matching cover image is not readable. Nothing was changed.'
-        ) from None
+    validate_upload_image(story.substack_image)
 
     paths = runtime_paths(root)
     repository = PublicationRepository(paths.database)
@@ -189,20 +215,14 @@ def add_substack_image(root: Path) -> StoryStatus:
                 rate_limit_monitor=monitor,
             )
         except (BrowserSessionError, PlaywrightError):
-            try:
-                monitor.require_clear(page)
-            except SubstackRateLimitError:
-                raise SubstackRateLimitError(
-                    'Substack rate limit encountered before image upload.\n\n'
-                    'Local publication state is unchanged.\n\nNothing was published.'
-                ) from None
+            monitor.require_clear(page)
             raise BrowserSessionError(
                 'Could not safely verify the linked authenticated Substack editor. '
                 'The draft was not changed. Nothing was published.'
             ) from None
         if evidence.rate_limited or monitor.encountered:
             raise SubstackRateLimitError(
-                'Substack rate limit encountered before image upload.\n\n'
+                'Substack rate limit encountered before Social Preview image upload.\n\n'
                 'Local publication state is unchanged.\n\nNothing was published.'
             )
         if not evidence.verified or evidence.inspection is None:
@@ -211,19 +231,227 @@ def add_substack_image(root: Path) -> StoryStatus:
                 'The draft was not changed. Nothing was published.'
             )
         remote = evidence.inspection
-        if remote.draft_url.rstrip('/') != record.draft_url.rstrip('/'):
+        if remote.draft_url.rstrip('/') != draft_url:
             raise BrowserSessionError(
-                'The opened editor does not match the linked draft URL. '
-                'The draft was not changed. Nothing was published.'
+                'The opened editor does not match the linked draft URL. Nothing was changed.'
             )
         if remote.visible_title != story.metadata.title or remote.body_classification != 'substantial':
             raise BrowserSessionError(
-                'The linked draft title or populated body does not match the image-upload preflight. '
-                'The draft was not changed. Nothing was published.'
+                'The linked draft title or populated body does not match the image preflight. '
+                'Nothing was changed.'
             )
-        publisher = SubstackImagePublisher(repository, page, publication_url, monitor)
+        publisher = SubstackImagePublisher(
+            repository, page, publication_url, monitor, paths.diagnostics,
+        )
         updated = publisher.upload_image(story, record)
     return StoryStatus(story, updated)
+
+
+def reconcile_substack_image(
+    root: Path, exact_story_hash: str,
+) -> ImageReconciliationResult:
+    """Read one linked draft and reconcile its local Social Preview image state."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    story = inspection.story
+    if not exact_story_hash or exact_story_hash != story.source_hash:
+        raise BrowserSessionError(
+            'The supplied story hash does not exactly match the current story. '
+            'Local state is unchanged. Nothing was published.'
+        )
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database)
+    record = repository.require_image_reconciliation_candidate(exact_story_hash, 'substack')
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The linked draft URL is not canonical. Local state is unchanged.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Run publish-to-all substack-login first. '
+            'Local state is unchanged.'
+        )
+
+    with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except (BrowserSessionError, PlaywrightError):
+            try:
+                monitor.require_clear(page)
+            except SubstackRateLimitError:
+                raise SubstackRateLimitError(
+                    'Substack rate limit encountered during image reconciliation.\n\n'
+                    'Local state is unchanged. Nothing was published.'
+                ) from None
+            raise BrowserSessionError(
+                'Could not safely inspect the linked authenticated Substack editor. '
+                'Local state is unchanged. Nothing was published.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limit encountered during image reconciliation.\n\n'
+                'Local state is unchanged. Nothing was published.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not positively verify the linked draft before Social Preview inspection. '
+                'Local state is unchanged and image retry remains blocked. Nothing was published.'
+            )
+        remote = evidence.inspection
+        if remote.draft_url.rstrip('/') != draft_url:
+            raise BrowserSessionError(
+                'The opened editor does not match the linked draft URL. Local state is unchanged.'
+            )
+        if remote.visible_title != story.metadata.title or remote.body_classification != 'substantial':
+            raise BrowserSessionError(
+                'The linked draft title or populated body does not match the current story. '
+                'Local state is unchanged.'
+            )
+        try:
+            social_preview = inspect_social_preview_image(page, monitor)
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'Remote Social Preview image state is unknown. Local state is unchanged '
+                'and image retry remains blocked.'
+            ) from None
+        social_state = social_preview.state.value
+        if social_state == 'unknown':
+            raise BrowserSessionError(
+                'Remote Social Preview image state is unknown. Local state is unchanged '
+                'and image retry remains blocked.'
+            )
+        if social_state not in {'none', 'present'}:
+            raise BrowserSessionError(
+                'Remote Social Preview image state is not positive reconciliation evidence. '
+                'Local state is unchanged.'
+            )
+        monitor.require_clear(page)
+        updated = repository.reconcile_image_upload(record, social_state)
+    return ImageReconciliationResult(story, updated, social_state)
+
+
+def observe_substack_image(root: Path) -> ImageObservationResult:
+    """Observe one user-driven social/post-preview upload without injecting a file."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser import body as body_editor
+    from .browser import editor
+    from .browser import image_observe
+    from .browser.body import RateLimitMonitor
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    story = inspection.story
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database)
+    record = repository.require_image_candidate(story.source_hash, 'substack')
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The linked draft URL is not canonical. Local state is unchanged.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Run publish-to-all substack-login first. '
+            'Local state is unchanged.'
+        )
+
+    with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        network = image_observe.SafeNetworkObservation(publication_url)
+        page.on('response', monitor.observe)
+        page.on('response', network.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'Local state is unchanged. Nothing was published.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limit encountered before manual image observation.\n\n'
+                'Local state is unchanged. Nothing was published.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'Local state is unchanged. Nothing was published.'
+            )
+        remote = evidence.inspection
+        if remote.draft_url.rstrip('/') != draft_url:
+            raise BrowserSessionError('The opened editor does not match the linked draft URL.')
+        if remote.visible_title != story.metadata.title or remote.body_classification != 'substantial':
+            raise BrowserSessionError(
+                'The linked draft title or populated body does not match the observation preflight.'
+            )
+
+        title_field = editor.unique_visible(editor.title_fields(page))
+        body_surface = body_editor.locate_body_surface(page)
+        if title_field is None or not title_field.is_editable():
+            raise BrowserSessionError('The draft title could not be inspected safely.')
+        initial_title = editor.title_value(title_field).strip()
+        initial_body = ' '.join(body_surface.inner_text().split())
+        target = image_observe.open_social_preview_image(page, monitor)
+        selected_files = target.file_input.evaluate(
+            'node => node.files ? node.files.length : 0'
+        )
+        if selected_files:
+            raise BrowserSessionError(
+                'The Social preview file input was not empty before observation. '
+                'No file was selected by this command.'
+            )
+        image_observe.install_dom_observer(page, target)
+        network.active = True
+        print(
+            '\nManual observation is ready in the visible browser.\n'
+            'Target: Post settings → Social preview → Edit social preview → Image.\n'
+            'Choose the image yourself with Select image and complete the Social preview Save step.\n'
+            'Do not click Continue, Publish, Send, or Schedule.\n'
+            'This command will not select a file or click any publication control.\n',
+            flush=True,
+        )
+        image_observe.wait_for_manual_upload(page, monitor)
+        page.wait_for_timeout(500)
+        monitor.require_clear(page)
+        dom = image_observe.read_dom_observation(page)
+        final_url_unchanged = page.url.rstrip('/') == draft_url
+        try:
+            final_title_field = editor.unique_visible(editor.title_fields(page))
+            final_body_surface = body_editor.locate_body_surface(page)
+            title_preserved = bool(
+                final_title_field is not None
+                and editor.title_value(final_title_field).strip() == initial_title
+            )
+            body_preserved = ' '.join(final_body_surface.inner_text().split()) == initial_body
+        except (BrowserSessionError, PlaywrightError):
+            title_preserved = body_preserved = False
+
+    current = repository.get_publication(story.source_hash, 'substack')
+    local_unchanged = current == record
+    if not local_unchanged:
+        raise BrowserSessionError(
+            'Local publication state changed unexpectedly during observation. Nothing was published.'
+        )
+    return ImageObservationResult(
+        story, current, draft_url, image_observe.ImageFeature.SOCIAL_POST_PREVIEW.value,
+        dom, network.responses, network.successful_responses, network.failed_responses,
+        final_url_unchanged, title_preserved, body_preserved, local_unchanged,
+    )
 
 
 def repair_substack_title(root: Path) -> StoryStatus:
@@ -296,6 +524,7 @@ def inspect_substack_draft(root: Path, draft_url: str) -> str:
     """Inspect one explicitly supplied editor URL without reading or writing SQLite."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.image_observe import SocialPreviewState, inspect_social_preview_image
     from .browser.reconcile import (
         SuppliedDraftEvidence, supplied_draft_diagnostics, validate_supplied_draft_url,
         verify_supplied_draft,
@@ -311,10 +540,16 @@ def inspect_substack_draft(root: Path, draft_url: str) -> str:
         page = context.new_page()
         monitor = RateLimitMonitor(publication_url)
         page.on('response', monitor.observe)
+        social_preview_state = SocialPreviewState.UNKNOWN.value
         try:
             evidence = verify_supplied_draft(
                 page, publication_url, supplied_url, paths.diagnostics,
                 rate_limit_monitor=monitor,
+            )
+        except SubstackRateLimitError:
+            return _format_supplied_draft_failure(
+                SuppliedDraftEvidence(False, 'Substack returned a rate-limit response.', True),
+                rate_limited=True,
             )
         except (BrowserSessionError, PlaywrightError):
             evidence = SuppliedDraftEvidence(
@@ -323,6 +558,16 @@ def inspect_substack_draft(root: Path, draft_url: str) -> str:
                     page, publication_url, paths.diagnostics,
                 ),
             )
+        if evidence.verified and evidence.inspection is not None:
+            try:
+                social_preview_state = inspect_social_preview_image(page, monitor).state.value
+            except SubstackRateLimitError:
+                return _format_supplied_draft_failure(
+                    SuppliedDraftEvidence(False, 'Substack returned a rate-limit response.', True),
+                    rate_limited=True,
+                )
+            except (BrowserSessionError, PlaywrightError):
+                social_preview_state = SocialPreviewState.UNKNOWN.value
     if evidence.rate_limited:
         return _format_supplied_draft_failure(evidence, rate_limited=True)
     if not evidence.verified or evidence.inspection is None:
@@ -339,6 +584,7 @@ def inspect_substack_draft(root: Path, draft_url: str) -> str:
         'Editable body: ' + result.body_classification,
         'Cover/image appears present: ' + ('Yes' if result.image_present else 'No confirmed cover'),
         'Cover image state: ' + result.cover_state.capitalize(),
+        'Social preview image: ' + social_preview_state,
         'Visible save/editor state: ' + (', '.join(result.editor_state) if result.editor_state else 'None visible'),
         'Definitely a draft editor: ' + ('Yes' if result.definitely_draft_editor else 'No'),
         'Final URL: ' + result.final_url,
@@ -367,6 +613,66 @@ def inspect_substack_draft(root: Path, draft_url: str) -> str:
         *lines, '', 'Local SQLite state unchanged.',
         'No remote changes were made.', 'Nothing was published.',
     ])
+
+
+def inspect_substack_social_preview(
+    root: Path, draft_url: str,
+) -> SocialPreviewReadOnlyResult:
+    """Open one supplied draft and inspect Social Preview without changing it."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    supplied_url = validate_supplied_draft_url(draft_url, publication_url)
+    paths = runtime_paths(root)
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. No remote or local changes were made.'
+        )
+    with persistent_browser(
+        paths.substack_browser_profile, paths.diagnostics, headless=False,
+    ) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, supplied_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except SubstackRateLimitError:
+            raise
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'Could not safely verify the supplied authenticated Substack editor. '
+                'No remote or local changes were made.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limit encountered during read-only Social Preview inspection. '
+                'Inspection stopped immediately. No remote or local changes were made.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not positively verify the supplied draft editor. '
+                'No remote or local changes were made.'
+            )
+        if evidence.inspection.draft_url.rstrip('/') != supplied_url:
+            raise BrowserSessionError(
+                'The opened editor does not match the supplied draft URL. '
+                'No remote or local changes were made.'
+            )
+        result = inspect_social_preview_image(page, monitor)
+        monitor.require_clear(page)
+        return SocialPreviewReadOnlyResult(
+            supplied_url, result.state.value,
+            result.diagnostics.local_save_count,
+            result.diagnostics.local_save_enabled,
+        )
 
 
 def reconcile_substack(

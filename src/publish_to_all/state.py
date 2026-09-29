@@ -136,6 +136,19 @@ MIGRATIONS = (
         "ALTER TABLE publications ADD COLUMN image_uploaded_at TEXT",
         "ALTER TABLE publications ADD COLUMN image_error_message TEXT",
     ),
+    (
+        """CREATE TABLE publication_image_attempts (
+            id INTEGER PRIMARY KEY,
+            publication_id INTEGER NOT NULL REFERENCES publications(id),
+            started_at TEXT,
+            recorded_at TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('failed_uncertain', 'reconciled_none', 'reconciled_present')),
+            error_message TEXT,
+            failed_step TEXT,
+            diagnostic_screenshot TEXT
+        )""",
+        "CREATE INDEX publication_image_attempts_publication ON publication_image_attempts(publication_id, id)",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -708,6 +721,135 @@ class PublicationRepository:
                 )
         return record
 
+    def require_image_reconciliation_candidate(
+        self, source_hash: str, destination: str,
+    ) -> PublicationRecord:
+        """Return an exact linked draft whose image state can be verified read-only."""
+        if not source_hash:
+            raise StateError('The exact current story hash is required. State unchanged.')
+        with self._connection() as connection:
+            record = self._lookup(connection, source_hash, destination)
+            if record is None:
+                raise StateError(
+                    'No publication record exists for this exact story version. State unchanged.'
+                )
+            if (record.status != PublicationStatus.DRAFT_CREATED
+                    or record.published_url is not None):
+                raise StateError('Image reconciliation requires an unpublished linked draft. State unchanged.')
+            if not _is_numeric_draft_url(record.draft_url):
+                raise StateError('Image reconciliation requires a numeric linked draft URL. State unchanged.')
+            clean_not_started = (
+                record.image_status == ImageStatus.NOT_STARTED
+                and not record.needs_reconciliation and not record.image_error_message
+            )
+            uncertain_failed = (
+                record.image_status == ImageStatus.FAILED
+                and record.needs_reconciliation and bool(record.image_error_message)
+            )
+            if not (clean_not_started or uncertain_failed):
+                raise StateError(
+                    'Image reconciliation requires a clean not-started image state or an uncertain '
+                    'failed image upload. State unchanged.'
+                )
+            if record.error_message or record.body_error_message:
+                raise StateError(
+                    'The publication has another unresolved error; image reconciliation was refused. '
+                    'State unchanged.'
+                )
+            if record.body_status != BodyStatus.INSERTED:
+                raise StateError('The linked draft body is not recorded as inserted. State unchanged.')
+            canonical_url = record.draft_url.rstrip('/')
+            owners = connection.execute(
+                """SELECT p.id FROM publications p
+                   WHERE p.draft_url IS NOT NULL AND rtrim(p.draft_url, '/') = ?""",
+                (canonical_url,),
+            ).fetchall()
+            if [row['id'] for row in owners] != [record.id]:
+                raise StateError(
+                    'The linked draft URL does not belong uniquely to this exact story version. '
+                    'State unchanged.'
+                )
+        return record
+
+    @staticmethod
+    def _preserve_image_failure(connection, record: PublicationRecord) -> None:
+        existing = connection.execute(
+            """SELECT 1 FROM publication_image_attempts
+               WHERE publication_id = ? AND outcome = 'failed_uncertain'
+               AND started_at IS ? AND error_message IS ?""",
+            (record.id, record.image_started_at, record.image_error_message),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """INSERT INTO publication_image_attempts
+                   (publication_id, started_at, recorded_at, outcome, error_message)
+                   VALUES (?, ?, ?, 'failed_uncertain', ?)""",
+                (record.id, record.image_started_at, _now(), record.image_error_message),
+            )
+
+    def reconcile_image_upload(
+        self, expected: PublicationRecord, remote_social_preview_state: str,
+    ) -> PublicationRecord:
+        """Resolve an uncertain Social Preview upload from positive remote evidence."""
+        if remote_social_preview_state not in {'none', 'present'}:
+            raise StateError(
+                'Remote Social Preview state is not positive reconciliation evidence. State unchanged.'
+            )
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,)
+            ).fetchone())
+            clean_not_started = (
+                current.image_status == ImageStatus.NOT_STARTED
+                and not current.needs_reconciliation and not current.image_error_message
+            )
+            uncertain_failed = (
+                current.image_status == ImageStatus.FAILED
+                and current.needs_reconciliation and bool(current.image_error_message)
+            )
+            if (current != expected or current.status != PublicationStatus.DRAFT_CREATED
+                    or current.published_url is not None
+                    or not _is_numeric_draft_url(current.draft_url)
+                    or current.body_status != BodyStatus.INSERTED
+                    or not (clean_not_started or uncertain_failed)
+                    or current.error_message or current.body_error_message):
+                raise StateError('Image reconciliation evidence is stale or insufficient. State unchanged.')
+            if clean_not_started and remote_social_preview_state == 'none':
+                return current
+            if uncertain_failed:
+                self._preserve_image_failure(connection, current)
+            now = _now()
+            new_status = (
+                ImageStatus.NOT_STARTED
+                if remote_social_preview_state == 'none' else ImageStatus.UPLOADED
+            )
+            uploaded_at = None if new_status == ImageStatus.NOT_STARTED else now
+            connection.execute(
+                """UPDATE publications SET image_status = ?, image_uploaded_at = ?,
+                   image_error_message = NULL, needs_reconciliation = 0, updated_at = ?
+                   WHERE id = ?""",
+                (new_status, uploaded_at, now, current.id),
+            )
+            connection.execute(
+                """INSERT INTO publication_image_attempts
+                   (publication_id, started_at, recorded_at, outcome)
+                   VALUES (?, ?, ?, ?)""",
+                (current.id, current.image_started_at, now,
+                 'reconciled_none'
+                 if remote_social_preview_state == 'none' else 'reconciled_present'),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
+
+    def image_attempt_history(self, publication_id: int) -> tuple[sqlite3.Row, ...]:
+        """Return image audit evidence in insertion order."""
+        with self._connection() as connection:
+            return tuple(connection.execute(
+                'SELECT * FROM publication_image_attempts WHERE publication_id = ? ORDER BY id',
+                (publication_id,),
+            ).fetchall())
+
     def mark_image_uploading(self, expected: PublicationRecord) -> PublicationRecord:
         """Compare-and-set immediately before selecting the local image file."""
         with self._connection(write=True) as connection:
@@ -733,7 +875,7 @@ class PublicationRepository:
             ).fetchone())
 
     def mark_image_uploaded(self, expected: PublicationRecord) -> PublicationRecord:
-        """Record a cover only after appearance, content, URL, and save checks pass."""
+        """Record a Social Preview image after preview, save, content, and URL checks pass."""
         with self._connection(write=True) as connection:
             current = self._record(connection.execute(
                 'SELECT * FROM publications WHERE id = ?', (expected.id,)
@@ -755,7 +897,8 @@ class PublicationRepository:
             ).fetchone())
 
     def mark_image_upload_failed(
-        self, expected: PublicationRecord, error_message: str,
+        self, expected: PublicationRecord, error_message: str, *, failed_step: str | None = None,
+        diagnostic_screenshot: str | None = None,
     ) -> PublicationRecord:
         """Block automatic retry after any upload may have reached Substack."""
         with self._connection(write=True) as connection:
@@ -768,6 +911,14 @@ class PublicationRepository:
                 """UPDATE publications SET image_status = ?, image_error_message = ?,
                    needs_reconciliation = 1, updated_at = ? WHERE id = ?""",
                 (ImageStatus.FAILED, error_message, _now(), current.id),
+            )
+            connection.execute(
+                """INSERT INTO publication_image_attempts
+                   (publication_id, started_at, recorded_at, outcome, error_message,
+                    failed_step, diagnostic_screenshot)
+                   VALUES (?, ?, ?, 'failed_uncertain', ?, ?, ?)""",
+                (current.id, current.image_started_at, _now(), error_message,
+                 failed_step, diagnostic_screenshot),
             )
             return self._record(connection.execute(
                 'SELECT * FROM publications WHERE id = ?', (current.id,)

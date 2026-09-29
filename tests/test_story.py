@@ -110,6 +110,58 @@ def test_valid_image_and_inputs_unchanged(tmp_path):
     assert story.source_hash == hashlib.sha256(before["story.md"]).hexdigest()
 
 
+def test_social_png_is_preferred_only_for_substack(tmp_path):
+    write_story(tmp_path)
+    general = tmp_path / "story.png"
+    social = tmp_path / "Social.png"
+    Image.new("RGB", (800, 450), "blue").save(general)
+    Image.new("RGBA", (1200, 630), "red").save(social)
+
+    story = load_story(tmp_path)
+
+    assert story.image == general
+    assert story.substack_image == social
+    assert not story.substack_image_fallback
+    assert (story.substack_image_info.width, story.substack_image_info.height) == (1200, 630)
+    assert story.substack_image_info.mime_type == "image/png"
+    assert story.substack_image_info.size_bytes == social.stat().st_size
+
+
+def test_substack_image_falls_back_only_to_matching_general_image(tmp_path):
+    write_story(tmp_path)
+    general = tmp_path / "story.png"
+    Image.new("RGB", (800, 450), "blue").save(general)
+    Image.new("RGB", (1200, 630), "red").save(tmp_path / "unrelated.png")
+
+    story = load_story(tmp_path)
+
+    assert story.image == general
+    assert story.substack_image == general
+    assert story.substack_image_fallback
+
+
+@pytest.mark.parametrize("kind", ["garbage", "jpeg", "truncated"])
+def test_invalid_social_png_is_rejected(tmp_path, kind):
+    write_story(tmp_path)
+    social = tmp_path / "Social.png"
+    if kind == "jpeg":
+        Image.new("RGB", (1200, 630)).save(social, format="JPEG")
+    elif kind == "truncated":
+        Image.new("RGB", (1200, 630)).save(social)
+        social.write_bytes(social.read_bytes()[:40])
+    else:
+        social.write_bytes(b"not a PNG")
+    with pytest.raises(StoryError):
+        load_story(tmp_path)
+
+
+def test_unusually_small_social_png_warns(tmp_path):
+    write_story(tmp_path)
+    Image.new("RGB", (20, 20)).save(tmp_path / "Social.png")
+    story = load_story(tmp_path)
+    assert any("unusually small (20x20)" in warning for warning in story.warnings)
+
+
 @pytest.mark.parametrize("kind", ["garbage", "jpeg", "directory", "truncated"])
 def test_invalid_image(tmp_path, kind):
     write_story(tmp_path)

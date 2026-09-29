@@ -90,6 +90,24 @@ def test_preview_optional_metadata(project, capsys):
         assert text in output
 
 
+def test_preview_reports_dedicated_substack_image_separately(project, capsys):
+    social = project / "In/Social.png"
+    Image.new("RGBA", (1200, 630), "red").save(social)
+    assert main(["preview"]) == 0
+    output = capsys.readouterr().out
+    assert "Image: date.png" in output
+    assert "Substack social preview image: Social.png" in output
+    assert "Substack image details: 1200x630, image/png," in output
+    assert "fallback" not in output
+
+
+def test_preview_reports_substack_fallback(project, capsys):
+    assert main(["preview"]) == 0
+    output = capsys.readouterr().out
+    assert "Substack social preview image: date.png" in output
+    assert "(fallback to matching general story image)" in output
+
+
 @pytest.mark.parametrize("command", ["check", "preview"])
 def test_offline_without_cover(project, capsys, command):
     (project / "config.toml").unlink()

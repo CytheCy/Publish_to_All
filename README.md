@@ -8,15 +8,16 @@ review, with no automatic final publication.
 `publish-to-all substack` still creates a title-only draft. The separate
 `publish-to-all substack-title` command repairs an empty title on an existing
 linked draft, `publish-to-all substack-body` adds the parsed story body, and
-`publish-to-all substack-image` uploads its matching cover. None publishes,
+`publish-to-all substack-image` uploads its matching Social Preview image. None publishes,
 sends, schedules, or configures publication settings.
 
 ## Structure
 
 ```text
 In/
-├── any-story-name.md
-└── any-story-name.png
+├── 01_01_2040.md
+├── 01_01_2040.png
+└── Social.png
 src/publish_to_all/
     application.py            # project inspection and local status queries
     cli.py                    # argparse command entry point
@@ -29,21 +30,30 @@ src/publish_to_all/
     browser/substack.py       # manual login and conservative authentication checks
     browser/editor.py         # guarded new-post navigation, title entry, save confirmation
     browser/body.py           # body inspection, formatted insertion, save confirmation
-    browser/image.py          # cover inspection, file selection, save confirmation
+    browser/image.py          # quarantined historical attachment-thumbnail helpers
+    browser/image_observe.py  # Social Preview inspection, upload, and save confirmation
     browser/title.py          # empty-title inspection, insertion, save confirmation
-    publishers/substack.py    # draft, title, body, and cover workflows
+    publishers/substack.py    # draft, title, body, and Social Preview workflows
     publishers/base.py        # abstract provider contract using validated Story
 tests/                       # configuration, story, state, and CLI tests
 config.example.toml
 pyproject.toml
 ```
 
-Only one Markdown story should be directly inside `In/` at a time. The Markdown
-file and optional image must share the same base filename. Supported cover
-extensions are `.png`, `.jpg`, `.jpeg`, and `.webp` (extensions are case-insensitive).
-Nested stories and unrelated images are ignored. Multiple Markdown stories or
-multiple matching covers fail clearly. A missing cover produces a warning.
-Original files are never renamed, moved, or rewritten.
+Only one Markdown story should be directly inside `In/` at a time. Its optional
+general story image shares the Markdown base filename; for example,
+`01_01_2040.png`. Supported general-image extensions are `.png`, `.jpg`, `.jpeg`,
+and `.webp` (extensions are case-insensitive). `Social.png` is a separate,
+special-purpose image and is the preferred Substack Social Preview source. When
+`Social.png` is absent, Substack falls back only to the matching general story
+image. It never selects another unrelated image. These files serve different
+purposes: the general image remains available to Hugo, Medium, Royal Road, and
+other workflows, while `Social.png` supplies the Substack article card/share
+image. `Social.png` is validated but is never resized, cropped, recompressed, or
+otherwise modified. Nested stories and unrelated images are ignored. Multiple
+Markdown stories or multiple matching general images fail clearly. A missing
+general image produces a warning. Original files are never renamed, moved, or
+rewritten.
 
 ## Setup
 
@@ -226,7 +236,7 @@ and story hash association remain intact. An uncertain body result sets the
 reconciliation flag and blocks another automatic insertion; the full body is
 never stored in SQLite.
 
-Cover upload has its own `image_not_started`, `image_uploading`, `image_uploaded`,
+Social Preview image upload has its own `image_not_started`, `image_uploading`, `image_uploaded`,
 and `image_upload_failed` state. An upload is eligible only after body insertion
 is complete. Once file selection begins, any uncertain outcome requires manual
 inspection and blocks automatic re-upload. SQLite stores no image bytes.
@@ -524,33 +534,98 @@ contain some or all of the story; local state is marked conservatively to block
 another automatic insertion. Use `substack-inspect-draft` with the retained URL
 to inspect an uncertain result before any recovery.
 
-## Upload the cover image to the linked Substack draft
+## Upload the article Social Preview image
 
-Run the dedicated cover stage only after the story body has been inserted:
+Substack's rendered editor distinguishes several unrelated image features. In
+particular, `File Settings → Thumbnail` edits the thumbnail of an embedded file
+attachment. It is not the article image. Inline body images and the publication
+cover are separate again. For an article card/share image, the current rendered
+path is `Post settings → Social preview → Edit social preview → Image`.
+
+After the body has been inserted into an existing linked draft, run:
 
 ```bash
 publish-to-all substack-image
 ```
 
-The command operates only on the numeric draft URL already linked to the exact
-current Markdown hash. It requires `draft_created`, `body_inserted`, a readable
-same-stem image, one unique local owner for the URL, no unresolved error or
-reconciliation condition, and an authenticated persistent Substack session. It
-opens that stored draft directly and never enters new-post creation.
+The command recalculates the exact current story hash and accepts only its
+existing `draft_created` record with a unique numeric draft URL, `body_inserted`,
+`image_not_started`, and no reconciliation condition. It uses `In/Social.png`
+when present, otherwise falls back to the same-basename general story image. It
+validates the selected image data locally, verifies the saved authenticated
+session, and opens only that stored draft URL. It confirms the exact title and a
+substantial body before any remote write. HTTP 429 stops the operation immediately.
 
-Before file selection, it verifies the exact visible title, a substantially
-populated editable body, stable draft-editor controls, and the configured host.
-It inspects only the main post cover/hero area. An existing cover is never
-replaced, and an uncertain cover state stops for manual review. Inline-body and
-social-preview upload controls are not used.
+The only upload route is `Post settings → Social preview → Edit social preview →
+Image`. Selectors stay within the Social Preview settings row and editor dialog.
+The File Settings attachment thumbnail, inline body image controls, publication
+cover/logo controls, and generic attachments are rejected; there is no fallback
+to those features.
 
-The original matching image is selected unchanged through the editor's semantic
-cover file control. The command stays on the same draft while it confirms cover
-appearance, the preserved title and body, and a fresh `Saved` signal. It never
-clicks Continue, Publish, Send, or Schedule and does not publish. Confirmed
-success prevents a second upload. Any uncertain failure after file selection,
-including HTTP 429, retains the draft and body state while blocking automatic
-retry until the remote cover is inspected manually.
+File selection occurs once on the exact Social Preview image input. Success
+requires one input event, one change event, input replacement or equivalent
+Social Preview rerender evidence, processing or a preview-related mutation, and
+an appearing image preview. The command then clicks only the Save/Done control
+inside the Social Preview editor and requires a fresh `Saving → Saved` transition
+from the main editor. It verifies the URL, title, and substantial unchanged body
+without reloading or navigating away. It never clicks Continue, Publish, Send,
+or Schedule, and it does not publish.
+
+If anything fails after file selection begins, local state changes to an uncertain
+failed image attempt and blocks retry. The title, body stage, draft URL, story hash,
+and duplicate protection remain intact. The command never retries file selection.
+On confirmed success it records `image_uploaded`, clears the image error, and
+records the upload timestamp.
+
+The manual observer remains available for UI diagnostics:
+
+```bash
+publish-to-all substack-image-observe
+```
+
+The observer opens only the numeric draft URL already linked to the exact current
+Markdown hash. It verifies the title and populated body, opens the social preview
+image editor, installs safe DOM and response counters, and stops before selecting
+a file. Select and save the image yourself in the visible browser, then press
+Enter in the terminal. The observer records which file input received events,
+input replacement, DOM mutations, processing/preview signals, dialog rerendering,
+safe response counts, navigation, and fresh save signals. It never reads file
+names or contents, cookies, tokens, request bodies, URLs from observed responses,
+or response headers. It never clicks Continue, Publish, Send, or Schedule, and it
+does not update local image state.
+
+To verify only the navigation path and current Social Preview image state, run:
+
+```bash
+publish-to-all substack-social-preview-inspect \
+  --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/123456"
+```
+
+This headed read-only command opens only the supplied numeric draft URL. It waits
+for the editor-specific `Settings` button, the portal-backed `Post settings`
+dialog, its exact `Social preview` row and `Edit` button, and the `Edit social
+preview` dialog. It reports the image state and local Save/Done control without
+selecting a file or clicking Save, Done, Continue, Publish, Send, or Schedule.
+
+The older File Settings → Thumbnail implementation is quarantined in the
+historical helper module and is not reachable from `substack-image`.
+
+Resolve that block only after a fresh read-only inspection of the linked draft:
+
+```bash
+publish-to-all substack-image-reconcile --story-hash "EXACT-CURRENT-STORY-HASH"
+```
+
+The required hash must exactly match the current Markdown. The command accepts
+either a clean `image_not_started` record or an uncertain `image_upload_failed`
+record with a unique stored numeric draft URL, opens only that URL, and inspects
+the article Social Preview image state. It never selects a file or changes the
+remote draft. A positively present Social Preview image records
+`image_uploaded`. A positively empty image resets a failed record to
+`image_not_started` and leaves an already clean not-started record unchanged.
+An unknown result or rate limit always leaves local image state unchanged. An
+earlier failure remains in local image-attempt audit history even when its active
+error and reconciliation flag are cleared.
 
 
 ### Reconcile an uncertain Substack attempt
@@ -562,10 +637,12 @@ publish-to-all substack-inspect-draft --draft-url "https://YOUR-PUBLICATION.subs
 ```
 
 The report includes the visible title, an `empty`/`minimal`/`partial`/`substantial`
-classification of editable body text, whether an editor or cover image is visible,
+classification of editable body text, the separate Social Preview image state,
+whether an editor or legacy cover/thumbnail image is visible,
 the visible save state, conservative draft-editor verification, and allowlisted
-URL/title diagnostics. Run it once for each draft you want to compare. It does not
-type, click editor controls, upload, reload, or access SQLite. HTTP 429 and rendered
+URL/title diagnostics. Run it once for each draft you want to compare. It clicks
+only the settings controls needed to inspect Social Preview state; it does not
+type, save, upload, reload, or access SQLite. HTTP 429 and rendered
 `Too many requests` evidence stop inspection immediately without retrying.
 
 From the project directory, with the virtual environment active, run:
