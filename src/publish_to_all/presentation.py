@@ -520,6 +520,53 @@ def format_final_action_diagnostic(result: PublishInspectionResult) -> str:
 
 def format_substack_publish_execution(result) -> str:
     """Render the executor's machine result without making workflow decisions."""
+    if result.dry_run:
+        guard = result.action_guard
+        candidate = result.candidate
+        lines = [
+            'FINAL ACTION VERIFIED' if result.status.value == 'dry_run_verified'
+            else 'FINAL ACTION VERIFICATION FAILED',
+            'NO CLICK PERFORMED',
+            'NOTHING PUBLISHED', '',
+            f'Final screen reached: {"Yes" if result.status.value == "dry_run_verified" else "No"}',
+            f'Candidate count: {result.candidate_count}',
+            f'Uniquely pinned: {"Yes" if candidate is not None and result.candidate_count == 1 else "No"}',
+            f'All executor guards passed: {"Yes" if guard and guard.allowed else "No"}',
+            f'Pre-click revalidation passed: {"Yes" if result.pre_click_revalidation_passed else "No"}',
+            'Playwright click calls: 0',
+            f'Unexpected publish/send/schedule network mutation: '
+            f'{"Yes" if result.write_like_network_methods else "No"}',
+            f'Network methods observed: {", ".join(result.write_like_network_methods) or "None"}',
+            f'SQLite checksum before: {result.database_sha256_before}',
+            f'SQLite checksum after: {result.database_sha256_after}',
+            f'SQLite unchanged: {"Yes" if result.database_sha256_before == result.database_sha256_after else "No"}',
+            f'Runtime schema before: {result.schema_version_before}',
+            f'Runtime schema after: {result.schema_version_after}',
+        ]
+        if candidate is not None:
+            lines.extend([
+                '', 'Final action candidate:',
+                f'  tag: {candidate.tag_name}',
+                f'  role: {candidate.role}',
+                f'  accessible name: {candidate.accessible_name}',
+                f'  visible text: {candidate.visible_text}',
+                f'  type: {_format_attribute(candidate.element_type)}',
+                f'  data-testid: {_format_attribute(candidate.data_testid)}',
+                f'  enabled: {"Yes" if candidate.enabled else "No"}',
+                f'  visible: {"Yes" if candidate.visible else "No"}',
+                f'  dialog ancestry: {candidate.nearest_dialog or "None"}',
+                f'  form membership: owner={candidate.form_owner or "None"}; '
+                f'nearest={candidate.nearest_form or "None"}',
+                f'  href/link state: {_format_attribute(candidate.href)}; '
+                f'target={_format_attribute(candidate.target)}; rel={_format_attribute(candidate.rel)}',
+                f'  publication-modal ancestry: {candidate.publish_modal_ancestry}',
+                f'  publication-modal ancestor count: {candidate.publish_modal_ancestor_count}',
+                f'  belongs to exactly one publication modal: '
+                f'{"Yes" if candidate.belongs_to_exactly_one_publish_modal else "No"}',
+            ])
+        if result.failures:
+            lines.extend(['', 'Reasons:', *(f'- {item}' for item in result.failures)])
+        return '\n'.join(lines)
     lines = [
         'Guarded Substack publication', '',
         f'Status: {result.status.value}',

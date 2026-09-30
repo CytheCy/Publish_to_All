@@ -200,6 +200,25 @@ class MutationGuard:
             )
 
 
+@dataclass
+class WriteLikeNetworkObserver:
+    """Record write-like request methods without retaining request data."""
+
+    methods: list[str]
+
+    def observe(self, request) -> None:
+        method = (getattr(request, 'method', '') or '').upper()
+        if method in {'POST', 'PUT', 'PATCH', 'DELETE'} and method not in self.methods:
+            self.methods.append(method)
+
+    def require_clear(self) -> None:
+        if self.methods:
+            raise BrowserSessionError(
+                'Unexpected write-like network activity occurred during dry-run. '
+                'No final action was clicked.'
+            )
+
+
 def install_mutation_guard(page) -> MutationGuard:
     guard = MutationGuard([])
     page.route('**/*', guard.handle)

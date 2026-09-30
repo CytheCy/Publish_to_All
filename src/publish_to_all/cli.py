@@ -75,9 +75,13 @@ def main(argv: list[str] | None = None) -> int:
         "substack-final-action-diagnostic",
         help="Capture raw final-action DOM evidence without clicking it or changing controls.",
     )
-    commands.add_parser(
+    command = commands.add_parser(
         "substack-publish",
         help="Publish the exact prepared Substack draft through the guarded one-click executor.",
+    )
+    command.add_argument(
+        "--dry-run", action="store_true",
+        help="Run the authenticated path through final-action revalidation, then stop before clicking.",
     )
     command = commands.add_parser(
         "substack-image-reconcile",
@@ -179,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             print(format_final_action_diagnostic(diagnose_substack_final_action(Path("."))))
             return 0
         if args.command == "substack-publish":
-            result = publish_substack(Path("."))
+            result = publish_substack(Path("."), dry_run=args.dry_run)
             print(format_substack_publish_execution(result))
             return 0 if result.status.value == 'published' else 1
         if args.command == "substack-image-reconcile":

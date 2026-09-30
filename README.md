@@ -689,6 +689,19 @@ the final action and cannot publish.
 
 ### Publish the prepared Substack draft
 
+To run the complete authenticated publication path through the final candidate
+pinning and pre-click revalidation, then stop before the click, run:
+
+```bash
+publish-to-all substack-publish --dry-run
+```
+
+This mode uses the production executor's candidate discovery, allowlist, and
+pre-click checks. It keeps the read-only network guard installed, opens the
+database read-only without applying migrations, and requires the SQLite
+checksum and schema version to be unchanged. A passing run prints
+`FINAL ACTION VERIFIED`, `NO CLICK PERFORMED`, and `NOTHING PUBLISHED`.
+
 The mutating publication command is:
 
 ```bash

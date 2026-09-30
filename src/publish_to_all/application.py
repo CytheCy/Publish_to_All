@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
 from typing import TYPE_CHECKING
 
 from .config import Config, load_config, runtime_paths
@@ -106,6 +107,13 @@ class PublishContinueDiagnosticResult:
 class FinalPublishDryRunResult:
     inspection: PublishInspectionResult
     validation: 'FinalPublishValidation'
+
+
+def _database_fingerprint(path: Path) -> tuple[str, int]:
+    digest = sha256(path.read_bytes()).hexdigest()
+    with sqlite3.connect(path) as connection:
+        schema = connection.execute('PRAGMA user_version').fetchone()[0]
+    return digest, schema
 
 
 def inspect_status(root: Path) -> StoryStatus:
@@ -270,14 +278,15 @@ def validate_substack_publish_configuration(root: Path) -> FinalPublishDryRunRes
     return FinalPublishDryRunResult(inspection, validation)
 
 
-def publish_substack(root: Path) -> 'PublishExecutionResult':
+def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionResult':
     """Publish the exact prepared draft through the guarded one-click executor."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_execute import GuardedFinalPublishExecutor, PublishPreconditions
     from .browser.publish_inspect import (
-        inspect_open_final_publication_screen, install_mutation_guard, select_continue_control,
+        WriteLikeNetworkObserver, inspect_open_final_publication_screen,
+        install_mutation_guard, select_continue_control,
     )
     from .browser.publish_navigate import (
         close_preflight_dialogs, open_and_inspect_final_publication_screen,
@@ -290,7 +299,8 @@ def publish_substack(root: Path) -> 'PublishExecutionResult':
     paths = runtime_paths(root)
     if not paths.database.is_file():
         raise BrowserSessionError('No publication database exists for the exact current story.')
-    repository = PublicationRepository(paths.database)
+    database_before, schema_before = _database_fingerprint(paths.database)
+    repository = PublicationRepository(paths.database, migrate=not dry_run)
     record = repository.require_publish_inspection_candidate(story.source_hash, 'substack')
     draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
     if draft_url != record.draft_url.rstrip('/'):
@@ -325,6 +335,9 @@ def publish_substack(root: Path) -> 'PublishExecutionResult':
             raise BrowserSessionError(
                 'The exact story/draft association changed during preflight. Nothing was published.'
             )
+        network = WriteLikeNetworkObserver([]) if dry_run else None
+        if network is not None:
+            page.on('request', network.observe)
         monitor = RateLimitMonitor(publication_url)
         page.on('response', monitor.observe)
         try:
@@ -383,19 +396,33 @@ def publish_substack(root: Path) -> 'PublishExecutionResult':
             continue_control=continue_control, leave_open=True,
         )
         guard.require_clear()
-        # Continue has now been proven read-only. Remove the inspection transport
-        # guard so the single explicitly authorized final click can reach Substack.
-        page.unroute('**/*')
+        if network is not None:
+            network.require_clear()
+        if not dry_run:
+            # Continue has now been proven read-only. Remove the inspection transport
+            # guard so the single explicitly authorized final click can reach Substack.
+            page.unroute('**/*')
         executor = GuardedFinalPublishExecutor(
             repository, page, publication_url, record, draft_url,
             lambda: inspect_open_final_publication_screen(page, publication_url),
         )
-        return executor.execute(
+        result = executor.execute(
             PublishPreconditions(
                 authenticated=True, duplicate_protection_passed=True,
                 draft_identity_matches=True,
             ),
-            initial_screen,
+            initial_screen, dry_run=dry_run,
+        )
+        if network is not None:
+            network.require_clear()
+        database_after, schema_after = _database_fingerprint(paths.database)
+        return result.__class__(
+            **{**result.__dict__,
+               'database_sha256_before': database_before,
+               'database_sha256_after': database_after,
+               'schema_version_before': schema_before,
+               'schema_version_after': schema_after,
+               'write_like_network_methods': tuple(network.methods) if network else ()}
         )
 
 

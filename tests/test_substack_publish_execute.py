@@ -182,6 +182,51 @@ def test_changed_preclick_snapshot_blocks_without_persistence_or_click(monkeypat
                                       'substack') == record
 
 
+def test_dry_run_uses_same_pinned_candidate_path_without_click_or_state_change(
+        monkeypatch, tmp_path):
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    before = (record, repository.path.read_bytes())
+
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+
+    assert result.status is ExecutionStatus.DRY_RUN_VERIFIED
+    assert result.dry_run
+    assert result.candidate is screen.final_action_evidence.candidates[0]
+    assert result.candidate_count == 1
+    assert result.pre_click_revalidation_passed
+    assert result.action_guard.allowed
+    handle.click.assert_not_called()
+    assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == before[0]
+    assert repository.path.read_bytes() == before[1]
+
+
+def test_dry_run_reuses_candidate_discovery_and_revalidation_and_fails_closed(
+        monkeypatch, tmp_path):
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    calls = []
+    original = publish_execute.collect_final_action_target
+
+    def collect(page_arg):
+        calls.append(page_arg)
+        return original(page_arg)
+
+    monkeypatch.setattr(publish_execute, 'collect_final_action_target', collect)
+    # A changed accessible name is rejected by the same pre-click guard used by live execution.
+    changed = replace(screen, final_action_evidence=action_evidence(
+        candidate(accessible_name='Send to subscribers now'),
+    ))
+    executor.inspect_screen = lambda: changed
+
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+
+    assert result.status is ExecutionStatus.BLOCKED
+    assert result.candidate is None
+    assert calls == []
+    assert not result.final_click_attempted
+    handle.click.assert_not_called()
+    assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == record
+
+
 def test_click_exception_is_uncertain_and_never_retried(monkeypatch, tmp_path):
     repository, _record, _page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
     handle.click.side_effect = PlaywrightLikeError('timeout after dispatch')

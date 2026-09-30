@@ -250,6 +250,7 @@ def verify_publication(page, publication_url: str, timeout: float = 10) -> Publi
 
 class ExecutionStatus(StrEnum):
     BLOCKED = 'blocked'
+    DRY_RUN_VERIFIED = 'dry_run_verified'
     PUBLISHED = 'published'
     UNCERTAIN = 'uncertain'
 
@@ -270,6 +271,15 @@ class PublishExecutionResult:
     action_guard: FinalActionGuard | None = None
     verification: PublicationVerification | None = None
     publication: object | None = None
+    candidate: FinalActionCandidate | None = None
+    candidate_count: int = 0
+    pre_click_revalidation_passed: bool = False
+    dry_run: bool = False
+    database_sha256_before: str = ''
+    database_sha256_after: str = ''
+    schema_version_before: int | None = None
+    schema_version_after: int | None = None
+    write_like_network_methods: tuple[str, ...] = ()
 
 
 class GuardedFinalPublishExecutor:
@@ -305,7 +315,7 @@ class GuardedFinalPublishExecutor:
         )
 
     def execute(self, preconditions: PublishPreconditions,
-                initial_screen: FinalScreenInspection) -> PublishExecutionResult:
+                initial_screen: FinalScreenInspection, *, dry_run: bool = False) -> PublishExecutionResult:
         if self._final_click_attempted:
             return self._blocked(('This execution already attempted the final click.',))
         failures = []
@@ -356,6 +366,12 @@ class GuardedFinalPublishExecutor:
         if self.page.url.rstrip('/') != self.draft_url:
             return self._blocked(('The draft URL changed immediately before the click.',),
                                  current_validation, current_guard)
+
+        if dry_run:
+            return PublishExecutionResult(
+                ExecutionStatus.DRY_RUN_VERIFIED, False, (), current_validation, current_guard,
+                None, None, target.candidate, len(target.evidence.candidates), True, True,
+            )
 
         # This durable compare-and-set is the final operation before Playwright is invoked.
         # If it fails, no browser mutation is attempted.
