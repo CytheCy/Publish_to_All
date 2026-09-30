@@ -74,6 +74,11 @@ class PublicationRecord:
     image_started_at: str | None = None
     image_uploaded_at: str | None = None
     image_error_message: str | None = None
+    final_click_attempted: bool = False
+    final_click_attempted_at: str | None = None
+    publication_verification_status: str = 'not_started'
+    publication_verification_evidence: str | None = None
+    publication_ambiguity_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +165,13 @@ MIGRATIONS = (
         )""",
         "CREATE INDEX publication_image_attempts_publication ON publication_image_attempts(publication_id, id)",
     ),
+    (
+        "ALTER TABLE publications ADD COLUMN final_click_attempted INTEGER NOT NULL DEFAULT 0 CHECK(final_click_attempted IN (0, 1))",
+        "ALTER TABLE publications ADD COLUMN final_click_attempted_at TEXT",
+        "ALTER TABLE publications ADD COLUMN publication_verification_status TEXT NOT NULL DEFAULT 'not_started' CHECK(publication_verification_status IN ('not_started', 'pending', 'verified', 'ambiguous'))",
+        "ALTER TABLE publications ADD COLUMN publication_verification_evidence TEXT",
+        "ALTER TABLE publications ADD COLUMN publication_ambiguity_reason TEXT",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -185,6 +197,21 @@ def _is_numeric_draft_url(value: str | None) -> bool:
     )
 
 
+def _is_public_url_for_draft(value: str, draft_url: str | None) -> bool:
+    try:
+        parsed = urlsplit(value)
+        draft = urlsplit(draft_url or '')
+        parts = parsed.path.rstrip('/').split('/')
+        return bool(
+            parsed.scheme == 'https' and parsed.hostname == draft.hostname
+            and parsed.username is None and parsed.password is None
+            and parsed.port in (None, 443) and not parsed.query and not parsed.fragment
+            and len(parts) == 3 and parts[1] == 'p' and parts[2]
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 class PublicationRepository:
     """One row per attempt; hash identity spans renames and all destinations.
 
@@ -199,10 +226,10 @@ class PublicationRepository:
         if not migrate:
             with self._connection() as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version != SCHEMA_VERSION:
+                if version > SCHEMA_VERSION:
                     raise StateError(
-                        f'This read-only command requires database schema {SCHEMA_VERSION}; '
-                        f'found {version}. Local state unchanged.'
+                        f'This read-only command supports database schema through {SCHEMA_VERSION}; '
+                        f'found newer schema {version}. Local state unchanged.'
                     )
             return
         try:
@@ -268,6 +295,8 @@ class PublicationRepository:
             values["body_status"] = BodyStatus(values["body_status"])
         if "image_status" in values:
             values["image_status"] = ImageStatus(values["image_status"])
+        if "final_click_attempted" in values:
+            values["final_click_attempted"] = bool(values["final_click_attempted"])
         return PublicationRecord(**values)
 
     @classmethod
@@ -485,6 +514,138 @@ class PublicationRepository:
         return self._transition(record_id, PublicationStatus.PUBLISHED,
                                 {PublicationStatus.DRAFT_CREATED, PublicationStatus.PUBLISHING, PublicationStatus.FAILED},
                                 published_url=published_url)
+
+    def mark_final_click_attempted(self, expected: PublicationRecord) -> PublicationRecord:
+        """Durably reserve the sole final click using compare-and-set semantics."""
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,),
+            ).fetchone())
+            if current != expected:
+                raise StateError('Final-click preflight state is stale. The final action was not clicked.')
+            if (current.status != PublicationStatus.DRAFT_CREATED or current.final_click_attempted
+                    or current.published_url or current.needs_reconciliation):
+                raise StateError(
+                    'The publication is not eligible for a first final click. The final action was not clicked.'
+                )
+            owner = connection.execute(
+                '''SELECT s.source_hash, p.destination FROM publications p
+                   JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
+                (current.id,),
+            ).fetchone()
+            duplicate = self._lookup(
+                connection, owner['source_hash'], owner['destination'], blocking=True,
+            )
+            if duplicate != current:
+                raise StateError(
+                    'Duplicate protection changed before the final click. The final action was not clicked.'
+                )
+            now = _now()
+            connection.execute(
+                '''UPDATE publications SET status = ?, final_click_attempted = 1,
+                   final_click_attempted_at = ?, publication_verification_status = 'pending',
+                   publication_verification_evidence = NULL,
+                   publication_ambiguity_reason = NULL, needs_reconciliation = 1,
+                   updated_at = ?, last_attempt_at = ?
+                   WHERE id = ?''',
+                (PublicationStatus.PUBLISHING, now, now, now, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
+    @staticmethod
+    def _verification_evidence(evidence: tuple[str, ...]) -> str | None:
+        if not evidence:
+            return None
+        # Evidence is generated from fixed labels and trusted URLs. Keep the field
+        # bounded and single-line so arbitrary rendered page text is never persisted.
+        return ' | '.join(str(item).replace('\n', ' ')[:500] for item in evidence)[:2000]
+
+    def mark_publication_verified(
+        self, expected: PublicationRecord, published_url: str,
+        evidence: tuple[str, ...],
+    ) -> PublicationRecord:
+        """Persist publication only after positive post-click verification."""
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,),
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.PUBLISHING
+                    or not current.final_click_attempted
+                    or current.publication_verification_status != 'pending'):
+                raise StateError('Publication verification state is stale. State unchanged.')
+            if not _is_public_url_for_draft(published_url, current.draft_url):
+                raise StateError(
+                    'Verified publication URL is not a canonical public URL for the linked draft.'
+                )
+            connection.execute(
+                '''UPDATE publications SET status = ?, published_url = ?, error_message = NULL,
+                   needs_reconciliation = 0, publication_verification_status = 'verified',
+                   publication_verification_evidence = ?, publication_ambiguity_reason = NULL,
+                   updated_at = ? WHERE id = ?''',
+                (PublicationStatus.PUBLISHED, published_url.rstrip('/'),
+                 self._verification_evidence(evidence), _now(), current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
+    def mark_publication_uncertain(
+        self, expected: PublicationRecord, reason: str, evidence: tuple[str, ...],
+    ) -> PublicationRecord:
+        """Fail closed after a click attempt whose remote outcome is not proven."""
+        safe_reason = ' '.join(str(reason).split())[:1000]
+        if not safe_reason:
+            safe_reason = 'Publication outcome is ambiguous after the final click attempt.'
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,),
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.PUBLISHING
+                    or not current.final_click_attempted
+                    or current.publication_verification_status != 'pending'):
+                raise StateError('Publication uncertainty state is stale. State unchanged.')
+            connection.execute(
+                '''UPDATE publications SET status = ?, error_message = ?, needs_reconciliation = 1,
+                   publication_verification_status = 'ambiguous',
+                   publication_verification_evidence = ?, publication_ambiguity_reason = ?,
+                   updated_at = ? WHERE id = ?''',
+                (PublicationStatus.FAILED, safe_reason, self._verification_evidence(evidence),
+                 safe_reason, _now(), current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
+    def reconcile_publication_verified(
+        self, expected: PublicationRecord, published_url: str,
+        evidence: tuple[str, ...],
+    ) -> PublicationRecord:
+        """Resolve an ambiguous final click after read-only remote verification."""
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,),
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.FAILED
+                    or not current.final_click_attempted or not current.needs_reconciliation
+                    or current.publication_verification_status != 'ambiguous'):
+                raise StateError('Publication reconciliation evidence is stale. State unchanged.')
+            if not _is_public_url_for_draft(published_url, current.draft_url):
+                raise StateError(
+                    'Reconciled publication URL is not a canonical public URL for the linked draft.'
+                )
+            connection.execute(
+                '''UPDATE publications SET status = ?, published_url = ?, error_message = NULL,
+                   needs_reconciliation = 0, publication_verification_status = 'verified',
+                   publication_verification_evidence = ?, publication_ambiguity_reason = NULL,
+                   updated_at = ? WHERE id = ?''',
+                (PublicationStatus.PUBLISHED, published_url.rstrip('/'),
+                 self._verification_evidence(evidence), _now(), current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
 
     def mark_failed(self, record_id: int, error_message: str, *, draft_url: str | None = None,
                     needs_reconciliation: bool = False) -> PublicationRecord:

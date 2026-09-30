@@ -10,7 +10,8 @@ from .application import (
     observe_substack_image,
     prepare_substack_draft, repair_substack_title,
     reassociate_substack_version, reconcile_substack, reconcile_substack_image,
-    forget_deleted_substack_draft,
+    forget_deleted_substack_draft, validate_substack_publish_configuration,
+    diagnose_substack_final_action, publish_substack,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
@@ -22,6 +23,8 @@ from .presentation import (
     format_substack_image_reconciliation,
     format_substack_reassociation, format_substack_session, format_substack_draft,
     format_deleted_draft_cleanup, format_substack_publish_inspection,
+    format_final_publish_validation, format_final_action_diagnostic,
+    format_substack_publish_execution,
 )
 
 
@@ -63,6 +66,18 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument(
         "--continue-diagnostic-only", action="store_true",
         help="Report safe Continue-control DOM semantics without clicking Continue.",
+    )
+    commands.add_parser(
+        "substack-publish-config-dry-run",
+        help="Validate the final publish configuration without changing it or publishing.",
+    )
+    commands.add_parser(
+        "substack-final-action-diagnostic",
+        help="Capture raw final-action DOM evidence without clicking it or changing controls.",
+    )
+    commands.add_parser(
+        "substack-publish",
+        help="Publish the exact prepared Substack draft through the guarded one-click executor.",
     )
     command = commands.add_parser(
         "substack-image-reconcile",
@@ -156,6 +171,17 @@ def main(argv: list[str] | None = None) -> int:
                 Path("."), continue_diagnostic_only=args.continue_diagnostic_only,
             )))
             return 0
+        if args.command == "substack-publish-config-dry-run":
+            result = validate_substack_publish_configuration(Path("."))
+            print(format_final_publish_validation(result))
+            return 0 if result.validation.ready_for_publish else 1
+        if args.command == "substack-final-action-diagnostic":
+            print(format_final_action_diagnostic(diagnose_substack_final_action(Path("."))))
+            return 0
+        if args.command == "substack-publish":
+            result = publish_substack(Path("."))
+            print(format_substack_publish_execution(result))
+            return 0 if result.status.value == 'published' else 1
         if args.command == "substack-image-reconcile":
             print(format_substack_image_reconciliation(
                 reconcile_substack_image(Path("."), args.story_hash)

@@ -26,7 +26,7 @@ def repository(tmp_path):
 
 def test_initialize_and_reopen(repository):
     with sqlite3.connect(repository.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
         assert connection.execute("SELECT count(*) FROM stories").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM publications").fetchone()[0] == 0
         columns = {row[1] for row in connection.execute("PRAGMA table_info(stories)")}

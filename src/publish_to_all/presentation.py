@@ -1,10 +1,16 @@
 """Human-readable reports, without terminal or filesystem side effects."""
 
+import json
+import re
+
 from .application import (
-    DeletedDraftCleanupResult, ImageObservationResult, ImageReconciliationResult, Inspection,
+    DeletedDraftCleanupResult, FinalPublishDryRunResult, ImageObservationResult,
+    ImageReconciliationResult, Inspection,
     PublishContinueDiagnosticResult, PublishInspectionResult, SocialPreviewReadOnlyResult,
     StoryStatus,
 )
+from .browser.publish_validate import ValidationStatus
+from .browser.publish_inspect import AttributeEvidence
 from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationStatus
 from .browser.substack import AuthenticationState, SessionResult
 
@@ -250,25 +256,90 @@ def format_substack_publish_inspection(
         ])
         return '\n'.join(lines)
     screen = result.final_screen
-    options = []
+    grouped = {}
+    navigation = []
     for control in screen.controls:
         if control.final_action:
             continue
-        options.extend([
-            f'- Label: {control.label}',
-            f'  Role/type: {control.role}/{control.control_type}',
-            f'  Current value/default: {control.value}',
-            f'  Required: {"Yes" if control.required else "No"}',
-            f'  Optional: {"Yes" if control.optional else "No"}',
-            '  Later automation: Safe to read; setting requires explicit desired-value rules',
-        ])
+        if control.safe_navigation:
+            navigation.append(control)
+            continue
+        grouped.setdefault(control.group, []).append(control)
+    options = []
+    for group, controls in grouped.items():
+        options.extend([f'{group}:'])
+        for control in controls:
+            attributes = ', '.join(control.semantic_attributes) or '[none]'
+            selected = (
+                'Selected' if control.selected is True else
+                'Unselected' if control.selected is False else 'Not applicable'
+            )
+            options.extend([
+                f'- Visible label: {control.label}',
+                f'  Accessible name: {control.accessible_name}',
+                f'  Role/type: {control.role}/{control.control_type}',
+                f'  Current value/default: {control.value}',
+                f'  Enabled: {"Yes" if control.enabled else "No"}',
+                f'  Selection state: {selected}',
+                f'  Required/optional: {"Required" if control.required else "Optional"}',
+                f'  Stable semantic attributes: {attributes}',
+                f'  Mutates publication configuration: '
+                f'{"Yes" if control.mutates_configuration else "No"}',
+                '  Final action: No',
+                f'  Relevant to future automation: '
+                f'{"Yes; requires an explicit desired value" if control.mutates_configuration else "No"}',
+            ])
     if not options:
-        options = ['- No non-final controls were positively identified.']
-    final_actions = [
-        f'- {control.label} (role={control.role}, type={control.control_type}; not clicked)'
-        for control in screen.controls if control.final_action
+        options = ['Other options:', '- No non-final configuration controls were identified.']
+    final_actions = []
+    for control in screen.controls:
+        if not control.final_action:
+            continue
+        attributes = ', '.join(control.semantic_attributes) or '[none]'
+        effect = (
+            'schedule publication' if control.label.lower().startswith('schedule') else
+            'send and/or publish immediately' if re.search(r'\b(?:now|send)\b', control.label, re.I) else
+            'commit publication'
+        )
+        final_actions.extend([
+            f'- {control.label}',
+            f'  Role/type: {control.role}/{control.control_type}',
+            f'  Enabled: {"Yes" if control.enabled else "No"}',
+            f'  Apparent effect: {effect}',
+            f'  Stable semantic attributes: {attributes}',
+            '  Clicked: No',
+        ])
+    safe_navigation = [
+        f'- {control.label} [{"enabled" if control.enabled else "disabled"}]'
+        for control in navigation
     ]
     blocked = ', '.join(screen.blocked_mutation_methods) or 'None'
+    evidence = ', '.join(screen.screen_attributes) or '[none]'
+    scheduling = screen.scheduling
+    scheduling_lines = ['SCHEDULING = UNKNOWN', 'Focused scheduling evidence unavailable.']
+    if scheduling is not None:
+        enabled = (
+            'Yes' if scheduling.enabled is True else
+            'No' if scheduling.enabled is False else 'Unknown'
+        )
+        scheduling_lines = [
+            f'SCHEDULING = {scheduling.state}',
+            f'Semantic element: {scheduling.semantic_element}',
+            f'Role: {scheduling.role}',
+            f'Accessible name: {scheduling.accessible_name}',
+            f'Checked semantics: {scheduling.checked_semantics}',
+            f'Enabled: {enabled}',
+            f'Group identity: {scheduling.group_identity}',
+            'Stable attributes: ' + (', '.join(scheduling.stable_attributes) or '[none]'),
+            f'Exact accessible-name matches: {scheduling.exact_name_match_count}',
+            f'Visible exact matches: {scheduling.visible_exact_name_match_count}',
+            f'Hidden exact matches: {scheduling.hidden_exact_name_match_count}',
+            f'Relationship to delivery: {scheduling.delivery_relationship}',
+            'Relevant ancestry:',
+            *[f'- {item}' for item in scheduling.ancestry],
+            'Related delivery/native controls:',
+            *[f'- {item}' for item in scheduling.related_controls],
+        ]
     return '\n'.join([
         'Substack final publication-screen inspection', '',
         'Preflight:',
@@ -291,21 +362,186 @@ def format_substack_publish_inspection(
         'Pre-click interpretation: editor navigation control; not a submit control', '',
         'Final publication screen:',
         f'URL: {screen.url}',
-        f'Title: {screen.title}', '',
+        f'Title: {screen.title}',
+        f'Scope: {screen.screen_kind}',
+        f'Stable evidence: {evidence}', '',
         'Visible options/defaults:',
         *options, '',
+        *scheduling_lines, '',
         'Final action controls:',
         *(final_actions or ['- None positively identified']),
-        f'Mutation requests blocked after Continue: {blocked}', '',
+        'Safe navigation controls:',
+        *(safe_navigation or ['- None positively identified']), '',
+        f'Unexpected mutating network activity: {"Yes" if screen.blocked_mutation_methods else "No"}',
+        f'Mutation request methods blocked after Continue: {blocked}', '',
         'Safe exit behavior:',
         screen.exit_behavior,
         f'Safe exit control: {screen.safe_exit or "None used"}', '',
+        f'SQLite unchanged: {"No" if result.local_state_changed else "Yes"}',
         f'Local state changed: {"Yes" if result.local_state_changed else "No"}', '',
+        'No settings changed.',
         'Nothing published: Yes', '',
         'Recommended next automation stage:',
         'Model the observed configuration controls with explicit desired values and a separate '
         'dry-run validator. Keep the final action behind distinct authorization.',
     ])
+
+
+def format_final_publish_validation(result: FinalPublishDryRunResult) -> str:
+    validation = result.validation
+    screen = result.inspection.final_screen
+    status_labels = {
+        ValidationStatus.REQUIRED_CORRECT: 'OK',
+        ValidationStatus.REQUIRED_INCORRECT: 'MISMATCH',
+        ValidationStatus.UNAVAILABLE_CONSISTENT: 'OK (disabled/unavailable as expected)',
+        ValidationStatus.INFORMATIONAL: 'INFORMATIONAL',
+        ValidationStatus.UNKNOWN_AMBIGUOUS: 'UNKNOWN/AMBIGUOUS',
+    }
+    lines = [
+        'Final publish configuration', '',
+        f'Publish dialog identity matched: {"Yes" if validation.dialog_found else "No"}',
+    ]
+    for item in validation.required_controls:
+        lines.extend([
+            '', item.label,
+            f'  desired: {item.desired}',
+            f'  observed: {item.observed}',
+            f'  status: {status_labels[item.status]}',
+            f'  evidence: {item.reason}',
+        ])
+    lines.extend(['', 'Informational controls'])
+    for item in validation.informational_controls:
+        lines.extend([
+            '', item.label,
+            f'  observed: {item.observed}',
+            '  enforcement: informational only; does not affect publish readiness',
+            f'  evidence: {item.reason}',
+        ])
+    if validation.mismatches:
+        lines.extend(['', 'Mismatches:', *(f'- {item}' for item in validation.mismatches)])
+    if validation.ambiguities:
+        lines.extend(['', 'Unknown or ambiguous:', *(f'- {item}' for item in validation.ambiguities)])
+    lines.extend([
+        '', f'Send to everyone now visible: {"Yes" if validation.final_action_visible else "No"}',
+        'Send to everyone now clicked: No',
+        f'Unexpected mutating network activity: '
+        f'{"Yes" if screen.blocked_mutation_methods else "No"}',
+        f'SQLite unchanged: {"No" if result.inspection.local_state_changed else "Yes"}',
+        f'Browser exit: {screen.exit_behavior}',
+        'No controls changed.',
+        'Nothing published: Yes', '',
+        f'READY FOR PUBLISH: {"YES" if validation.ready_for_publish else "NO"}',
+    ])
+    return '\n'.join(lines)
+
+
+def _format_attribute(attribute: AttributeEvidence) -> str:
+    return json.dumps(attribute.value) if attribute.present else 'absent'
+
+
+def format_final_action_diagnostic(result: PublishInspectionResult) -> str:
+    """Render each raw final-action candidate without collapsing duplicates."""
+    screen = result.final_screen
+    evidence = screen.final_action_evidence
+    if evidence is None:
+        return '\n'.join([
+            'Final action evidence', '', 'Evidence unavailable.',
+            'Send to everyone now clicked: No', 'Nothing published: Yes',
+        ])
+    lines = [
+        'Final action evidence', '',
+        f'Exact accessible name: {evidence.exact_accessible_name}', '',
+        'Matches:',
+        f'  total: {evidence.total_matches}',
+        f'  visible: {evidence.visible_matches}',
+        f'  hidden: {evidence.hidden_matches}',
+        f'  enabled visible: {evidence.enabled_visible_matches}',
+        f'  disabled visible: {evidence.disabled_visible_matches}',
+        f'Publish modal matches: {evidence.publish_modal_matches}',
+        f'More than one matching publish modal: {"yes" if evidence.multiple_publish_modals else "no"}',
+        f'Ambiguous: {"yes" if evidence.ambiguity else "no"}',
+    ]
+    for index, item in enumerate(evidence.candidates, 1):
+        lines.extend([
+            '', f'Candidate {index}:',
+            f'  native tag: {item.tag_name}',
+            f'  role: {item.role}',
+            f'  computed accessible name: {item.accessible_name}',
+            f'  visible text: {json.dumps(item.visible_text)}',
+            f'  visible: {"yes" if item.visible else "no"}',
+            f'  enabled: {"yes" if item.enabled else "no"}',
+            f'  type attribute: {_format_attribute(item.element_type)}',
+            f'  effective type: {item.effective_type}',
+            f'  id: {_format_attribute(item.id)}',
+            f'  class: {_format_attribute(item.class_name)}',
+            f'  data-testid: {_format_attribute(item.data_testid)}',
+            f'  name: {_format_attribute(item.name)}',
+            f'  value: {_format_attribute(item.value)}',
+            f'  href: {_format_attribute(item.href)}',
+            f'  target: {_format_attribute(item.target)}',
+            f'  rel: {_format_attribute(item.rel)}',
+            f'  form attribute: {_format_attribute(item.form_attribute)}',
+            f'  form owner: {item.form_owner or "absent"}',
+            f'  form owner action: {_format_attribute(item.form_owner_action)}',
+            f'  form owner method: {_format_attribute(item.form_owner_method)}',
+            f'  form owner effective method: {item.form_owner_effective_method or "absent"}',
+            f'  nearest form: {item.nearest_form or "absent"}',
+            f'  nearest form action: {_format_attribute(item.nearest_form_action)}',
+            f'  nearest form method: {_format_attribute(item.nearest_form_method)}',
+            f'  nearest form effective method: {item.nearest_form_effective_method or "absent"}',
+            f'  formaction: {_format_attribute(item.formaction)}',
+            f'  formmethod: {_format_attribute(item.formmethod)}',
+            f'  aria-labelledby: {_format_attribute(item.aria_labelledby)}',
+            f'  aria-describedby: {_format_attribute(item.aria_describedby)}',
+            f'  tabindex: {_format_attribute(item.tabindex)}',
+            f'  nearest dialog: {item.nearest_dialog or "absent"}',
+            '  nearest stable data-testid ancestor: '
+            f'{item.nearest_stable_testid_ancestor or "absent"}',
+            f'  publish-modal ancestry: {item.publish_modal_ancestry}',
+            f'  publish-modal ancestor matches: {item.publish_modal_ancestor_count}',
+            '  belongs to exactly one verified publish modal: '
+            f'{"yes" if item.belongs_to_exactly_one_publish_modal else "no"}',
+        ])
+    lines.extend([
+        '', f'Unexpected mutating network activity: '
+        f'{"yes" if screen.blocked_mutation_methods else "no"}',
+        'Mutation request methods blocked: '
+        f'{", ".join(screen.blocked_mutation_methods) or "none"}',
+        f'SQLite SHA-256 before: {result.database_sha256_before}',
+        f'SQLite SHA-256 after: {result.database_sha256_after}',
+        f'SQLite unchanged: {"no" if result.local_state_changed else "yes"}',
+        f'Browser exit method: {screen.exit_behavior}',
+        'Final action clicked: No',
+        'No controls changed.',
+        'Nothing published: Yes',
+    ])
+    return '\n'.join(lines)
+
+
+def format_substack_publish_execution(result) -> str:
+    """Render the executor's machine result without making workflow decisions."""
+    lines = [
+        'Guarded Substack publication', '',
+        f'Status: {result.status.value}',
+        f'Final click attempted: {"Yes" if result.final_click_attempted else "No"}',
+    ]
+    if result.failures:
+        lines.extend(['', 'Reasons:', *(f'- {reason}' for reason in result.failures)])
+    if result.verification is not None:
+        lines.extend([
+            '', f'Post-click verification: {result.verification.status.value}',
+            f'Published URL: {result.verification.published_url or "Unverified"}',
+            'Evidence: ' + (', '.join(result.verification.evidence) or 'None'),
+        ])
+        if result.verification.ambiguity_reason:
+            lines.append(f'Ambiguity: {result.verification.ambiguity_reason}')
+    if result.publication is not None:
+        lines.extend([
+            '', f'Local publication state: {result.publication.status.value}',
+            'Reconciliation required: '
+            f'{"Yes" if result.publication.needs_reconciliation else "No"}',
+        ])
+    return '\n'.join(lines)
 
 
 def format_substack_title(result: StoryStatus) -> str:
@@ -354,7 +590,7 @@ def format_status(result: StoryStatus) -> str:
         if record.error_message:
             lines.append(f"Error: {record.error_message}")
         if record.needs_reconciliation:
-            lines.append("Reconciliation required before retrying: a remote draft may exist.")
+            lines.append("Reconciliation required before retrying: the remote outcome is unresolved.")
         if record.body_status != BodyStatus.NOT_STARTED:
             body_labels = {
                 BodyStatus.INSERTING: 'Insertion in progress; inspect the draft before retrying',

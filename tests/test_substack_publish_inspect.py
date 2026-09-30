@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -7,7 +8,7 @@ from PIL import Image
 import pytest
 
 from publish_to_all import application
-from publish_to_all.browser import image_observe, publish_inspect, reconcile
+from publish_to_all.browser import image_observe, publish_inspect, publish_navigate, reconcile
 from publish_to_all.cli import main
 from publish_to_all.config import runtime_paths
 from publish_to_all.errors import BrowserSessionError
@@ -132,21 +133,139 @@ def test_read_only_diagnostic_records_exact_live_signature_without_clicking():
 
 
 def test_configuration_values_and_final_actions_are_classified(monkeypatch):
-    monkeypatch.setattr(publish_inspect, '_raw_controls', lambda _scope: [
-        {'label': 'Publish post', 'role': 'heading', 'type': 'h2', 'value': ''},
-        {'label': 'Audience', 'role': 'group-label', 'type': 'legend', 'value': ''},
-        {'label': 'Everyone', 'role': 'radio', 'type': 'radio', 'value': 'Selected'},
+    monkeypatch.setattr(publish_inspect, '_raw_publication_controls', lambda _scope: [
+        {'label': 'Everyone', 'accessibleName': 'Everyone', 'role': 'radio',
+         'type': 'radio', 'value': 'Selected', 'selected': True, 'group': 'Audience'},
         {'label': 'Send via email', 'role': 'checkbox', 'type': 'checkbox',
-         'value': 'Not selected', 'required': False},
-        {'label': 'Publish now', 'role': 'button', 'type': 'button', 'value': ''},
+         'accessibleName': 'Send via email', 'value': 'Not selected', 'selected': False,
+         'required': False, 'group': 'Delivery', 'attributes': ['name=email']},
+        {'label': 'Publish now', 'accessibleName': 'Publish now', 'role': 'button',
+         'type': 'button', 'value': '', 'attributes': ['data-testid=publish']},
     ])
     controls = publish_inspect._publication_controls(MagicMock())
     everyone = next(item for item in controls if item.label == 'Everyone')
     email = next(item for item in controls if item.label == 'Send via email')
     final = next(item for item in controls if item.label == 'Publish now')
     assert everyone.value == 'Selected' and everyone.control_type == 'radio'
+    assert everyone.selected is True and everyone.group == 'Audience'
     assert email.value == 'Not selected' and email.optional
+    assert not email.selected and email.semantic_attributes == ('name=email',)
     assert final.final_action and not final.optional
+
+
+def test_select_and_text_date_values_are_read_without_interaction(monkeypatch):
+    monkeypatch.setattr(publish_inspect, '_raw_publication_controls', lambda _scope: [
+        {'label': 'Section', 'accessibleName': 'Section', 'role': 'combobox',
+         'type': 'select', 'value': 'Main publication', 'group': 'Destination'},
+        {'label': 'Publish date', 'accessibleName': 'Publish date', 'role': 'textbox',
+         'type': 'date', 'value': '2026-10-01', 'group': 'Scheduling'},
+        {'label': 'Preview text', 'accessibleName': 'Preview text', 'role': 'textbox',
+         'type': 'text', 'value': 'A short preview', 'group': 'Other options'},
+    ])
+    scope = MagicMock()
+    controls = publish_inspect._publication_controls(scope)
+    assert [(item.label, item.value, item.group) for item in controls] == [
+        ('Section', 'Main publication', 'Destination'),
+        ('Publish date', '2026-10-01', 'Scheduling'),
+        ('Preview text', 'A short preview', 'Other options'),
+    ]
+    scope.get_by_role.assert_not_called()
+
+
+def test_custom_combobox_open_state_is_not_treated_as_its_value():
+    script = MagicMock(return_value=[{
+        'label': 'Select or create tags', 'accessibleName': 'Select or create tags',
+        'role': 'combobox', 'type': 'button', 'value': '', 'selected': None,
+        'group': 'Tags', 'attributes': ['role=combobox', 'aria-expanded=false'],
+        'disabled': True,
+    }])
+    scope = MagicMock(evaluate=script)
+    controls = publish_inspect._publication_controls(scope)
+    assert controls[0].value == 'None'
+    assert not controls[0].enabled
+
+
+def test_same_label_controls_in_different_semantic_groups_are_preserved(monkeypatch):
+    monkeypatch.setattr(publish_inspect, '_raw_publication_controls', lambda _scope: [
+        {'label': 'Everyone', 'accessibleName': 'Everyone', 'role': 'radio',
+         'type': 'radio', 'value': 'Selected', 'selected': True,
+         'attributes': ['name=audience']},
+        {'label': 'Everyone', 'accessibleName': 'Everyone', 'role': 'radio',
+         'type': 'radio', 'value': 'Selected', 'selected': True,
+         'attributes': ['name=commentLevel']},
+    ])
+    controls = publish_inspect._publication_controls(MagicMock())
+    assert [(item.label, item.group) for item in controls] == [
+        ('Everyone', 'Audience'), ('Everyone', 'Comments'),
+    ]
+
+
+def test_live_scheduling_off_dom_fixture_is_preserved():
+    scope = MagicMock()
+    scope.evaluate.return_value = {
+        'target': {
+            'element': 'button', 'role': 'checkbox',
+            'name': 'Schedule time to email and publish', 'checked': False,
+            'enabled': True,
+            'attributes': [
+                'data-testid=scheduled-at', 'type=button', 'role=checkbox',
+                'aria-checked=false',
+            ],
+            'ancestors': [
+                'label', 'div', 'div', 'div', 'div', 'div', 'div', 'div',
+                'div[data-testid=publish-modal, role=dialog, aria-labelledby=publish-title]',
+            ],
+        },
+        'matchCount': 1, 'visibleMatchCount': 1, 'hiddenMatchCount': 0,
+        'native': [
+            'input[name=scheduled-at, type=checkbox]; name="scheduled-at"; '
+            'visible=false; enabled=true; checked=false',
+        ],
+        'delivery': (
+            'button[type=button, role=checkbox, aria-checked=true]; '
+            'name="Send via email and the Substack app"; '
+            'visible=true; enabled=true; checked=true'
+        ),
+        'relationship': (
+            'same div ancestor; scheduling distance=8; delivery distance=8; '
+            'scheduling follows delivery=true'
+        ),
+        'deliveryMatchCount': 1,
+    }
+    evidence = publish_inspect._scheduling_evidence(scope)
+    assert evidence.state == 'OFF'
+    assert evidence.semantic_element == 'button'
+    assert evidence.role == 'checkbox'
+    assert evidence.accessible_name == 'Schedule time to email and publish'
+    assert evidence.checked_semantics == 'false' and evidence.enabled
+    assert evidence.exact_name_match_count == 1
+    assert evidence.visible_exact_name_match_count == 1
+    assert evidence.hidden_exact_name_match_count == 0
+    assert evidence.stable_attributes == (
+        'data-testid=scheduled-at', 'type=button', 'role=checkbox',
+        'aria-checked=false',
+    )
+    assert 'visible=false' in evidence.related_controls[1]
+
+
+def test_scheduling_fixture_fails_closed_on_hidden_exact_name_duplicate():
+    scope = MagicMock()
+    scope.evaluate.return_value = {
+        'target': {
+            'element': 'button', 'role': 'checkbox',
+            'name': 'Schedule time to email and publish', 'checked': False,
+            'enabled': True,
+            'attributes': [
+                'data-testid=scheduled-at', 'type=button', 'role=checkbox',
+                'aria-checked=false',
+            ],
+            'ancestors': ['label'],
+        },
+        'matchCount': 2, 'visibleMatchCount': 1, 'hiddenMatchCount': 1,
+        'native': [], 'delivery': '[not uniquely identified]',
+        'relationship': '[no unique common relationship]', 'deliveryMatchCount': 0,
+    }
+    assert publish_inspect._scheduling_evidence(scope).state == 'UNKNOWN'
 
 
 class FinalPage:
@@ -180,15 +299,32 @@ class FinalScope(Node):
 
 def screen_controls(include_back=False):
     items = (
-        publish_inspect.PublicationControl('Publish post', 'heading', 'h2', 'None', False, True, False),
-        publish_inspect.PublicationControl('Everyone', 'radio', 'radio', 'Selected', False, True, False),
-        publish_inspect.PublicationControl('Publish now', 'button', 'button', 'None', False, False, True),
+        publish_inspect.PublicationControl(
+            'Everyone', 'radio', 'radio', 'Selected', False, True, False,
+            accessible_name='Everyone', selected=True, group='Audience',
+            mutates_configuration=True,
+        ),
+        publish_inspect.PublicationControl(
+            'Publish now', 'button', 'button', 'None', False, False, True,
+            accessible_name='Publish now', mutates_configuration=True,
+        ),
     )
     if include_back:
         items += (publish_inspect.PublicationControl(
             'Back', 'button', 'button', 'None', False, True, False,
+            accessible_name='Back', safe_navigation=True,
         ),)
     return items
+
+
+def open_screen(include_back=False, evidence=None):
+    controls = screen_controls(include_back)
+    return publish_inspect.FinalScreenInspection(
+        DRAFT, 'Publish post', controls,
+        tuple(item.label for item in controls if item.final_action), None,
+        'Browser remains on the final publication screen.', (), 'dialog',
+        ('scope=dialog',), final_action_evidence=evidence,
+    )
 
 
 def test_final_screen_detected_and_final_action_never_clicked(monkeypatch):
@@ -200,7 +336,11 @@ def test_final_screen_detected_and_final_action_never_clicked(monkeypatch):
         continue_node, 'button', 'Continue', 'continue-button', 'button', 'editor header/toolbar',
     )
     monkeypatch.setattr(publish_inspect, '_publication_controls', lambda _scope: screen_controls())
-    result = publish_inspect.inspect_final_publication_screen(
+    monkeypatch.setattr(
+        publish_navigate, 'inspect_open_final_publication_screen',
+        lambda *_args: open_screen(),
+    )
+    result = publish_navigate.open_and_inspect_final_publication_screen(
         page, URL, DRAFT, MagicMock(), publish_inspect.MutationGuard([]),
         continue_control=selected,
     )
@@ -208,6 +348,25 @@ def test_final_screen_detected_and_final_action_never_clicked(monkeypatch):
     final_action.click.assert_not_called()
     assert result.final_actions == ('Publish now',)
     assert result.safe_exit is None
+    assert result.screen_kind == 'dialog'
+    assert result.screen_attributes == ('scope=dialog',)
+
+
+def test_final_screen_requires_a_visible_final_action(monkeypatch):
+    continue_node = Node()
+    page = FinalPage(FinalScope())
+    selected = publish_inspect.ContinueControl(
+        continue_node, 'button', 'Continue', 'publish-button', 'button',
+        'div.editor.newsletter-post-editor',
+    )
+    monkeypatch.setattr(publish_navigate, 'monotonic', MagicMock(side_effect=[0, 11]))
+    monkeypatch.setattr(publish_inspect, '_publication_controls', lambda _scope: ())
+    with pytest.raises(BrowserSessionError, match='could not be positively identified'):
+        publish_navigate.open_and_inspect_final_publication_screen(
+            page, URL, DRAFT, MagicMock(), publish_inspect.MutationGuard([]),
+            continue_control=selected,
+        )
+    continue_node.click.assert_called_once()
 
 
 def test_safe_back_returns_to_editor_without_final_action(monkeypatch):
@@ -220,13 +379,47 @@ def test_safe_back_returns_to_editor_without_final_action(monkeypatch):
     monkeypatch.setattr(
         publish_inspect, '_publication_controls', lambda _scope: screen_controls(include_back=True),
     )
-    result = publish_inspect.inspect_final_publication_screen(
+    monkeypatch.setattr(
+        publish_navigate, 'inspect_open_final_publication_screen',
+        lambda *_args: open_screen(include_back=True),
+    )
+    result = publish_navigate.open_and_inspect_final_publication_screen(
         page, URL, DRAFT, MagicMock(), publish_inspect.MutationGuard([]),
         continue_control=selected,
     )
     back.click.assert_called_once()
     assert result.safe_exit == 'Back'
     assert 'returned to the draft editor' in result.exit_behavior
+
+
+def test_final_action_diagnostic_closes_browser_without_clicking_any_final_screen_control(
+    monkeypatch,
+):
+    continue_node, back = Node(), Node()
+    page = FinalPage(FinalScope(back), back)
+    selected = publish_inspect.ContinueControl(
+        continue_node, 'button', 'Continue', 'publish-button', 'button',
+        'div.editor.newsletter-post-editor',
+    )
+    monkeypatch.setattr(
+        publish_inspect, '_publication_controls', lambda _scope: screen_controls(include_back=True),
+    )
+    evidence = publish_inspect.FinalActionEvidence(
+        'Send to everyone now', (), 0, 0, 0, 0, 0, 1, False, True,
+    )
+    collector = MagicMock(return_value=evidence)
+    monkeypatch.setattr(publish_inspect, 'inspect_final_action_evidence', collector)
+    result = publish_navigate.open_and_inspect_final_publication_screen(
+        page, URL, DRAFT, MagicMock(), publish_inspect.MutationGuard([]),
+        continue_control=selected, leave_open=True,
+    )
+    continue_node.click.assert_called_once()
+    back.click.assert_not_called()
+    assert result.safe_exit is None
+    assert result.final_action_evidence is evidence
+    assert result.exit_behavior == (
+        'Browser closed on final publication screen; no exit control was used.'
+    )
 
 
 def test_mutation_guard_blocks_publish_transports():
@@ -239,6 +432,50 @@ def test_mutation_guard_blocks_publish_transports():
     post.continue_.assert_not_called()
     get.continue_.assert_called_once()
     assert guard.blocked_methods == ['POST']
+    with pytest.raises(BrowserSessionError, match='write-like network activity'):
+        guard.require_clear()
+
+
+def test_unexpected_write_like_activity_stops_final_screen_before_exit(monkeypatch):
+    continue_node, back = Node(), Node()
+    page = FinalPage(FinalScope(back), back)
+    selected = publish_inspect.ContinueControl(
+        continue_node, 'button', 'Continue', 'publish-button', 'button',
+        'div.editor.newsletter-post-editor',
+    )
+    monkeypatch.setattr(
+        publish_inspect, '_publication_controls', lambda _scope: screen_controls(include_back=True),
+    )
+    guard = publish_inspect.MutationGuard(['POST'])
+    with pytest.raises(BrowserSessionError, match='write-like network activity'):
+        publish_navigate.open_and_inspect_final_publication_screen(
+            page, URL, DRAFT, MagicMock(), guard, continue_control=selected,
+        )
+    continue_node.click.assert_called_once()
+    back.click.assert_not_called()
+
+
+@pytest.mark.parametrize('label', [
+    'Publish', 'Send to everyone now', 'Publish now', 'Schedule', 'Confirm', 'Done',
+])
+def test_mutating_control_names_never_qualify_as_safe_navigation(monkeypatch, label):
+    monkeypatch.setattr(publish_inspect, '_raw_publication_controls', lambda _scope: [{
+        'label': label, 'accessibleName': label, 'role': 'button', 'type': 'button',
+    }])
+    control = publish_inspect._publication_controls(MagicMock())[0]
+    assert control.mutates_configuration
+    assert not control.safe_navigation
+
+
+def test_safe_exit_requires_non_form_button_semantics(monkeypatch):
+    monkeypatch.setattr(publish_inspect, '_raw_publication_controls', lambda _scope: [
+        {'label': 'Back', 'accessibleName': 'Back', 'role': 'button', 'type': 'button'},
+        {'label': 'Cancel', 'accessibleName': 'Cancel', 'role': 'button', 'type': 'submit',
+         'inForm': True},
+    ])
+    back, cancel = publish_inspect._publication_controls(MagicMock())
+    assert back.safe_navigation and not back.mutates_configuration
+    assert not cancel.safe_navigation and cancel.mutates_configuration
 
 
 def make_project(tmp_path, monkeypatch):
@@ -287,7 +524,7 @@ def fake_live_path(monkeypatch, story, record, paths):
         image_observe, 'inspect_social_preview_image',
         lambda *_args, **_kwargs: SimpleNamespace(state=SimpleNamespace(value='present')),
     )
-    monkeypatch.setattr(publish_inspect, 'close_preflight_dialogs', lambda *_args: None)
+    monkeypatch.setattr(publish_navigate, 'close_preflight_dialogs', lambda *_args: None)
     selected = publish_inspect.ContinueControl(
         MagicMock(), 'button', 'Continue', 'continue-button', 'button', 'editor header/toolbar',
     )
@@ -301,7 +538,7 @@ def fake_live_path(monkeypatch, story, record, paths):
         'Browser closed on final publication screen; no exit control was used.', (),
     )
     inspect = MagicMock(return_value=final)
-    monkeypatch.setattr(publish_inspect, 'inspect_final_publication_screen', inspect)
+    monkeypatch.setattr(publish_navigate, 'open_and_inspect_final_publication_screen', inspect)
     return inspect
 
 
@@ -314,6 +551,12 @@ def test_command_is_read_only_in_sqlite_and_reports_defaults(tmp_path, monkeypat
     output = capsys.readouterr()
     assert not output.err
     assert 'Current value/default: Selected' in output.out
+    assert 'Audience:' in output.out
+    assert 'Final action controls:' in output.out
+    assert 'Publish now' in output.out
+    assert 'Unexpected mutating network activity: No' in output.out
+    assert 'SQLite unchanged: Yes' in output.out
+    assert 'No settings changed.' in output.out
     assert 'Nothing published: Yes' in output.out
     inspect.assert_called_once()
 
@@ -341,6 +584,29 @@ def test_continue_diagnostic_command_never_clicks_and_preserves_sqlite(
     assert 'Nothing published: Yes' in output.out
     inspect_candidates.assert_called_once()
     final.assert_not_called()
+
+
+def test_final_action_diagnostic_preserves_sqlite_and_leaves_final_screen_untouched(
+    tmp_path, monkeypatch, capsys,
+):
+    _root, story, _repository, record, paths = make_project(tmp_path, monkeypatch)
+    inspect = fake_live_path(monkeypatch, story, record, paths)
+    evidence = publish_inspect.FinalActionEvidence(
+        'Send to everyone now', (), 0, 0, 0, 0, 0, 1, False, True,
+    )
+    inspect.return_value = replace(inspect.return_value, final_action_evidence=evidence)
+    before = paths.database.read_bytes()
+    assert main(['substack-final-action-diagnostic']) == 0
+    assert paths.database.read_bytes() == before
+    output = capsys.readouterr()
+    assert not output.err
+    assert 'Final action evidence' in output.out
+    assert 'SQLite SHA-256 before:' in output.out
+    assert 'SQLite unchanged: yes' in output.out
+    assert 'Browser closed on final publication screen; no exit control was used.' in output.out
+    assert 'Final action clicked: No' in output.out
+    inspect.assert_called_once()
+    assert inspect.call_args.kwargs['leave_open'] is True
 
 
 @pytest.mark.parametrize('broken', ['body', 'image', 'reconciliation'])
@@ -385,7 +651,7 @@ def test_rate_limit_stops_before_social_preview_or_continue(tmp_path, monkeypatc
     social = MagicMock()
     final = MagicMock()
     monkeypatch.setattr(image_observe, 'inspect_social_preview_image', social)
-    monkeypatch.setattr(publish_inspect, 'inspect_final_publication_screen', final)
+    monkeypatch.setattr(publish_navigate, 'open_and_inspect_final_publication_screen', final)
     before = paths.database.read_bytes()
     assert main(['substack-publish-inspect']) == 1
     assert 'rate limiting' in capsys.readouterr().err.lower()

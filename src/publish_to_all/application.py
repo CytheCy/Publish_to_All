@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import Config, load_config, runtime_paths
 from .story import Story, load_story
@@ -17,6 +18,10 @@ from .publishers.substack import (
     SubstackBodyPublisher, SubstackImagePublisher, SubstackPublisher,
     SubstackTitleRepairPublisher,
 )
+
+if TYPE_CHECKING:
+    from .browser.publish_execute import PublishExecutionResult
+    from .browser.publish_validate import FinalPublishValidation
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,8 @@ class PublishInspectionResult:
     continue_context: str
     final_screen: object
     local_state_changed: bool
+    database_sha256_before: str = ''
+    database_sha256_after: str = ''
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,12 @@ class PublishContinueDiagnosticResult:
     substack: PublicationRecord
     diagnostic: object
     local_state_changed: bool
+
+
+@dataclass(frozen=True)
+class FinalPublishDryRunResult:
+    inspection: PublishInspectionResult
+    validation: 'FinalPublishValidation'
 
 
 def inspect_status(root: Path) -> StoryStatus:
@@ -104,14 +117,17 @@ def inspect_status(root: Path) -> StoryStatus:
 
 def inspect_substack_publish(
     root: Path, *, continue_diagnostic_only: bool = False,
+    final_action_diagnostic: bool = False,
 ) -> PublishInspectionResult | PublishContinueDiagnosticResult:
     """Inspect the prepared draft's final publication UI without permitting mutation."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_inspect import (
-        close_preflight_dialogs, inspect_final_publication_screen,
         inspect_continue_candidates, install_mutation_guard, select_continue_control,
+    )
+    from .browser.publish_navigate import (
+        close_preflight_dialogs, open_and_inspect_final_publication_screen,
     )
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
 
@@ -123,7 +139,7 @@ def inspect_substack_publish(
         raise BrowserSessionError(
             'No publication database exists for the exact current story. Local state unchanged.'
         )
-    database_before = sha256(paths.database.read_bytes()).digest()
+    database_before = sha256(paths.database.read_bytes()).hexdigest()
     repository = PublicationRepository(paths.database, migrate=False)
     record = repository.require_publish_inspection_candidate(story.source_hash, 'substack')
     draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
@@ -208,9 +224,10 @@ def inspect_substack_publish(
             continue_control = select_continue_control(page)
             guard = install_mutation_guard(page)
             try:
-                final_screen = inspect_final_publication_screen(
+                final_screen = open_and_inspect_final_publication_screen(
                     page, publication_url, draft_url, monitor, guard,
                     continue_control=continue_control,
+                    leave_open=final_action_diagnostic,
                 )
             except SubstackRateLimitError:
                 raise
@@ -218,7 +235,7 @@ def inspect_substack_publish(
                 monitor.require_clear(page)
                 raise
 
-    database_after = sha256(paths.database.read_bytes()).digest()
+    database_after = sha256(paths.database.read_bytes()).hexdigest()
     local_state_changed = database_before != database_after
     if local_state_changed:
         raise BrowserSessionError(
@@ -232,7 +249,154 @@ def inspect_substack_publish(
         story, record, continue_control.role, continue_control.label,
         continue_control.test_id, continue_control.element_type,
         continue_control.context, final_screen, local_state_changed,
+        database_before, database_after,
     )
+
+
+def diagnose_substack_final_action(root: Path) -> PublishInspectionResult:
+    """Collect raw final-action DOM evidence and close the browser without leaving the screen."""
+    result = inspect_substack_publish(root, final_action_diagnostic=True)
+    if not isinstance(result, PublishInspectionResult):
+        raise BrowserSessionError('Final-action evidence was not available.')
+    return result
+
+
+def validate_substack_publish_configuration(root: Path) -> FinalPublishDryRunResult:
+    """Run the existing safe inspection path, then validate its immutable snapshot."""
+    from .browser.publish_validate import validate_final_publish_configuration
+
+    inspection = inspect_substack_publish(root)
+    validation = validate_final_publish_configuration(inspection.final_screen)
+    return FinalPublishDryRunResult(inspection, validation)
+
+
+def publish_substack(root: Path) -> 'PublishExecutionResult':
+    """Publish the exact prepared draft through the guarded one-click executor."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
+    from .browser.publish_execute import GuardedFinalPublishExecutor, PublishPreconditions
+    from .browser.publish_inspect import (
+        inspect_open_final_publication_screen, install_mutation_guard, select_continue_control,
+    )
+    from .browser.publish_navigate import (
+        close_preflight_dialogs, open_and_inspect_final_publication_screen,
+    )
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    story = inspection.story
+    paths = runtime_paths(root)
+    if not paths.database.is_file():
+        raise BrowserSessionError('No publication database exists for the exact current story.')
+    repository = PublicationRepository(paths.database)
+    record = repository.require_publish_inspection_candidate(story.source_hash, 'substack')
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The linked draft URL is not canonical. Nothing was published.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Run publish-to-all substack-login first. '
+            'Nothing was published.'
+        )
+
+    with persistent_browser(
+        paths.substack_browser_profile, paths.diagnostics, headless=False,
+    ) as context:
+        page = context.new_page()
+        authentication = verify_page(page, publication_url, 10, True)
+        if authentication == AuthenticationState.RATE_LIMITED:
+            raise SubstackRateLimitError(
+                'Substack rate limiting occurred during publish preflight. Nothing was published.'
+            )
+        if authentication != AuthenticationState.AUTHENTICATED:
+            raise BrowserSessionError(
+                'Authenticated Substack preflight did not succeed. Nothing was published.'
+            )
+
+        # Re-read the exact association after authentication and before browser
+        # mutation. This is the duplicate/identity compare point for the attempt.
+        current = repository.require_publish_inspection_candidate(
+            story.source_hash, 'substack',
+        )
+        duplicate = repository.find_duplicate(story.source_hash, 'substack')
+        if current != record or duplicate != record:
+            raise BrowserSessionError(
+                'The exact story/draft association changed during preflight. Nothing was published.'
+            )
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except SubstackRateLimitError:
+            raise
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'Nothing was published.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limiting occurred during publish preflight. Nothing was published.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not positively verify the linked authenticated draft editor. '
+                'Nothing was published.'
+            )
+        remote = evidence.inspection
+        if remote.draft_url.rstrip('/') != draft_url or remote.final_url.rstrip('/') != draft_url:
+            raise BrowserSessionError(
+                'The opened editor URL does not exactly match the linked numeric draft URL. '
+                'Nothing was published.'
+            )
+        if remote.visible_title != story.metadata.title:
+            raise BrowserSessionError(
+                'The live draft title does not exactly match the current story. Nothing was published.'
+            )
+        if remote.body_classification != 'substantial':
+            raise BrowserSessionError('The live draft body is not substantial. Nothing was published.')
+        if 'Saved' not in remote.editor_state or 'Saving' in remote.editor_state:
+            raise BrowserSessionError('The live editor is not positively saved. Nothing was published.')
+        social_preview = inspect_social_preview_image(page, monitor)
+        monitor.require_clear(page)
+        if social_preview.state.value != 'present':
+            raise BrowserSessionError(
+                'The Social Preview image is not positively present. Nothing was published.'
+            )
+        close_preflight_dialogs(page, monitor)
+        monitor.require_clear(page)
+        if page.url.rstrip('/') != draft_url:
+            raise BrowserSessionError(
+                'The exact draft editor was not preserved after preflight. Nothing was published.'
+            )
+
+        continue_control = select_continue_control(page)
+        guard = install_mutation_guard(page)
+        initial_screen = open_and_inspect_final_publication_screen(
+            page, publication_url, draft_url, monitor, guard,
+            continue_control=continue_control, leave_open=True,
+        )
+        guard.require_clear()
+        # Continue has now been proven read-only. Remove the inspection transport
+        # guard so the single explicitly authorized final click can reach Substack.
+        page.unroute('**/*')
+        executor = GuardedFinalPublishExecutor(
+            repository, page, publication_url, record, draft_url,
+            lambda: inspect_open_final_publication_screen(page, publication_url),
+        )
+        return executor.execute(
+            PublishPreconditions(
+                authenticated=True, duplicate_protection_passed=True,
+                draft_identity_matches=True,
+            ),
+            initial_screen,
+        )
 
 
 def reassociate_substack_version(root: Path, from_hash: str) -> PublicationReassociation:

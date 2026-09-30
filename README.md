@@ -645,9 +645,68 @@ publish-to-all substack-publish-inspect
 
 This opens only the already linked numeric draft, verifies the prepared editor and authenticated
 session, and opens the final publication configuration screen through its editor-scoped `Continue`
-control. It reports the visible options, current defaults, final action controls, and a safe exit.
-The command makes no local or remote changes, does not send email, does not schedule, and does not
-publish. It is intended to inform a later, separately authorized publication automation stage.
+control exactly once. It reports each visible setting's label, accessible name, control type,
+enabled and selected state, current value/default, required/optional state, stable semantic
+attributes, and logical screen group. Selects, dropdowns, text fields, and date/time controls are
+read in place without opening, focusing, typing, or changing them. Commit controls such as the
+currently rendered Publish, Send, or Schedule action are listed separately and never clicked.
+
+The command blocks and fails on unexpected write-like network activity after Continue, records the
+SQLite checksum before and after the run, and uses Back/Close only when its non-form navigation
+semantics are unambiguous. Otherwise it closes the browser on the final screen. No publication
+setting is changed, no email or app notification is sent, nothing is scheduled, and nothing is
+published. The report is intended to inform a later, separately authorized publication automation
+stage.
+
+To validate the observed final dialog against the currently supported desired configuration,
+run:
+
+```bash
+publish-to-all substack-publish-config-dry-run
+```
+
+This command uses the same authenticated preflight, safe `Continue` navigation, mutation guard,
+and final-screen inspector. A separate pure validator requires Audience `Everyone`, Comments
+`Everyone`, `Send via email and the Substack app`, immediate publication (scheduling off), and no
+tags. Missing or ambiguous required state produces `READY FOR PUBLISH: NO`. Disabled empty tags
+are accepted as unavailable in a way consistent with the desired configuration. AI controls and
+Social Preview presence are reported as informational only and cannot change readiness in this
+version. The validator never changes a control, creates a tag, schedules, edits Social Preview,
+toggles AI settings, or clicks the final `Send to everyone now` action.
+
+To capture raw evidence for every DOM element whose exact accessible name is
+`Send to everyone now`, run:
+
+```bash
+publish-to-all substack-final-action-diagnostic
+```
+
+This dedicated pass preserves duplicate and hidden candidates independently. It reports native
+tag and role semantics, explicit attribute presence, link and form behavior, publish-modal
+ancestry, separate candidate counts, mutation monitoring, and the SQLite checksum before and
+after. It leaves the final screen unchanged and closes the browser context there. It never clicks
+the final action and cannot publish.
+
+### Publish the prepared Substack draft
+
+The mutating publication command is:
+
+```bash
+publish-to-all substack-publish
+```
+
+This command reruns authenticated editor preflight, exact story/hash and numeric-draft association
+checks, duplicate protection, Social Preview verification, complete final-configuration validation,
+and the exact final-action guard. Immediately before the final action it reinspects the open dialog,
+revalidates every required setting, recollects the action evidence, and confirms that the draft URL
+has not changed. It pins the sole validated DOM button and calls its ordinary Playwright `click()`
+exactly once. There is no retry, forced or JavaScript click, keyboard submission, coordinate click,
+or alternate selector.
+
+The click attempt is persisted before Playwright is invoked. Success requires one trusted public
+`/p/<slug>` URL, an explicit rendered Published/Sent confirmation, and disappearance of the publish
+modal. A click exception or inconclusive verification records a failed, reconciliation-required
+outcome and cannot retry within that execution.
 
 ### Forget a draft manually deleted in Substack
 
