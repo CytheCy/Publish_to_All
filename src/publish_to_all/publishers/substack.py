@@ -29,21 +29,40 @@ class SubstackPublisher(Publisher):
         step = 'Navigate to dashboard'
         uncertain = False
         url = None
+
+        def capture_draft_url(observed_url):
+            nonlocal url
+            url = observed_url.rstrip('/')
+            self.repository.record_provisional_draft_url(attempt.id, url)
+
         try:
             editor.navigate_dashboard(self.page, self.publication_url)
             step = 'Open new-post editor'
             # A click may create a remote draft even if Playwright subsequently fails.
             uncertain = True
-            editor.open_new_post(self.page, self.publication_url)
+            editor.open_new_post(
+                self.page, self.publication_url, capture_draft_url,
+            )
+            observed_url = editor.extract_draft_url(self.page, self.publication_url)
+            if observed_url:
+                capture_draft_url(observed_url)
             step = 'Locate title field'
             field = editor.locate_title_field(self.page, self.publication_url)
-            url = editor.extract_draft_url(self.page, self.publication_url)
+            observed_url = editor.extract_draft_url(self.page, self.publication_url)
+            if observed_url:
+                capture_draft_url(observed_url)
+            if url is None:
+                raise BrowserSessionError('The new editor has no numeric draft identity yet.')
             step = 'Enter title'
             previously_saved = editor.save_visible(self.page)
-            editor.enter_title(self.page, field, story.metadata.title, self.publication_url)
+            editor.start_save_observation(self.page)
+            field = editor.enter_title(
+                self.page, field, story.metadata.title, self.publication_url,
+            )
             step = 'Confirm draft save'
             url = editor.confirm_draft(self.page, field, story.metadata.title,
-                                       self.publication_url, previously_saved=previously_saved)
+                                       self.publication_url, expected_draft_url=url,
+                                       previously_saved=previously_saved)
             step = 'Record draft in SQLite'
             return self.repository.mark_draft_created(attempt.id, url)
         except (Exception, KeyboardInterrupt):
@@ -59,6 +78,8 @@ class SubstackPublisher(Publisher):
             # Do not propagate raw browser errors or rendered page content.
             try:
                 url = url or editor.extract_draft_url(self.page, self.publication_url)
+                if url:
+                    self.repository.record_provisional_draft_url(attempt.id, url)
             except Exception:
                 pass
             message = f'Substack draft creation failed at step: {step}.'
@@ -258,6 +279,7 @@ class SubstackTitleRepairPublisher(Publisher):
         self._require_clear_before_edit()
         try:
             previously_saved = editor.save_visible(self.page)
+            editor.start_save_observation(self.page)
         except PlaywrightError:
             raise PublishToAllError(
                 'Substack draft title was not changed.\n\n'

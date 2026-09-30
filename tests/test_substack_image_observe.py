@@ -241,6 +241,8 @@ def test_manual_dom_mutation_capture_uses_only_safe_summary():
         'originalReplaced': True, 'addedNodes': 7, 'removedNodes': 3,
         'processingAppeared': True, 'previewAppeared': True,
         'rerendered': True, 'activeChanged': True,
+        'dialogReplaced': True, 'dialogTemporarilyClosed': True,
+        'finalPreview': True,
         'savingAppeared': True, 'savedAppeared': True, 'inputCount': 2,
     }
 
@@ -250,6 +252,8 @@ def test_manual_dom_mutation_capture_uses_only_safe_summary():
     assert result.different_input_appeared and result.original_input_replaced
     assert (result.added_nodes, result.removed_nodes) == (7, 3)
     assert result.processing_appeared and result.preview_appeared
+    assert result.final_preview_detected
+    assert result.dialog_replaced and result.dialog_temporarily_closed
     assert result.saving_appeared and result.saved_appeared
 
 
@@ -268,6 +272,19 @@ def test_rate_limit_stops_manual_wait_immediately():
     release.set()
 
 
+def _ordered_wait(observations):
+    remaining = iter(observations)
+
+    def wait(_page, _monitor, predicate, **_kwargs):
+        latest = None
+        for latest in remaining:
+            if predicate(latest):
+                return latest
+        return latest or image_observe.DomObservation(observed_input_count=0)
+
+    return wait
+
+
 def test_supply_file_requires_observed_transition_and_never_retries(tmp_path, monkeypatch):
     page = MagicMock()
     monitor = MagicMock()
@@ -277,14 +294,8 @@ def test_supply_file_requires_observed_transition_and_never_retries(tmp_path, mo
         image_observe.DomObservation(input_events=1, change_events=1),
         image_observe.DomObservation(
             input_events=1, change_events=1, original_input_replaced=True,
-        ),
-        image_observe.DomObservation(
-            input_events=1, change_events=1, original_input_replaced=True,
-            processing_appeared=True,
-        ),
-        image_observe.DomObservation(
-            input_events=1, change_events=1, original_input_replaced=True,
-            processing_appeared=True, preview_appeared=True,
+            different_input_appeared=True, processing_appeared=True,
+            preview_appeared=True, final_preview_detected=True,
         ),
     ])
     monkeypatch.setattr(image_observe, '_wait_for', lambda *_, **__: next(observations))
@@ -298,30 +309,114 @@ def test_supply_file_requires_observed_transition_and_never_retries(tmp_path, mo
 
     file_input.set_input_files.assert_called_once_with(str(source))
     assert result.preview_appeared
-    assert trace.completed[-4:] == [
-        'Observe input/change', 'Detect input replacement', 'Detect processing', 'Detect preview',
+    assert trace.completed[-3:] == [
+        'Observe input/change', 'Detect upload transition', 'Detect preview',
     ]
+    assert 'Original input detached: Yes' in trace.text()
+    assert 'Replacement input found: Yes' in trace.text()
 
 
-@pytest.mark.parametrize(('observation', 'message'), [
-    (image_observe.DomObservation(input_events=1), 'input/change'),
-    (image_observe.DomObservation(input_events=1, change_events=1), 'replaced or rerendered'),
-    (image_observe.DomObservation(
+@pytest.mark.parametrize('transition', [
+    image_observe.DomObservation(
         input_events=1, change_events=1, original_input_replaced=True,
-    ), 'processing or preview mutation'),
+        different_input_appeared=True, preview_appeared=True, final_preview_detected=True,
+    ),
+    image_observe.DomObservation(
+        input_events=1, change_events=1, social_preview_rerendered=True,
+        dialog_replaced=True, preview_appeared=True, final_preview_detected=True,
+    ),
+    image_observe.DomObservation(
+        input_events=1, change_events=1, processing_appeared=True,
+        preview_appeared=True, final_preview_detected=True,
+    ),
+    image_observe.DomObservation(
+        input_events=1, change_events=1, preview_appeared=True,
+        final_preview_detected=True,
+    ),
 ])
-def test_supply_file_rejects_missing_transition_evidence(
-        tmp_path, monkeypatch, observation, message):
+def test_supply_file_accepts_flexible_transition_evidence(
+        tmp_path, monkeypatch, transition):
     target = image_observe.SocialPreviewTarget(MagicMock(), MagicMock(), MagicMock())
-    monkeypatch.setattr(image_observe, '_wait_for', lambda *_, **__: observation)
+    monkeypatch.setattr(image_observe, '_wait_for', _ordered_wait([
+        image_observe.DomObservation(input_events=1, change_events=1), transition,
+    ]))
     monkeypatch.setattr(image_observe, 'install_dom_observer', MagicMock())
 
-    with pytest.raises(BrowserSessionError, match=message):
-        image_observe.supply_social_preview_file(
-            MagicMock(), target, tmp_path / 'story.png', MagicMock(),
-            trace=image_observe.UploadTrace(),
-        )
+    result = image_observe.supply_social_preview_file(
+        MagicMock(), target, tmp_path / 'story.png', MagicMock(),
+        trace=image_observe.UploadTrace(),
+    )
+
+    assert result.final_preview_detected
     target.file_input.set_input_files.assert_called_once()
+
+
+def test_supply_file_allows_input_replacement_after_processing_starts(tmp_path, monkeypatch):
+    target = image_observe.SocialPreviewTarget(MagicMock(), MagicMock(), MagicMock())
+    monkeypatch.setattr(image_observe, '_wait_for', _ordered_wait([
+        image_observe.DomObservation(input_events=1, change_events=1),
+        image_observe.DomObservation(
+            input_events=1, change_events=1, processing_appeared=True,
+        ),
+        image_observe.DomObservation(
+            input_events=1, change_events=1, processing_appeared=True,
+            original_input_replaced=True, different_input_appeared=True,
+            preview_appeared=True, final_preview_detected=True,
+        ),
+    ]))
+    monkeypatch.setattr(image_observe, 'install_dom_observer', MagicMock())
+
+    result = image_observe.supply_social_preview_file(
+        MagicMock(), target, tmp_path / 'story.png', MagicMock(),
+        trace=image_observe.UploadTrace(),
+    )
+
+    assert result.processing_appeared and result.original_input_replaced
+    target.file_input.set_input_files.assert_called_once()
+
+
+def test_supply_file_requires_final_preview_and_reports_separate_diagnostics(
+        tmp_path, monkeypatch):
+    target = image_observe.SocialPreviewTarget(MagicMock(), MagicMock(), MagicMock())
+    observation = image_observe.DomObservation(
+        input_events=1, change_events=1, original_input_replaced=True,
+        social_preview_rerendered=True, processing_appeared=True,
+    )
+    monkeypatch.setattr(image_observe, '_wait_for', lambda *_, **__: observation)
+    monkeypatch.setattr(image_observe, 'install_dom_observer', MagicMock())
+    trace = image_observe.UploadTrace()
+
+    with pytest.raises(BrowserSessionError, match='preview did not appear'):
+        image_observe.supply_social_preview_file(
+            MagicMock(), target, tmp_path / 'story.png', MagicMock(), trace=trace,
+        )
+
+    target.file_input.set_input_files.assert_called_once()
+    assert 'Original input detached: Yes' in trace.text()
+    assert 'Replacement input found: No' in trace.text()
+    assert 'Social Preview panel rerendered: Yes' in trace.text()
+    assert 'Processing detected: Yes' in trace.text()
+    assert 'Preview mutation detected: No' in trace.text()
+    assert 'Final preview detected: No' in trace.text()
+
+
+def test_dom_observer_re_resolves_dialog_panel_inputs_and_preview():
+    file_input = MagicMock()
+    target = image_observe.SocialPreviewTarget(MagicMock(), file_input, MagicMock())
+
+    image_observe.install_dom_observer(MagicMock(), target)
+
+    script = file_input.evaluate.call_args.args[0]
+    assert 'resolveDialog' in script
+    assert '[role="dialog"][data-testid="modal"]' in script
+    assert 'resolveImageScope' in script
+    assert 'const inputs = fileInputs(scope)' in script
+    assert 'currentPreviews' in script
+
+    page = MagicMock()
+    page.evaluate.return_value = {'finalPreview': True}
+    assert image_observe.read_dom_observation(page).final_preview_detected
+    assert 's.refresh([])' in page.evaluate.call_args.args[0]
 
 
 def test_social_preview_save_is_dialog_scoped_and_requires_fresh_save(monkeypatch):

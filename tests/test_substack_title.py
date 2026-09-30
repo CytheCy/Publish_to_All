@@ -108,8 +108,13 @@ def test_save_confirmation_requires_fresh_saved_signal_and_exact_visible_title(m
     field = MagicMock()
     monitor = MagicMock()
     monkeypatch.setattr(editor, 'title_value', MagicMock(return_value='Exact Metadata Title'))
+    current = MagicMock()
+    monkeypatch.setattr(editor, 'title_fields', lambda _: MagicMock(all=lambda: [current]))
     monkeypatch.setattr(editor, 'save_visible', MagicMock(side_effect=[False, True]))
-    monkeypatch.setattr(title, '_saving_visible', MagicMock(side_effect=[True, False]))
+    monkeypatch.setattr(editor, 'saving_visible', MagicMock(side_effect=[True, False]))
+    monkeypatch.setattr(
+        editor, 'observed_save_transition', MagicMock(side_effect=[(True, False), (True, True)]),
+    )
     title.confirm_title_save(
         page, field, 'Exact Metadata Title', URL, monitor, previously_saved=True,
     )
@@ -120,6 +125,7 @@ def test_save_confirmation_requires_fresh_saved_signal_and_exact_visible_title(m
 
 def test_save_confirmation_rejects_visible_title_mismatch(monkeypatch):
     monkeypatch.setattr(editor, 'title_value', lambda _: 'Changed title')
+    monkeypatch.setattr(editor, 'title_fields', lambda _: MagicMock(all=lambda: [MagicMock()]))
     with pytest.raises(BrowserSessionError, match='no longer matches'):
         title.confirm_title_save(
             MagicMock(url=DRAFT), MagicMock(), 'Exact Metadata Title', URL, MagicMock(),

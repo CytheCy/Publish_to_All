@@ -1,8 +1,9 @@
 """Human-readable reports, without terminal or filesystem side effects."""
 
 from .application import (
-    ImageObservationResult, ImageReconciliationResult, Inspection,
-    SocialPreviewReadOnlyResult, StoryStatus,
+    DeletedDraftCleanupResult, ImageObservationResult, ImageReconciliationResult, Inspection,
+    PublishContinueDiagnosticResult, PublishInspectionResult, SocialPreviewReadOnlyResult,
+    StoryStatus,
 )
 from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationStatus
 from .browser.substack import AuthenticationState, SessionResult
@@ -210,6 +211,103 @@ def format_social_preview_inspection(result: SocialPreviewReadOnlyResult) -> str
     ])
 
 
+def format_substack_publish_inspection(
+    result: PublishInspectionResult | PublishContinueDiagnosticResult,
+) -> str:
+    if isinstance(result, PublishContinueDiagnosticResult):
+        diagnostic = result.diagnostic
+        lines = [
+            'Substack Continue-control read-only diagnostic', '',
+            f'Draft: {result.substack.draft_url}',
+            'Authenticated editor: Verified',
+            'Prepared draft: Verified', '',
+            f'Exact accessible-name Continue candidates: {len(diagnostic.candidates)}',
+            f'Visible and enabled candidates: {diagnostic.visible_enabled_count}',
+        ]
+        for index, item in enumerate(diagnostic.candidates, 1):
+            nearby = '; '.join(item.nearby_labels) or '[none]'
+            lines.extend([
+                '', f'Candidate {index}:',
+                f'Tag: {item.tag}', f'Role: {item.role}',
+                f'Accessible name: {item.accessible_name}',
+                f'Visible text: {item.visible_text}',
+                f'aria-label: {item.aria_label}', f'title: {item.title}',
+                f'data-testid: {item.test_id}', f'type attribute: {item.element_type}',
+                f'href: {item.href}',
+                f'Visible/enabled: {"Yes" if item.visible else "No"}/'
+                f'{"Yes" if item.enabled else "No"}',
+                f'Inside dialog: {"Yes" if item.in_dialog else "No"}',
+                f'Inside authenticated editor context: {"Yes" if item.in_editor else "No"}',
+                f'Appears to submit: {"Yes" if item.appears_submit else "No"}',
+                f'Form: {item.form_attributes}',
+                f'Ancestor context: {item.ancestor_context}',
+                f'Nearby stable labels: {nearby}',
+            ])
+        lines.extend([
+            '', 'Continue clicked: No',
+            f'Local state changed: {"Yes" if result.local_state_changed else "No"}',
+            'Nothing published: Yes',
+        ])
+        return '\n'.join(lines)
+    screen = result.final_screen
+    options = []
+    for control in screen.controls:
+        if control.final_action:
+            continue
+        options.extend([
+            f'- Label: {control.label}',
+            f'  Role/type: {control.role}/{control.control_type}',
+            f'  Current value/default: {control.value}',
+            f'  Required: {"Yes" if control.required else "No"}',
+            f'  Optional: {"Yes" if control.optional else "No"}',
+            '  Later automation: Safe to read; setting requires explicit desired-value rules',
+        ])
+    if not options:
+        options = ['- No non-final controls were positively identified.']
+    final_actions = [
+        f'- {control.label} (role={control.role}, type={control.control_type}; not clicked)'
+        for control in screen.controls if control.final_action
+    ]
+    blocked = ', '.join(screen.blocked_mutation_methods) or 'None'
+    return '\n'.join([
+        'Substack final publication-screen inspection', '',
+        'Preflight:',
+        f'Exact current story hash: {result.story.source_hash}',
+        f'Linked numeric draft URL: {result.substack.draft_url}',
+        f'Draft state: {result.substack.status.value}',
+        f'Body state: {result.substack.body_status.value}',
+        f'Social Preview image state: {result.substack.image_status.value} locally; present remotely',
+        'Reconciliation required: No',
+        'Authenticated editor: Verified',
+        'Title match: Yes',
+        'Body substantial: Yes',
+        'Editor saved: Yes', '',
+        'Continue control:',
+        f'Label: {result.continue_label}',
+        f'Role/type: {result.continue_role}/{result.continue_type}',
+        f'data-testid: {result.continue_test_id or "[none]"}',
+        f'Context: {result.continue_context}',
+        'Clicked: Exactly once',
+        'Pre-click interpretation: editor navigation control; not a submit control', '',
+        'Final publication screen:',
+        f'URL: {screen.url}',
+        f'Title: {screen.title}', '',
+        'Visible options/defaults:',
+        *options, '',
+        'Final action controls:',
+        *(final_actions or ['- None positively identified']),
+        f'Mutation requests blocked after Continue: {blocked}', '',
+        'Safe exit behavior:',
+        screen.exit_behavior,
+        f'Safe exit control: {screen.safe_exit or "None used"}', '',
+        f'Local state changed: {"Yes" if result.local_state_changed else "No"}', '',
+        'Nothing published: Yes', '',
+        'Recommended next automation stage:',
+        'Model the observed configuration controls with explicit desired values and a separate '
+        'dry-run validator. Keep the final action behind distinct authorization.',
+    ])
+
+
 def format_substack_title(result: StoryStatus) -> str:
     return "\n".join([
         "Substack draft title repaired", "", "Story:", result.story.metadata.title, "",
@@ -225,6 +323,19 @@ def format_substack_reassociation(result: PublicationReassociation) -> str:
         "New hash:", result.to_story.source_hash, "",
         "Draft:", result.publication.draft_url, "",
         "Remote draft was not modified.",
+        "Nothing was published.",
+    ])
+
+
+def format_deleted_draft_cleanup(result: DeletedDraftCleanupResult) -> str:
+    return "\n".join([
+        "Obsolete deleted Substack draft removed from local state", "",
+        "Historical story:", result.story.title, "",
+        "Story hash:", result.story.source_hash, "",
+        "Deleted draft:", result.removal.deleted_draft_url, "",
+        "Remote deletion verified:", result.remote_reason, "",
+        "Publication record removed:", str(result.removal.publication_id), "",
+        "Story-version row removed:", "Yes" if result.removal.story_removed else "No", "",
         "Nothing was published.",
     ])
 

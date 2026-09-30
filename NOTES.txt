@@ -1,1 +1,3 @@
 Substack likes 1200 × 630 image.
+
+You are a copy editor. Proofread and make print ready. Provide me with a .md file with changes and also list changes you made.

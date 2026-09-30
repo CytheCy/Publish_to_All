@@ -52,22 +52,27 @@ def confirm_title_save(
     page, field, title: str, publication_url: str, monitor: body.RateLimitMonitor,
     *, previously_saved: bool, timeout: float = 30,
 ) -> None:
-    """Require the exact title and a fresh autosave signal on the same editor page."""
+    """Require the exact title and a fresh Saving -> Saved signal on the same URL."""
     deadline = monotonic() + timeout
-    saw_unsaved = not previously_saved
+    expected_url = editor.extract_draft_url(page, publication_url)
+    if expected_url is None:
+        raise BrowserSessionError('The linked numeric draft URL is unavailable.')
     while True:
         monitor.require_clear(page)
         editor.require_publication(page, publication_url)
+        if editor.extract_draft_url(page, publication_url) != expected_url:
+            raise BrowserSessionError('The editor left the linked numeric draft URL.')
         try:
-            current = editor.title_value(field)
+            current_field = editor.unique_visible(editor.title_fields(page))
+            current = editor.title_value(current_field) if current_field is not None else None
             saved = editor.save_visible(page)
-            saving = _saving_visible(page)
+            saving = editor.saving_visible(page)
+            saw_saving, saw_saved_after_saving = editor.observed_save_transition(page)
         except (PlaywrightError, AttributeError, TypeError):
             raise BrowserSessionError('The repaired title or save state could not be verified.') from None
         if current != title:
             raise BrowserSessionError('The visible repaired title no longer matches exactly.')
-        saw_unsaved = saw_unsaved or saving or not saved
-        if saved and not saving and saw_unsaved:
+        if saw_saving and saw_saved_after_saving and saved and not saving:
             return
         if monotonic() >= deadline:
             raise BrowserSessionError('Could not confirm a fresh Substack autosave after title repair.')

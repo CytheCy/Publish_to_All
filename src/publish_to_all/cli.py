@@ -6,9 +6,11 @@ import sys
 
 from .application import (
     add_substack_body, add_substack_image, inspect_project, inspect_status,
-    inspect_substack_draft, inspect_substack_social_preview, observe_substack_image,
+    inspect_substack_draft, inspect_substack_publish, inspect_substack_social_preview,
+    observe_substack_image,
     prepare_substack_draft, repair_substack_title,
     reassociate_substack_version, reconcile_substack, reconcile_substack_image,
+    forget_deleted_substack_draft,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
@@ -19,6 +21,7 @@ from .presentation import (
     format_substack_image_observation,
     format_substack_image_reconciliation,
     format_substack_reassociation, format_substack_session, format_substack_draft,
+    format_deleted_draft_cleanup, format_substack_publish_inspection,
 )
 
 
@@ -54,6 +57,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Observe one manual social/post-preview image upload; never select a file or publish.",
     )
     command = commands.add_parser(
+        "substack-publish-inspect",
+        help="Inspect a prepared linked draft's final publication options; never publish.",
+    )
+    command.add_argument(
+        "--continue-diagnostic-only", action="store_true",
+        help="Report safe Continue-control DOM semantics without clicking Continue.",
+    )
+    command = commands.add_parser(
         "substack-image-reconcile",
         help="Reconcile one uncertain Social Preview image upload; never upload or publish.",
     )
@@ -76,7 +87,10 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
     command = commands.add_parser("substack-reconcile", help="Inspect existing drafts without remote changes.")
     reconciliation = command.add_mutually_exclusive_group()
-    reconciliation.add_argument("--link", action="store_true", help="Link locally only with exact title, Draft status, and matching recorded attempt URL.")
+    reconciliation.add_argument(
+        "--link", action="store_true",
+        help="Link locally after the exact recorded numeric draft editor URL verifies.",
+    )
     reconciliation.add_argument("--draft-url", help="Verify and link a user-supplied existing Substack draft editor URL.")
     command.add_argument(
         "--replace-linked-draft", action="store_true",
@@ -90,11 +104,23 @@ def main(argv: list[str] | None = None) -> int:
         "--from-hash", required=True,
         help="Exact prior story hash that currently owns the untouched draft.",
     )
+    command = commands.add_parser(
+        "substack-forget-deleted-draft",
+        help="Verify a manually deleted draft is gone, then remove its obsolete local record.",
+    )
+    command.add_argument(
+        "--story-hash", required=True,
+        help="Exact historical story hash whose obsolete draft record may be removed.",
+    )
     commands.add_parser("substack-login", help="Log into Substack manually in a visible browser.")
     command = commands.add_parser("substack-session", help="Check the saved Substack browser session.")
     command.add_argument("--debug", action="store_true", help="Show redacted session diagnostics for any result.")
     args = parser.parse_args(argv)
     try:
+        if args.command == "substack-forget-deleted-draft":
+            result = forget_deleted_substack_draft(Path("."), args.story_hash)
+            print(format_deleted_draft_cleanup(result))
+            return 0
         if args.command == "substack-reassociate-version":
             result = reassociate_substack_version(Path("."), args.from_hash)
             print(format_substack_reassociation(result))
@@ -124,6 +150,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "substack-image-observe":
             print(format_substack_image_observation(observe_substack_image(Path("."))))
+            return 0
+        if args.command == "substack-publish-inspect":
+            print(format_substack_publish_inspection(inspect_substack_publish(
+                Path("."), continue_diagnostic_only=args.continue_diagnostic_only,
+            )))
             return 0
         if args.command == "substack-image-reconcile":
             print(format_substack_image_reconciliation(

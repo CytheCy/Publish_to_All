@@ -183,7 +183,7 @@ automatically when opening the database repository. Browser commands create the
 Substack profile directory; diagnostics are created on browser failure if a page
 can be captured. The logs directory remains reserved.
 
-The current schema version is **5**, stored in SQLite's `PRAGMA user_version`.
+The current schema version is **6**, stored in SQLite's `PRAGMA user_version`.
 Ordered migrations run transactionally when opening the database; a newer,
 unsupported version fails clearly without downgrading it. Tests use temporary
 databases and isolated XDG directories, never the user's application database.
@@ -195,7 +195,8 @@ published URLs, creation/update/attempt timestamps, body and image stage state
 and timestamps, optional sanitized errors, and a reconciliation-required flag.
 Version 3 adds body-insertion tracking. Version 4 adds an audit table for
 cross-version publication reassociations while preserving existing records.
-Version 5 adds cover-image upload tracking.
+Version 5 adds cover-image upload tracking and version 6 adds image-attempt audit
+history.
 Timestamps are UTC ISO 8601 values. Attempt time is when that attempt was
 reserved; transitions update its update time. Retries create new attempt rows,
 preserving history. No unused destination records are created. The generic
@@ -412,15 +413,21 @@ series, or episode, and does not change audience, email, SEO, or scheduling.
 Publish, Send, Schedule, and Continue controls are never used. The publisher's
 final-publication method is disabled.
 
+The command starts observing navigation before it clicks the creation control.
+As soon as the page enters a numeric `/publish/post/<id>` editor URL, that
+sanitized URL is persisted while the attempt remains `draft_creating`. It is
+provisional identity, not creation success. If title entry or save confirmation
+then fails, the failed attempt retains the URL for deterministic reconciliation.
+
 The editing tab stays open while the command waits for observable save evidence.
-Success requires a fresh saved indication after title entry, or the exact title
-in a separately loaded copy of an observed stable draft URL. A stale Saved label
-or an editor URL alone does not prove success. The wait is bounded; there is no
-long fixed sleep or terminal confirmation. Chromium closes after verification.
-Only recognized URLs from the configured publication are recorded; queries and
-fragments are stripped. If save evidence is sufficient but no stable URL is
-recognized, SQLite records `draft_created` with a null URL and the report says
-`Draft URL: Not available`.
+After confirming one editable title input, it fills the exact title, resolves the
+current visible input again to catch an editor rerender, and continuously checks
+that the exact title and numeric URL remain unchanged. Success requires an
+observed fresh `Saving → Saved` transition caused after save observation began.
+A stale Saved label or an editor URL alone does not prove success. The command
+does not reload or open another tab to confirm the save. The wait is bounded;
+uncertainty fails the attempt while retaining the provisional URL and blocking
+automatic retry.
 
 The success report explicitly lists `Added: Title`, `Not added yet: Story body,
 Image`, and `Nothing was published`. Inspect local state with:
@@ -628,6 +635,57 @@ earlier failure remains in local image-attempt audit history even when its activ
 error and reconciliation flag are cleared.
 
 
+### Inspect final publication options
+
+After a linked draft has its title, substantial body, and Social Preview image fully prepared, run:
+
+```bash
+publish-to-all substack-publish-inspect
+```
+
+This opens only the already linked numeric draft, verifies the prepared editor and authenticated
+session, and opens the final publication configuration screen through its editor-scoped `Continue`
+control. It reports the visible options, current defaults, final action controls, and a safe exit.
+The command makes no local or remote changes, does not send email, does not schedule, and does not
+publish. It is intended to inform a later, separately authorized publication automation stage.
+
+### Forget a draft manually deleted in Substack
+
+If a linked draft was manually deleted in Substack while SQLite still reports it
+as active, run the dedicated recovery command with its complete historical hash:
+
+```bash
+publish-to-all substack-forget-deleted-draft \
+  --story-hash "EXACT-HISTORICAL-STORY-HASH"
+```
+
+The command requires that historical hash to exist in SQLite and requires exactly
+one Substack record with a stored numeric draft URL for that story version. That
+record must still be in the draft-created workflow. It refuses the cleanup if any
+Substack record for the hash has a published URL or local published state. Using
+the saved authenticated Playwright profile, it opens only the stored URL once and
+looks for strong deletion evidence,
+such as an authenticated 404/410 response, an explicit not-found/deleted state,
+the exact missing-post response inside Substack's creator editor shell, or a
+redirect to the authenticated Posts listing where that numeric URL is absent.
+Any redirect to a public `/p/...` post refuses cleanup.
+An editor that still exists, an authentication failure, a timeout, a generic error,
+or any unknown result leaves SQLite unchanged. HTTP 429 or `Too many requests`
+stops the check immediately without a retry or reload and also leaves SQLite
+unchanged.
+
+After positive verification, one transaction removes the obsolete publication row,
+its body/image/error/reconciliation state, image-attempt rows, and any reassociation
+rows owned by that publication. This also removes duplicate protection for the
+deleted draft. The historical story-version row is removed when no remaining
+publication or reassociation references it. The current Markdown and all unrelated
+story versions and publication records are untouched, so an edited current version
+without a record continues to show `Substack: Not started`.
+
+This recovery does not create a replacement draft, modify the remote publication,
+or publish anything. Run a future draft workflow separately only when you intend
+to create a new draft.
+
 ### Reconcile an uncertain Substack attempt
 
 Inspect any known numeric draft editor URL without changing the draft or SQLite:
@@ -651,11 +709,18 @@ From the project directory, with the virtual environment active, run:
 publish-to-all substack-reconcile
 ```
 
-This uses the authenticated browser profile to inspect the rendered Posts listing.
-It does not open an editor, create a draft, edit content, delete anything, or publish.
-The default command leaves publication state unchanged. It reports exact-title
-links only when their semantic listing row also explicitly says `Draft` and the
-link identifies a numeric editor URL on the configured publication.
+When the failed attempt already records a numeric draft URL, this opens and
+verifies that exact URL directly with the authenticated browser profile. It does
+not create a draft, edit content, delete anything, or publish. The default command
+leaves publication state unchanged. An empty or different visible title does not
+defeat exact-URL identity; the page must still remain at that URL and show stable,
+corroborating authenticated draft-editor evidence. Public, published,
+inaccessible, wrong-publication, ambiguous, and rate-limited pages are rejected.
+
+When no numeric URL was captured, the command falls back to the rendered Posts
+listing and reports exact-title links only when their semantic row explicitly
+says `Draft` and the link identifies a numeric editor URL on the configured
+publication.
 
 If exactly one matching URL also matches the URL recorded by the failed attempt,
 the command reports that evidence. You can then explicitly link the local record:
@@ -664,10 +729,10 @@ the command reports that evidence. You can then explicitly link the local record
 publish-to-all substack-reconcile --link
 ```
 
-Linking preserves the original failure message and updates the local attempt to
-`draft_created`. Creating a duplicate remains blocked. A changed attempt, missing
-recorded URL, multiple matches, no visible match, unsupported listing structure,
-or an authentication/navigation uncertainty leaves state unchanged. A listing
+Linking updates the same local attempt to `draft_created` and clears its resolved
+active failure. Creating a duplicate remains blocked. A changed attempt, multiple
+listing matches, no visible listing match, unsupported listing structure, or an
+authentication/navigation uncertainty leaves state unchanged. A listing
 can be incomplete or paginated, and an early failure may have left an untitled
 draft. Therefore no visible match means **Unknown**, never proof of absence.
 This command does not clear failed attempts or authorize a fresh creation. If it

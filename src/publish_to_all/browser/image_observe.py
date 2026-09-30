@@ -60,6 +60,7 @@ class UploadTrace:
 
     completed: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
+    transition_diagnostics: tuple[str, ...] = ()
     current: str = 'Open Post settings'
 
     def start(self, checkpoint: str) -> None:
@@ -75,7 +76,25 @@ class UploadTrace:
     def text(self) -> str:
         completed = ', '.join(self.completed) or 'None'
         observations = '; '.join(self.observations) or 'None'
-        return f'Completed checkpoints: {completed}\nSafe observations: {observations}'
+        result = f'Completed checkpoints: {completed}\nSafe observations: {observations}'
+        if self.transition_diagnostics:
+            result += '\n' + '\n'.join(self.transition_diagnostics)
+        return result
+
+    def record_transition(self, observation) -> None:
+        """Store only fixed-vocabulary booleans from the upload transition."""
+        answer = lambda value: 'Yes' if value else 'No'
+        self.transition_diagnostics = (
+            f'Original input detached: {answer(observation.original_input_replaced)}',
+            f'Replacement input found: {answer(observation.different_input_appeared)}',
+            f'Social Preview panel rerendered: {answer(observation.social_preview_rerendered)}',
+            f'Processing detected: {answer(observation.processing_appeared)}',
+            f'Preview mutation detected: {answer(observation.preview_appeared)}',
+            f'Final preview detected: {answer(observation.final_preview_detected)}',
+            f'Social Preview dialog replaced: {answer(observation.dialog_replaced)}',
+            f'Social Preview dialog temporarily closed: '
+            f'{answer(observation.dialog_temporarily_closed)}',
+        )
 
 
 @dataclass(frozen=True)
@@ -96,6 +115,9 @@ class DomObservation:
     saved_appeared: bool = False
     saving_then_saved: bool = False
     observed_input_count: int = 1
+    dialog_replaced: bool = False
+    dialog_temporarily_closed: bool = False
+    final_preview_detected: bool = False
 
 
 @dataclass
@@ -399,22 +421,90 @@ def install_dom_observer(page, target: SocialPreviewTarget) -> None:
     target.file_input.evaluate(
         """node => {
             const dialog = node.closest('[role="dialog"]');
-            const fileInputs = () => [...document.querySelectorAll('input[type="file"]')];
-            const initialInputs = new Set(fileInputs());
-            const previewSelector = 'img, picture, [class*="preview" i] img, '
-                + '[data-testid*="preview" i] img';
+            const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+            const isSocialDialog = item => item.matches('[role="dialog"][data-testid="modal"]')
+                && [...item.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6')]
+                    .some(heading => /^edit social preview$/i.test(normalize(heading.textContent)));
+            const socialDialogs = () => [...document.querySelectorAll(
+                '[role="dialog"][data-testid="modal"]'
+            )].filter(isSocialDialog);
+            const resolveDialog = () => {
+                const dialogs = socialDialogs();
+                return dialogs.length === 1 ? dialogs[0] : null;
+            };
+            const fileInputs = scope => scope
+                ? [...scope.querySelectorAll('input[type="file"]')]
+                : [];
+            const initialInputs = new Set(fileInputs(dialog));
+            initialInputs.add(node);
+            const previewSelector = 'img, picture, [data-testid*="preview" i] '
+                + '[style*="background-image" i], [class*="preview" i] '
+                + '[style*="background-image" i]';
             const progressSelector = 'progress, [role="progressbar"], [aria-busy="true"], '
                 + '[class*="uploading" i], [class*="processing" i], '
                 + '[data-testid*="upload-progress" i]';
+            const visible = item => !!(item.offsetWidth || item.offsetHeight
+                || item.getClientRects().length);
+            const resolveImageScope = currentDialog => {
+                if (!currentDialog) return null;
+                const labels = [...currentDialog.querySelectorAll('*')].filter(item =>
+                    /^image$/i.test(normalize(item.textContent))
+                    && ![...item.children].some(child => /^image$/i.test(normalize(child.textContent))));
+                if (labels.length !== 1) return currentDialog;
+                let candidate = labels[0];
+                while (candidate && candidate !== currentDialog) {
+                    if (candidate.querySelector('input[type="file"], ' + previewSelector)) {
+                        return candidate;
+                    }
+                    candidate = candidate.parentElement;
+                }
+                return currentDialog;
+            };
+            const panel = resolveImageScope(dialog) || node.parentElement;
             const state = {
-                original: node, dialog, initialInputs, inputEvents: 0, changeEvents: 0,
+                original: node, dialog, panel, initialInputs, inputEvents: 0, changeEvents: 0,
                 originalReceived: false, differentReceived: false,
                 differentAppeared: false, originalReplaced: false,
                 addedNodes: 0, removedNodes: 0, processingAppeared: false,
-                previewAppeared: false, rerendered: false,
-                initialPreviews: new Set(dialog.querySelectorAll(previewSelector)),
+                previewAppeared: false, rerendered: false, dialogReplaced: false,
+                dialogTemporarilyClosed: false, finalPreview: false,
+                initialPreviews: new Set((panel || dialog).querySelectorAll(previewSelector)),
                 savingAppeared: false, savedAppeared: false, saveSequence: [],
                 initialActive: document.activeElement, activeChanged: false
+            };
+            state.refresh = records => {
+                const currentDialog = resolveDialog();
+                const currentPanel = resolveImageScope(currentDialog);
+                const originalDialogDetached = !state.dialog.isConnected;
+                state.originalReplaced ||= !state.original.isConnected;
+                state.dialogReplaced ||= originalDialogDetached
+                    && !!currentDialog && currentDialog !== state.dialog;
+                state.dialogTemporarilyClosed ||= originalDialogDetached && !currentDialog;
+                state.rerendered ||= !state.panel?.isConnected
+                    || (!!currentPanel && currentPanel !== state.panel);
+                const scope = currentPanel || currentDialog;
+                const inputs = fileInputs(scope);
+                state.differentAppeared ||= inputs.some(input => !state.initialInputs.has(input));
+                state.processingAppeared ||= !!scope?.querySelector(progressSelector);
+                const currentPreviews = scope
+                    ? [...scope.querySelectorAll(previewSelector)].filter(visible) : [];
+                const newPreview = currentPreviews.some(preview => !state.initialPreviews.has(preview));
+                state.previewAppeared ||= newPreview;
+                state.activeChanged ||= document.activeElement !== state.initialActive;
+                for (const record of records || []) {
+                    const changed = record.target.nodeType === 1
+                        ? record.target : record.target.parentElement;
+                    const inScope = !!changed && !!scope
+                        && (scope === changed || scope.contains(changed));
+                    state.previewAppeared ||= inScope && (
+                        changed.matches?.(previewSelector)
+                        || !!changed.closest?.(previewSelector)
+                        || !!changed.querySelector?.(previewSelector)
+                    );
+                }
+                state.finalPreview ||= newPreview
+                    || (state.previewAppeared && currentPreviews.length > 0);
+                return {currentDialog, scope, inputs};
             };
             window.__publishToAllManualImageObservation = state;
             const observeFileEvent = (event, kind) => {
@@ -440,17 +530,8 @@ def install_dom_observer(page, target: SocialPreviewTarget) -> None:
                     current.addedNodes += record.addedNodes.length;
                     current.removedNodes += record.removedNodes.length;
                 }
-                const inputs = fileInputs();
-                current.differentAppeared ||= inputs.some(input => !current.initialInputs.has(input));
-                current.originalReplaced ||= !current.original.isConnected;
-                current.rerendered ||= !current.dialog.isConnected;
-                const socialDialogs = [...document.querySelectorAll('[role="dialog"]')]
-                    .filter(item => /edit social preview/i.test(item.textContent || ''));
-                const scopes = current.dialog.isConnected ? [current.dialog] : socialDialogs;
-                current.processingAppeared ||= scopes.some(scope => !!scope.querySelector(progressSelector));
-                current.previewAppeared ||= scopes.some(scope =>
-                    [...scope.querySelectorAll(previewSelector)]
-                        .some(preview => !current.initialPreviews.has(preview)));
+                const refreshed = current.refresh(records);
+                const scopes = refreshed.scope ? [refreshed.scope] : [];
                 for (const record of records) {
                     const changed = record.target.nodeType === 1
                         ? record.target : record.target.parentElement;
@@ -479,8 +560,7 @@ def install_dom_observer(page, target: SocialPreviewTarget) -> None:
                     for (const added of statusNodes) {
                         const element = added.nodeType === 1 ? added : added.parentElement;
                         const containingDialog = element?.closest?.('[role="dialog"]');
-                        if (containingDialog
-                                && /edit social preview/i.test(containingDialog.textContent || '')) continue;
+                        if (containingDialog && isSocialDialog(containingDialog)) continue;
                         const text = (added.textContent || '').trim();
                         const saving = /^(?:Saving|Saving changes)(?:\\.{3}|…)?$/i.test(text);
                         const saved = /^(?:Saved|Draft saved|All changes saved|Saved to drafts)$/i.test(text);
@@ -504,7 +584,7 @@ def read_dom_observation(page) -> DomObservation:
             """() => {
                 const s = window.__publishToAllManualImageObservation;
                 if (!s) return {};
-                const inputs = [...document.querySelectorAll('input[type="file"]')];
+                const refreshed = s.refresh([]);
                 return {
                     inputEvents: s.inputEvents, changeEvents: s.changeEvents,
                     originalReceived: s.originalReceived,
@@ -514,26 +594,39 @@ def read_dom_observation(page) -> DomObservation:
                     addedNodes: s.addedNodes, removedNodes: s.removedNodes,
                     processingAppeared: s.processingAppeared,
                     previewAppeared: s.previewAppeared,
-                    rerendered: s.rerendered || !s.dialog.isConnected,
+                    rerendered: s.rerendered,
+                    dialogReplaced: s.dialogReplaced,
+                    dialogTemporarilyClosed: s.dialogTemporarilyClosed,
+                    finalPreview: s.finalPreview,
                     activeChanged: s.activeChanged,
                     savingAppeared: s.savingAppeared,
                     savedAppeared: s.savedAppeared,
                     savingThenSaved: s.saveSequence.some((value, index) =>
                         value === 'saving' && s.saveSequence.slice(index + 1).includes('saved')),
-                    inputCount: inputs.length
+                    inputCount: refreshed.inputs.length
                 };
             }"""
         )
         return DomObservation(
-            int(value.get('inputEvents') or 0), int(value.get('changeEvents') or 0),
-            bool(value.get('originalReceived')), bool(value.get('differentReceived')),
-            bool(value.get('differentAppeared')), bool(value.get('originalReplaced')),
-            int(value.get('addedNodes') or 0), int(value.get('removedNodes') or 0),
-            bool(value.get('processingAppeared')), bool(value.get('previewAppeared')),
-            bool(value.get('rerendered')), bool(value.get('activeChanged')),
-            bool(value.get('savingAppeared')), bool(value.get('savedAppeared')),
-            bool(value.get('savingThenSaved')),
-            int(value.get('inputCount') or 0),
+            input_events=int(value.get('inputEvents') or 0),
+            change_events=int(value.get('changeEvents') or 0),
+            original_input_received_file=bool(value.get('originalReceived')),
+            different_input_received_file=bool(value.get('differentReceived')),
+            different_input_appeared=bool(value.get('differentAppeared')),
+            original_input_replaced=bool(value.get('originalReplaced')),
+            added_nodes=int(value.get('addedNodes') or 0),
+            removed_nodes=int(value.get('removedNodes') or 0),
+            processing_appeared=bool(value.get('processingAppeared')),
+            preview_appeared=bool(value.get('previewAppeared')),
+            social_preview_rerendered=bool(value.get('rerendered')),
+            active_control_changed=bool(value.get('activeChanged')),
+            saving_appeared=bool(value.get('savingAppeared')),
+            saved_appeared=bool(value.get('savedAppeared')),
+            saving_then_saved=bool(value.get('savingThenSaved')),
+            observed_input_count=int(value.get('inputCount') or 0),
+            dialog_replaced=bool(value.get('dialogReplaced')),
+            dialog_temporarily_closed=bool(value.get('dialogTemporarilyClosed')),
+            final_preview_detected=bool(value.get('finalPreview')),
         )
     except (PlaywrightError, AttributeError, TypeError, ValueError):
         return DomObservation(observed_input_count=0)
@@ -579,32 +672,18 @@ def supply_social_preview_file(page, target: SocialPreviewTarget, image_path, mo
     events = _wait_for(
         page, monitor, lambda value: value.input_events >= 1 and value.change_events >= 1,
     )
+    trace.record_transition(events)
     if events.input_events != 1 or events.change_events != 1:
         raise BrowserSessionError('The Social Preview input/change event evidence was not exact.')
     trace.complete('Observe input/change', 'One input event and one change event')
 
-    trace.start('Detect input replacement')
-    rerender = _wait_for(
-        page, monitor,
-        lambda value: value.original_input_replaced or value.social_preview_rerendered,
-    )
-    if not (rerender.original_input_replaced or rerender.social_preview_rerendered):
-        raise BrowserSessionError('The Social Preview input was not replaced or rerendered.')
-    trace.complete('Detect input replacement', 'Input replacement or dialog rerender detected')
-
-    trace.start('Detect processing')
-    processing = _wait_for(
-        page, monitor,
-        lambda value: value.processing_appeared or value.preview_appeared,
-    )
-    if not (processing.processing_appeared or processing.preview_appeared):
-        raise BrowserSessionError('No Social Preview processing or preview mutation was detected.')
-    trace.complete('Detect processing', 'Processing state or preview mutation detected')
-
-    trace.start('Detect preview')
-    preview = _wait_for(page, monitor, lambda value: value.preview_appeared)
-    if not preview.preview_appeared:
+    trace.start('Detect upload transition')
+    preview = _wait_for(page, monitor, lambda value: value.final_preview_detected)
+    trace.record_transition(preview)
+    if not preview.final_preview_detected:
         raise BrowserSessionError('The Social Preview image preview did not appear.')
+    trace.complete('Detect upload transition', 'Bounded upload transition evidence accepted')
+    trace.start('Detect preview')
     trace.complete('Detect preview', 'Social Preview image preview appeared')
     return preview
 

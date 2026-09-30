@@ -83,6 +83,17 @@ class PublicationReassociation:
     to_story: StoryVersion
 
 
+@dataclass(frozen=True)
+class DeletedDraftRemoval:
+    publication_id: int
+    story_id: int
+    deleted_draft_url: str
+    image_attempts_removed: int
+    reassociations_removed: int
+    story_removed: bool
+    removed_at: str
+
+
 # Each entry migrates the preceding version. Execute individually inside one
 # transaction (executescript would implicitly commit a pending transaction).
 MIGRATIONS = (
@@ -181,8 +192,19 @@ class PublicationRepository:
     and attempt insertion across processes before any future remote side effect.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, migrate: bool = True):
         self.path = path
+        if not migrate and not path.is_file():
+            raise StateError('No publication database exists. Local state unchanged.')
+        if not migrate:
+            with self._connection() as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version != SCHEMA_VERSION:
+                    raise StateError(
+                        f'This read-only command requires database schema {SCHEMA_VERSION}; '
+                        f'found {version}. Local state unchanged.'
+                    )
+            return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -271,6 +293,112 @@ class PublicationRepository:
         with self._connection() as connection:
             return self._lookup(connection, source_hash, destination, blocking=True)
 
+    def require_deleted_draft_removal_candidate(
+        self, source_hash: str, destination: str,
+    ) -> PublicationRecord:
+        """Return the sole unpublished linked draft for an exact historical hash."""
+        if not source_hash:
+            raise StateError('The exact historical story hash is required. Local state unchanged.')
+        with self._connection() as connection:
+            story = connection.execute(
+                'SELECT id FROM stories WHERE source_hash = ?', (source_hash,),
+            ).fetchone()
+            if story is None:
+                raise StateError(
+                    'No publication record exists for this exact story hash. Local state unchanged.'
+                )
+            rows = [self._record(row) for row in connection.execute(
+                '''SELECT * FROM publications
+                   WHERE story_id = ? AND destination = ? ORDER BY id''',
+                (story['id'], destination),
+            ).fetchall()]
+        if any(row.status == PublicationStatus.PUBLISHED or row.published_url for row in rows):
+            raise StateError(
+                'The exact story has a published Substack record. Deleted-draft cleanup refused; '
+                'local state unchanged.'
+            )
+        linked = [row for row in rows if row.draft_url is not None]
+        if not linked:
+            raise StateError(
+                'The Substack publication record has no valid stored numeric draft URL. '
+                'Local state unchanged.'
+            )
+        if len(linked) != 1:
+            raise StateError(
+                'The exact story must have exactly one Substack record with a stored draft URL. '
+                'Local state unchanged.'
+            )
+        record = linked[0]
+        if record.status != PublicationStatus.DRAFT_CREATED:
+            raise StateError(
+                'The linked Substack record is not in the draft-created workflow. '
+                'Deleted-draft cleanup refused; '
+                'local state unchanged.'
+            )
+        if not _is_numeric_draft_url(record.draft_url):
+            raise StateError(
+                'The active publication record has no valid stored numeric draft URL. '
+                'Local state unchanged.'
+            )
+        return record
+
+    def remove_verified_deleted_draft(
+        self, source_hash: str, destination: str, expected: PublicationRecord,
+        verified_draft_url: str,
+    ) -> DeletedDraftRemoval:
+        """Atomically remove a positively verified deleted draft and dependent state."""
+        if not source_hash:
+            raise StateError('The exact historical story hash is required. Local state unchanged.')
+        with self._connection(write=True) as connection:
+            rows = connection.execute(
+                '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+                   WHERE s.source_hash = ? AND p.destination = ?
+                   ORDER BY p.id''',
+                (source_hash, destination),
+            ).fetchall()
+            records = [self._record(row) for row in rows]
+            if any(row.status == PublicationStatus.PUBLISHED or row.published_url for row in records):
+                raise StateError(
+                    'Local state indicates publication. Deleted-draft cleanup refused; '
+                    'local state unchanged.'
+                )
+            linked = [row for row in records if row.draft_url is not None]
+            if len(linked) != 1 or linked[0] != expected:
+                raise StateError('Deleted-draft cleanup evidence is stale. Local state unchanged.')
+            current = linked[0]
+            if current.status != PublicationStatus.DRAFT_CREATED:
+                raise StateError(
+                    'The linked Substack record is no longer in the draft-created workflow. '
+                    'Local state unchanged.'
+                )
+            if (not _is_numeric_draft_url(current.draft_url)
+                    or current.draft_url.rstrip('/') != verified_draft_url.rstrip('/')):
+                raise StateError(
+                    'Verified remote URL does not match the active stored draft URL. '
+                    'Local state unchanged.'
+                )
+            removed_at = _now()
+            image_attempts = connection.execute(
+                'DELETE FROM publication_image_attempts WHERE publication_id = ?',
+                (current.id,),
+            ).rowcount
+            reassociations = connection.execute(
+                'DELETE FROM publication_reassociations WHERE publication_id = ?',
+                (current.id,),
+            ).rowcount
+            connection.execute('DELETE FROM publications WHERE id = ?', (current.id,))
+            story_removed = connection.execute(
+                '''DELETE FROM stories WHERE id = ?
+                   AND NOT EXISTS (SELECT 1 FROM publications WHERE story_id = ?)
+                   AND NOT EXISTS (SELECT 1 FROM publication_reassociations
+                                   WHERE from_story_id = ? OR to_story_id = ?)''',
+                (current.story_id, current.story_id, current.story_id, current.story_id),
+            ).rowcount == 1
+            return DeletedDraftRemoval(
+                current.id, current.story_id, current.draft_url, image_attempts,
+                reassociations, story_removed, removed_at,
+            )
+
     @staticmethod
     def refuse_duplicate(story: Story, duplicate: PublicationRecord) -> None:
         lines = [f"This exact version already has a Substack record ({duplicate.status.value}).",
@@ -327,6 +455,28 @@ class PublicationRepository:
     def mark_draft_created(self, record_id: int, draft_url: str | None = None) -> PublicationRecord:
         return self._transition(record_id, PublicationStatus.DRAFT_CREATED,
                                 {PublicationStatus.DRAFT_CREATING, PublicationStatus.FAILED}, draft_url=draft_url)
+
+    def record_provisional_draft_url(self, record_id: int, draft_url: str) -> PublicationRecord:
+        """Persist an observed numeric editor URL without claiming creation success."""
+        if not _is_numeric_draft_url(draft_url):
+            raise StateError('Cannot record a non-numeric provisional draft URL.')
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (record_id,)
+            ).fetchone())
+            if current is None or current.status != PublicationStatus.DRAFT_CREATING:
+                raise StateError('Cannot attach draft identity to the current publication state.')
+            if (current.draft_url is not None
+                    and current.draft_url.rstrip('/') != draft_url.rstrip('/')):
+                raise StateError('A different provisional draft URL is already recorded.')
+            if current.draft_url is None:
+                connection.execute(
+                    'UPDATE publications SET draft_url = ?, updated_at = ? WHERE id = ?',
+                    (draft_url.rstrip('/'), _now(), current.id),
+                )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
 
     def mark_publishing(self, record_id: int) -> PublicationRecord:
         return self._transition(record_id, PublicationStatus.PUBLISHING, {PublicationStatus.DRAFT_CREATED})
@@ -718,6 +868,55 @@ class PublicationRepository:
                 raise StateError(
                     'The linked draft URL does not belong uniquely to this exact story version. '
                     'Nothing was changed.'
+                )
+        return record
+
+    def require_publish_inspection_candidate(
+        self, source_hash: str, destination: str,
+    ) -> PublicationRecord:
+        """Return one fully prepared unpublished draft without changing SQLite."""
+        if not source_hash:
+            raise StateError('The exact current story hash is required. Local state unchanged.')
+        with self._connection() as connection:
+            record = self._lookup(connection, source_hash, destination)
+            if record is None:
+                raise StateError(
+                    'No publication record exists for the exact current story hash. '
+                    'Local state unchanged.'
+                )
+            if record.status != PublicationStatus.DRAFT_CREATED:
+                raise StateError(
+                    f'Publication state must be draft_created, not {record.status.value}. '
+                    'Local state unchanged.'
+                )
+            if not _is_numeric_draft_url(record.draft_url):
+                raise StateError(
+                    'The current story requires one linked numeric draft URL. Local state unchanged.'
+                )
+            if record.published_url:
+                raise StateError('The current story is already published. Inspection refused.')
+            if record.needs_reconciliation:
+                raise StateError('The current draft requires reconciliation. Local state unchanged.')
+            if record.error_message or record.body_error_message or record.image_error_message:
+                raise StateError(
+                    'The current draft has an unresolved error. Local state unchanged.'
+                )
+            if record.body_status != BodyStatus.INSERTED:
+                raise StateError('The story body is not recorded as inserted. Local state unchanged.')
+            if record.image_status != ImageStatus.UPLOADED:
+                raise StateError(
+                    'The Social Preview image is not recorded as uploaded. Local state unchanged.'
+                )
+            canonical_url = record.draft_url.rstrip('/')
+            owners = connection.execute(
+                """SELECT p.id FROM publications p
+                   WHERE p.draft_url IS NOT NULL AND rtrim(p.draft_url, '/') = ?""",
+                (canonical_url,),
+            ).fetchall()
+            if [row['id'] for row in owners] != [record.id]:
+                raise StateError(
+                    'The linked draft URL does not belong uniquely to the exact current story. '
+                    'Local state unchanged.'
                 )
         return record
 

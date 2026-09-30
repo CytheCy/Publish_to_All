@@ -1,11 +1,15 @@
 """Read-only application operations reusable by any interface."""
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from .config import Config, load_config, runtime_paths
 from .story import Story, load_story
-from .state import PublicationReassociation, PublicationRecord, PublicationRepository
+from .state import (
+    DeletedDraftRemoval, PublicationReassociation, PublicationRecord,
+    PublicationRepository, StoryVersion,
+)
 from .browser.session import persistent_browser
 from .browser.substack import AuthenticationState, collect_diagnostics, verify_page
 from .errors import BrowserSessionError, SubstackRateLimitError
@@ -63,6 +67,34 @@ class SocialPreviewReadOnlyResult:
     local_save_enabled: bool
 
 
+@dataclass(frozen=True)
+class DeletedDraftCleanupResult:
+    story: StoryVersion
+    removal: DeletedDraftRemoval
+    remote_reason: str
+
+
+@dataclass(frozen=True)
+class PublishInspectionResult:
+    story: Story
+    substack: PublicationRecord
+    continue_role: str
+    continue_label: str
+    continue_test_id: str
+    continue_type: str
+    continue_context: str
+    final_screen: object
+    local_state_changed: bool
+
+
+@dataclass(frozen=True)
+class PublishContinueDiagnosticResult:
+    story: Story
+    substack: PublicationRecord
+    diagnostic: object
+    local_state_changed: bool
+
+
 def inspect_status(root: Path) -> StoryStatus:
     """Read exact-version state, initializing only the schema if necessary."""
     story = load_story(root / "In")
@@ -70,11 +102,227 @@ def inspect_status(root: Path) -> StoryStatus:
     return StoryStatus(story, repository.get_publication(story.source_hash, "substack"))
 
 
+def inspect_substack_publish(
+    root: Path, *, continue_diagnostic_only: bool = False,
+) -> PublishInspectionResult | PublishContinueDiagnosticResult:
+    """Inspect the prepared draft's final publication UI without permitting mutation."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
+    from .browser.publish_inspect import (
+        close_preflight_dialogs, inspect_final_publication_screen,
+        inspect_continue_candidates, install_mutation_guard, select_continue_control,
+    )
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    story = inspection.story
+    paths = runtime_paths(root)
+    if not paths.database.is_file():
+        raise BrowserSessionError(
+            'No publication database exists for the exact current story. Local state unchanged.'
+        )
+    database_before = sha256(paths.database.read_bytes()).digest()
+    repository = PublicationRepository(paths.database, migrate=False)
+    record = repository.require_publish_inspection_candidate(story.source_hash, 'substack')
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The linked draft URL is not canonical. Local state unchanged.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Run publish-to-all substack-login first. '
+            'Local state unchanged.'
+        )
+
+    with persistent_browser(
+        paths.substack_browser_profile, paths.diagnostics, headless=False,
+    ) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except SubstackRateLimitError:
+            raise
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'Continue was not clicked. Local state unchanged.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limiting occurred during publication inspection. '
+                'Inspection stopped immediately without retry or reload. Local state unchanged.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not positively verify the linked authenticated draft editor. '
+                'Continue was not clicked. Local state unchanged.'
+            )
+        remote = evidence.inspection
+        if remote.draft_url.rstrip('/') != draft_url or remote.final_url.rstrip('/') != draft_url:
+            raise BrowserSessionError(
+                'The opened editor URL does not exactly match the linked numeric draft URL. '
+                'Continue was not clicked.'
+            )
+        if remote.visible_title != story.metadata.title:
+            raise BrowserSessionError('The live draft title does not exactly match the current story.')
+        if remote.body_classification != 'substantial':
+            raise BrowserSessionError('The live draft body is not substantial. Continue was not clicked.')
+        if 'Saved' not in remote.editor_state or 'Saving' in remote.editor_state:
+            raise BrowserSessionError('The live editor is not positively saved. Continue was not clicked.')
+
+        try:
+            social_preview = inspect_social_preview_image(page, monitor)
+            monitor.require_clear(page)
+        except SubstackRateLimitError:
+            raise
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'The Social Preview image could not be verified. Continue was not clicked.'
+            ) from None
+        if social_preview.state.value != 'present':
+            raise BrowserSessionError(
+                'The Social Preview image is not positively present. Continue was not clicked.'
+            )
+        close_preflight_dialogs(page, monitor)
+        monitor.require_clear(page)
+        if page.url.rstrip('/') != draft_url:
+            raise BrowserSessionError(
+                'The exact draft editor was not preserved after preflight. Continue was not clicked.'
+            )
+
+        if continue_diagnostic_only:
+            continue_diagnostic = inspect_continue_candidates(page)
+            monitor.require_clear(page)
+            continue_control = None
+            final_screen = None
+        else:
+            continue_diagnostic = None
+            continue_control = select_continue_control(page)
+            guard = install_mutation_guard(page)
+            try:
+                final_screen = inspect_final_publication_screen(
+                    page, publication_url, draft_url, monitor, guard,
+                    continue_control=continue_control,
+                )
+            except SubstackRateLimitError:
+                raise
+            except (BrowserSessionError, PlaywrightError):
+                monitor.require_clear(page)
+                raise
+
+    database_after = sha256(paths.database.read_bytes()).digest()
+    local_state_changed = database_before != database_after
+    if local_state_changed:
+        raise BrowserSessionError(
+            'The read-only inspection detected an unexpected SQLite change. Nothing was published.'
+        )
+    if continue_diagnostic_only:
+        return PublishContinueDiagnosticResult(
+            story, record, continue_diagnostic, local_state_changed,
+        )
+    return PublishInspectionResult(
+        story, record, continue_control.role, continue_control.label,
+        continue_control.test_id, continue_control.element_type,
+        continue_control.context, final_screen, local_state_changed,
+    )
+
+
 def reassociate_substack_version(root: Path, from_hash: str) -> PublicationReassociation:
     """Move an untouched draft association to the current story hash locally."""
     story = load_story(root / 'In')
     repository = PublicationRepository(runtime_paths(root).database)
     return repository.reassociate_draft_version(from_hash, story, 'substack')
+
+
+def forget_deleted_substack_draft(
+    root: Path, story_hash: str,
+) -> DeletedDraftCleanupResult:
+    """Verify one historical remote draft is gone, then remove its local record."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.deleted_draft import DeletedDraftState, inspect_deleted_draft
+    from .browser.reconcile import validate_supplied_draft_url
+
+    publication_url = load_config(root / 'config.toml').require_substack()
+    paths = runtime_paths(root)
+
+    # Verification is read-only. Do not migrate or otherwise modify SQLite until
+    # remote deletion has been positively established.
+    repository = PublicationRepository(paths.database, migrate=False)
+    story = repository.get_story(story_hash)
+    if story is None:
+        raise BrowserSessionError(
+            'The supplied historical story hash does not exist. Local state unchanged.'
+        )
+    record = repository.require_deleted_draft_removal_candidate(story_hash, 'substack')
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The stored draft URL is not canonical. Local state unchanged.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Authentication cannot be verified. Local state unchanged.'
+        )
+
+    with persistent_browser(
+        paths.substack_browser_profile, paths.diagnostics, headless=False,
+    ) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = inspect_deleted_draft(
+                page, publication_url, draft_url, monitor,
+            )
+        except PlaywrightError:
+            if monitor.encountered:
+                raise SubstackRateLimitError(
+                    'Substack rate limiting occurred while checking the stored draft. '
+                    'No retry or reload was attempted. Local state unchanged.'
+                ) from None
+            raise BrowserSessionError(
+                'Remote draft state is unknown because the stored URL could not be inspected. '
+                'Local state unchanged.'
+            ) from None
+
+    if evidence.state == DeletedDraftState.RATE_LIMITED:
+        raise SubstackRateLimitError(
+            'Substack rate limiting occurred while checking the stored draft. '
+            'No retry or reload was attempted. Local state unchanged.'
+        )
+    if evidence.state == DeletedDraftState.AUTHENTICATION_FAILED:
+        raise BrowserSessionError(
+            'Authentication could not be verified for the stored Substack draft. '
+            'Local state unchanged.'
+        )
+    if evidence.state == DeletedDraftState.EXISTS:
+        raise BrowserSessionError(
+            'The stored Substack draft still exists remotely. Deleted-draft cleanup refused; '
+            'local state unchanged.'
+        )
+    if evidence.state == DeletedDraftState.PUBLISHED:
+        raise BrowserSessionError(
+            'The stored Substack draft redirects to a published post. '
+            'Deleted-draft cleanup refused; local state unchanged.'
+        )
+    if evidence.state != DeletedDraftState.DELETED:
+        raise BrowserSessionError(
+            'Remote draft state is unknown. Deletion was not positively verified; '
+            'local state unchanged.'
+        )
+
+    repository = PublicationRepository(paths.database)
+    removal = repository.remove_verified_deleted_draft(
+        story_hash, 'substack', record, draft_url,
+    )
+    return DeletedDraftCleanupResult(story, removal, evidence.reason)
 
 
 def prepare_substack_draft(root: Path) -> StoryStatus:
@@ -681,6 +929,7 @@ def reconcile_substack(
 ) -> str:
     """Read-only remotely; optionally link locally with corroborating attempt URL."""
     from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
     from .browser.reconcile import (
         inspect_drafts, DraftEvidence, SuppliedDraftEvidence, supplied_draft_diagnostics,
         validate_supplied_draft_url, verify_supplied_draft,
@@ -702,6 +951,17 @@ def reconcile_substack(
         attempt and attempt.status == PublicationStatus.DRAFT_CREATED
         and attempt.draft_url and not attempt.published_url
     )
+    recorded_url = (
+        validate_supplied_draft_url(attempt.draft_url, publication_url)
+        if unresolved and attempt.draft_url else None
+    )
+    if supplied_url and recorded_url and supplied_url != recorded_url:
+        return '\n'.join([
+            'Unable to verify supplied draft URL safely.', '',
+            'Reason: The failed attempt already records a different numeric draft URL.', '',
+            'Recorded draft: ' + recorded_url, '',
+            'Local state unchanged.', 'Nothing was published.',
+        ])
     if not unresolved and not (supplied_url and linked):
         if supplied_url:
             return 'Unable to verify supplied draft URL safely.\n\nLocal state unchanged.\nNothing was published.'
@@ -712,17 +972,26 @@ def reconcile_substack(
         raise BrowserSessionError('No saved Substack session. Local state unchanged.')
     with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
         page = context.new_page()
-        if supplied_url:
+        exact_url = supplied_url or recorded_url
+        if exact_url:
+            monitor = RateLimitMonitor(publication_url)
+            page.on('response', monitor.observe)
             try:
                 evidence = verify_supplied_draft(
-                    page, publication_url, supplied_url, paths.diagnostics,
+                    page, publication_url, exact_url, paths.diagnostics,
+                    rate_limit_monitor=monitor,
                 )
             except (BrowserSessionError, PlaywrightError):
-                evidence = SuppliedDraftEvidence(
-                    False, 'Editor evidence could not be read safely.', diagnostics=supplied_draft_diagnostics(
-                        page, publication_url, paths.diagnostics,
-                    ),
-                )
+                if monitor.encountered:
+                    evidence = SuppliedDraftEvidence(
+                        False, 'Substack returned a rate-limit response.', rate_limited=True,
+                    )
+                else:
+                    evidence = SuppliedDraftEvidence(
+                        False, 'Editor evidence could not be read safely.', diagnostics=supplied_draft_diagnostics(
+                            page, publication_url, paths.diagnostics,
+                        ),
+                    )
             if evidence.rate_limited:
                 return _format_supplied_draft_failure(evidence, rate_limited=True)
             if not evidence.verified:
@@ -731,21 +1000,32 @@ def reconcile_substack(
                 if not replace_linked_draft:
                     return '\n'.join([
                         'Verified supplied Substack draft editor.', '',
-                        'Draft:', supplied_url, '',
+                        'Draft:', exact_url, '',
                         'Local association unchanged.',
                         'To replace it explicitly, add --replace-linked-draft.', '',
                         'No remote changes were made.', 'Nothing was published.',
                     ])
                 record = repository.replace_linked_draft(
-                    inspection.story.source_hash, 'substack', attempt, supplied_url,
+                    inspection.story.source_hash, 'substack', attempt, exact_url,
                 )
             else:
-                record = repository.reconcile_failed_draft(
-                    attempt, supplied_url, verified_manual_url=True,
-                )
+                if supplied_url or link:
+                    record = repository.reconcile_failed_draft(
+                        attempt, exact_url, verified_manual_url=supplied_url is not None,
+                    )
+                else:
+                    return '\n'.join([
+                        'Verified the exact Substack draft recorded by the failed attempt.', '',
+                        'Draft:', exact_url, '', 'Visible title:',
+                        (evidence.inspection.visible_title
+                         if evidence.inspection and evidence.inspection.visible_title else '[empty]'), '',
+                        'Local state unchanged.',
+                        'To reconcile locally, run: publish-to-all substack-reconcile --link', '',
+                        'No remote changes were made.', 'Nothing was published.',
+                    ])
             return '\n'.join([
                 'Substack reconciliation complete', '', 'Story:', inspection.story.metadata.title, '',
-                'Draft:', record.draft_url or supplied_url, '', 'Local state:', 'Draft created', '',
+                'Draft:', record.draft_url or exact_url, '', 'Local state:', 'Draft created', '',
                 'Duplicate protection remains active.', '',
                 'No remote draft was modified or deleted.', 'Nothing was published.',
             ])

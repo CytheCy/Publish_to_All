@@ -459,14 +459,25 @@ def test_one_explicit_cover_add_control_is_positive_no_cover_evidence(monkeypatc
     assert inspection.control == image.CoverControl(add, False)
 
 
-def test_successful_upload_preserves_source_and_transitions(tmp_path, monkeypatch):
+def test_successful_upload_preserves_source_title_body_and_transitions(tmp_path, monkeypatch):
     story, repository, record, publisher, monitor = publisher_setup(tmp_path, monkeypatch)
     before = hashlib.sha256(story.image.read_bytes()).hexdigest()
+    title_value = MagicMock(return_value=story.metadata.title)
+    initial_body = MagicMock(inner_text=MagicMock(return_value=BODY_TEXT))
+    final_body = MagicMock(inner_text=MagicMock(return_value=BODY_TEXT))
+    body_surfaces = iter((initial_body, final_body))
+    monkeypatch.setattr(editor, 'title_value', title_value)
+    monkeypatch.setattr(body, 'locate_body_surface', lambda _: next(body_surfaces))
+
     saved = publisher.upload_image(story, record)
+
     assert saved.image_status == ImageStatus.UPLOADED
     assert saved.body_status == BodyStatus.INSERTED
     assert saved.draft_url == DRAFT and not saved.needs_reconciliation
     assert hashlib.sha256(story.image.read_bytes()).hexdigest() == before
+    assert title_value.call_count == 2
+    initial_body.inner_text.assert_called_once_with()
+    final_body.inner_text.assert_called_once_with()
     image.upload_cover.assert_called_once()
     image.confirm_cover_and_save.assert_called_once()
     assert monitor.require_clear.call_count >= 4

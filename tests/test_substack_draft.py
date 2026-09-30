@@ -146,23 +146,22 @@ def test_duplicate_precedes_browser(project, browser, actions, capsys, status):
     browser[0].assert_not_called()
 
 
-@pytest.mark.parametrize('url', [DRAFT, None])
-def test_success_title_only_and_timestamps(project, browser, actions, capsys, url):
+def test_success_title_only_and_timestamps(project, browser, actions, capsys):
     before = {p: p.read_bytes() for p in (project / 'In').iterdir()}
     def opening(*_):
         assert record(project).status == Status.DRAFT_CREATING
     actions['open_new_post'].side_effect = opening
-    actions['confirm_draft'].return_value = url
+    actions['confirm_draft'].return_value = DRAFT
     assert main(['substack']) == 0
     saved = record(project)
-    assert saved.status == Status.DRAFT_CREATED and saved.draft_url == url
+    assert saved.status == Status.DRAFT_CREATED and saved.draft_url == DRAFT
     assert saved.updated_at >= saved.last_attempt_at == saved.created_at
     assert not saved.needs_reconciliation
     actions['enter_title'].assert_called_once_with(browser[2], actions['locate_title_field'].return_value,
                                                    'Exact — title & punctuation!', URL)
     output = capsys.readouterr().out
     assert 'Added:\nTitle' in output and 'Not added yet:\nStory body\nImage' in output
-    assert (url or 'Not available') in output and 'Nothing was published.' in output
+    assert DRAFT in output and 'Nothing was published.' in output
     assert before == {p: p.read_bytes() for p in (project / 'In').iterdir()}
     browser[2].fill.assert_not_called()
     browser[2].set_input_files.assert_not_called()
@@ -209,6 +208,50 @@ def test_failure_without_url_still_blocks_retry(project, browser, actions, capsy
     browser[0].reset_mock()
     assert main(['substack']) == 1
     browser[0].assert_not_called()
+
+
+def test_numeric_draft_url_is_persisted_before_title_field_lookup(
+        project, browser, actions, capsys):
+    def opening(_page, _publication_url, capture):
+        capture(DRAFT)
+
+    def fail_after_capture(*_):
+        current = record(project)
+        assert current.status == Status.DRAFT_CREATING
+        assert current.draft_url == DRAFT
+        raise RuntimeError('title field unavailable')
+
+    actions['open_new_post'].side_effect = opening
+    actions['locate_title_field'].side_effect = fail_after_capture
+
+    assert main(['substack']) == 1
+
+    saved = record(project)
+    assert saved.status == Status.FAILED
+    assert saved.draft_url == DRAFT
+    assert saved.needs_reconciliation
+    actions['enter_title'].assert_not_called()
+    assert 'Locate title field' in capsys.readouterr().err
+
+
+def test_title_save_failure_retains_provisional_url_and_never_retries_creation(
+        project, browser, actions):
+    actions['open_new_post'].side_effect = (
+        lambda _page, _publication_url, capture: capture(DRAFT)
+    )
+    actions['confirm_draft'].side_effect = RuntimeError('save uncertain')
+
+    assert main(['substack']) == 1
+    failed = record(project)
+    assert failed.status == Status.FAILED
+    assert failed.draft_url == DRAFT
+    assert failed.needs_reconciliation
+
+    browser[0].reset_mock()
+    actions['open_new_post'].reset_mock()
+    assert main(['substack']) == 1
+    browser[0].assert_not_called()
+    actions['open_new_post'].assert_not_called()
 
 
 def test_no_publish_implementation(project, browser):
@@ -274,10 +317,11 @@ def test_enter_title_preserves_exact_value_and_only_fills_title():
     field = title_field()
     title = '  A title — with Unicode & spaces  '
     field.fill.side_effect = lambda value: setattr(field.input_value, 'return_value', value)
-    editor.enter_title(page, field, title, URL)
+    page.get_by_role.return_value.or_.return_value.all.return_value = [field]
+    returned = editor.enter_title(page, field, title, URL)
     field.fill.assert_called_once_with(title)
     field.blur.assert_called_once()
-    assert not page.mock_calls
+    assert returned is field
 
 
 @pytest.mark.parametrize('url,value', [(DRAFT, 'Existing title'), ('https://other.substack.com/publish/post/123', '')])
@@ -299,43 +343,46 @@ def test_confirm_never_accepts_url_or_stale_saved_label(monkeypatch):
     page = MagicMock(url=DRAFT)
     monkeypatch.setattr(editor, 'save_visible', lambda _: True)
     page.get_by_text.return_value.all.return_value = []
-    verification = page.context.new_page.return_value
-    verification.url = DRAFT
-    missing = MagicMock()
-    missing.all.return_value = []
-    monkeypatch.setattr(editor, 'title_fields', lambda _: missing)
-    with pytest.raises(BrowserSessionError, match='confirm'):
+    fields = MagicMock(all=lambda: [title_field('Title')])
+    monkeypatch.setattr(editor, 'title_fields', lambda _: fields)
+    monkeypatch.setattr(editor, 'observed_save_transition', lambda _: (False, False))
+    with pytest.raises(BrowserSessionError, match='fresh Saving to Saved'):
         editor.confirm_draft(page, title_field('Title'), 'Title', URL, previously_saved=True, timeout=0)
-    verification.close.assert_called_once()
-
-
-def test_confirm_fresh_autosave_without_stable_url(monkeypatch):
-    page = MagicMock(url=URL + '/publish/post/new')
-    monkeypatch.setattr(editor, 'save_visible', MagicMock(side_effect=[False, True]))
-    page.get_by_text.return_value.all.return_value = []
-    assert editor.confirm_draft(page, title_field('Title'), 'Title', URL, previously_saved=True) is None
     page.context.new_page.assert_not_called()
 
 
-def test_confirm_reopens_known_url_and_checks_exact_title(monkeypatch):
-    page = MagicMock(url=DRAFT)
-    verification = page.context.new_page.return_value
-    verification.url = DRAFT
+def test_confirm_refuses_fresh_autosave_without_numeric_url(monkeypatch):
+    page = MagicMock(url=URL + '/publish/post/new')
+    monkeypatch.setattr(editor, 'save_visible', MagicMock(side_effect=[False, True]))
     page.get_by_text.return_value.all.return_value = []
+    with pytest.raises(BrowserSessionError, match='numeric draft URL'):
+        editor.confirm_draft(page, title_field('Title'), 'Title', URL, previously_saved=True)
+    page.context.new_page.assert_not_called()
+
+
+def test_confirm_requires_fresh_saving_to_saved_on_same_url(monkeypatch):
+    page = MagicMock(url=DRAFT)
     monkeypatch.setattr(editor, 'save_visible', lambda _: True)
+    monkeypatch.setattr(editor, 'saving_visible', MagicMock(side_effect=[True, False]))
+    monkeypatch.setattr(
+        editor, 'observed_save_transition', MagicMock(side_effect=[(True, False), (True, True)]),
+    )
     fields = MagicMock()
     fields.all.return_value = [title_field('Title')]
     monkeypatch.setattr(editor, 'title_fields', lambda _: fields)
     assert editor.confirm_draft(page, title_field('Title'), 'Title', URL, previously_saved=True) == DRAFT
-    verification.goto.assert_called_once_with(DRAFT, wait_until='domcontentloaded')
-    verification.close.assert_called_once()
+    page.context.new_page.assert_not_called()
+    page.goto.assert_not_called()
     page.reload.assert_not_called()
 
 
 def test_title_mismatch_never_confirms(monkeypatch):
-    page = MagicMock(url=URL + '/publish/post/new')
+    page = MagicMock(url=DRAFT)
     monkeypatch.setattr(editor, 'save_visible', lambda _: True)
-    page.get_by_text.return_value.all.return_value = []
+    monkeypatch.setattr(editor, 'saving_visible', lambda _: False)
+    monkeypatch.setattr(editor, 'observed_save_transition', lambda _: (True, True))
+    fields = MagicMock(all=lambda: [title_field('Other')])
+    monkeypatch.setattr(editor, 'title_fields', lambda _: fields)
     with pytest.raises(BrowserSessionError):
         editor.confirm_draft(page, title_field('Other'), 'Title', URL, timeout=0)
 
@@ -403,9 +450,9 @@ def test_reconciling_unknown_failure_clears_block_flag(project):
 
 @pytest.mark.parametrize('matches,known,link,linked', [
     ((DRAFT,), DRAFT, False, False), ((DRAFT,), DRAFT, True, True),
-    ((DRAFT,), None, True, False), ((), DRAFT, True, False),
-    ((DRAFT, URL + '/publish/post/456'), DRAFT, True, False),
-    ((URL + '/publish/post/456',), DRAFT, True, False),
+    ((DRAFT,), None, True, False), ((), DRAFT, True, True),
+    ((DRAFT, URL + '/publish/post/456'), DRAFT, True, True),
+    ((URL + '/publish/post/456',), DRAFT, True, True),
 ])
 def test_reconcile_command_preserves_uncertain_attempts(project, browser, actions, monkeypatch,
                                                        capsys, matches, known, link, linked):
@@ -417,6 +464,15 @@ def test_reconcile_command_preserves_uncertain_attempts(project, browser, action
                              needs_reconciliation=True)
     before = {p: p.read_bytes() for p in (project / 'In').iterdir()}
     monkeypatch.setattr(reconcile, 'inspect_drafts', lambda *_: reconcile.DraftEvidence(matches, 'Listing inspected.'))
+    monkeypatch.setattr(
+        reconcile, 'verify_supplied_draft',
+        lambda _page, _publication, draft_url, *_args, **_kwargs: reconcile.SuppliedDraftEvidence(
+            True, 'Verified exact editor.', inspection=reconcile.DraftInspection(
+                draft_url, '', 'empty', False, ('Saved',), True, draft_url,
+                'Editing post', ('Draft', 'Saved', 'Preview', 'Settings'),
+            ),
+        ),
+    )
     assert main(['substack-reconcile'] + (['--link'] if link else [])) == 0
     output = capsys.readouterr().out
     saved = record(project)
@@ -425,7 +481,7 @@ def test_reconcile_command_preserves_uncertain_attempts(project, browser, action
         assert saved.error_message is None
     else:
         assert saved == failed
-        assert ('Unknown' in output) if not (matches == (DRAFT,) and known == DRAFT) else ('--link' in output)
+        assert ('Unknown' in output) if known is None else ('--link' in output)
     assert before == {p: p.read_bytes() for p in (project / 'In').iterdir()}
     actions['open_new_post'].assert_not_called()
     actions['enter_title'].assert_not_called()
@@ -620,7 +676,10 @@ def test_supplied_draft_verification_uncertainty_leaves_state_unchanged(
         monkeypatch.setattr(reconcile, 'verify_supplied_draft', MagicMock(side_effect=PlaywrightError('unavailable')))
     else:
         reason = 'The editor shows published-post status.' if kind == 'published' else 'Ambiguous editor evidence.'
-        monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_: reconcile.SuppliedDraftEvidence(False, reason))
+        monkeypatch.setattr(
+            reconcile, 'verify_supplied_draft',
+            lambda *_, **__: reconcile.SuppliedDraftEvidence(False, reason),
+        )
     assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
     assert record(project) == failed
     output = capsys.readouterr().out
@@ -644,7 +703,7 @@ def test_supplied_draft_failure_reports_safe_diagnostics_and_preserves_state(
         ('Saved', 'Preview', 'Continue', 'Settings'), False,
         runtime_paths(project).diagnostics / 'safe.png',
     )
-    monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_: reconcile.SuppliedDraftEvidence(
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_, **__: reconcile.SuppliedDraftEvidence(
         False, 'Insufficient corroboration.', diagnostics=diagnostic,
     ))
     assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
@@ -690,7 +749,7 @@ def test_supplied_verified_draft_links_failed_attempt_only(
     attempt = repo.begin_attempt(story, 'substack')
     failed = repo.mark_failed(attempt.id, 'Original failure', needs_reconciliation=True)
     monkeypatch.setattr(reconcile, 'verify_supplied_draft',
-                        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
+                        lambda *_, **__: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
     assert main(['substack-reconcile', '--draft-url', DRAFT + '?tracking=removed']) == 0
     saved = record(project)
     assert saved.id == failed.id
@@ -714,7 +773,40 @@ def test_supplied_verified_draft_links_failed_attempt_only(
     browser[2].fill.assert_not_called()
 
 
-def test_supplied_verified_draft_replaces_only_same_unresolved_attempt_url(
+@pytest.mark.parametrize('remote_title', ['', 'Different remote title'])
+def test_recorded_exact_url_reconciliation_does_not_depend_on_title(
+        project, browser, actions, monkeypatch, remote_title):
+    from publish_to_all.browser import reconcile
+    repo = repository(project)
+    story = load_story(project / 'In')
+    attempt = repo.begin_attempt(story, 'substack')
+    failed = repo.mark_failed(
+        attempt.id, 'Title save uncertain', draft_url=DRAFT, needs_reconciliation=True,
+    )
+    verify = MagicMock(return_value=reconcile.SuppliedDraftEvidence(
+        True, 'Verified exact authenticated editor.', inspection=reconcile.DraftInspection(
+            DRAFT, remote_title, 'empty', False, ('Saved',), True, DRAFT,
+            'Editing post', ('Draft', 'Saved', 'Preview', 'Settings'),
+        ),
+    ))
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', verify)
+    listing = MagicMock()
+    monkeypatch.setattr(reconcile, 'inspect_drafts', listing)
+
+    assert main(['substack-reconcile', '--link']) == 0
+
+    saved = record(project)
+    assert saved.id == failed.id
+    assert saved.status == Status.DRAFT_CREATED
+    assert saved.draft_url == DRAFT
+    assert not saved.needs_reconciliation
+    assert saved.error_message is None
+    assert verify.call_args.args[2] == DRAFT
+    listing.assert_not_called()
+    actions['open_new_post'].assert_not_called()
+
+
+def test_supplied_wrong_url_does_not_replace_recorded_attempt_url(
         project, browser, monkeypatch):
     from publish_to_all.browser import reconcile
     repo = repository(project)
@@ -724,16 +816,13 @@ def test_supplied_verified_draft_replaces_only_same_unresolved_attempt_url(
         attempt.id, 'Original failure', draft_url=URL + '/publish/post/999',
         needs_reconciliation=True,
     )
-    monkeypatch.setattr(reconcile, 'verify_supplied_draft',
-                        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
+    verify = MagicMock(return_value=reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'))
+    monkeypatch.setattr(reconcile, 'verify_supplied_draft', verify)
     assert main(['substack-reconcile', '--draft-url', DRAFT]) == 0
     saved = record(project)
     assert saved.id == failed.id
-    assert saved.status == Status.DRAFT_CREATED
-    assert saved.draft_url == DRAFT
-    assert not saved.needs_reconciliation
-    with pytest.raises(DuplicatePublicationError):
-        repo.begin_attempt(story, 'substack')
+    assert saved == failed
+    verify.assert_not_called()
 
 
 def test_reconcile_failed_draft_accepts_previously_missing_url_and_rejects_replacement(project):
@@ -889,7 +978,7 @@ def test_linked_draft_reassociation_requires_flag_and_preserves_duplicate_protec
     second = URL + '/publish/post/456'
     monkeypatch.setattr(
         reconcile, 'verify_supplied_draft',
-        lambda *_: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'),
+        lambda *_, **__: reconcile.SuppliedDraftEvidence(True, 'Verified draft editor.'),
     )
 
     assert main(['substack-reconcile', '--draft-url', second]) == 0

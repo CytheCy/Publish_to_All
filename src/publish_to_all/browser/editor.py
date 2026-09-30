@@ -17,6 +17,8 @@ TITLE = re.compile(r"^(Title|Post title|Add a title)$", re.I)
 SAVED = re.compile(r"^(Saved|Draft saved|All changes saved|Saved to drafts)$", re.I)
 SAVING = re.compile(r"^Saving(?: changes)?(?:\.{3}|…)?$", re.I)
 
+_SAVE_OBSERVER = "__publishToAllTitleSaveObservation"
+
 
 def is_publishing_control(label: str) -> bool:
     return bool(DANGEROUS.search(label))
@@ -97,11 +99,26 @@ def title_fields(page):
     return page.get_by_role('textbox', name=TITLE).or_(page.get_by_placeholder(TITLE))
 
 
-def open_new_post(page: Page, publication_url: str) -> None:
+def open_new_post(page: Page, publication_url: str, on_draft_url=None) -> None:
     require_publication(page, publication_url)
     # Never initiate creation if navigation has already reached an editor.
     if extract_draft_url(page, publication_url) or urlsplit(page.url).path.rstrip('/') == '/publish/post/new':
         raise BrowserSessionError('An existing editor is open; reconcile before retrying.')
+    observed = set()
+
+    def capture(_frame=None):
+        url = extract_draft_url(page, publication_url)
+        if url and url not in observed:
+            observed.add(url)
+            if on_draft_url is not None:
+                on_draft_url(url)
+
+    # A numeric editor URL can appear before the React editor and title input
+    # hydrate. Listen before the creation click so identity is persisted at the
+    # earliest navigation event, including a click that later raises.
+    listener_installed = hasattr(page, 'on') and hasattr(page, 'remove_listener')
+    if listener_installed:
+        page.on('framenavigated', capture)
     candidates = controls(page, CREATE)
     # A rendered Posts link is a conservative fallback to the creator listing.
     if unique_visible(candidates) is None:
@@ -112,12 +129,19 @@ def open_new_post(page: Page, publication_url: str) -> None:
             if target.rstrip('/') == publication_url + '/publish/posts':
                 page.goto(target, wait_until='domcontentloaded')
                 require_publication(page, publication_url)
-    create = wait_visible(page, controls(page, CREATE))
-    click_creation_control(page, create, publication_url, CREATE)
-    # Some versions open an article directly; others expose Create > Article.
-    choice = wait_visible(page, title_fields(page).or_(controls(page, ARTICLE)))
-    if unique_visible(title_fields(page)) is None:
-        click_creation_control(page, choice, publication_url, ARTICLE)
+    try:
+        create = wait_visible(page, controls(page, CREATE))
+        click_creation_control(page, create, publication_url, CREATE)
+        capture()
+        # Some versions open an article directly; others expose Create > Article.
+        choice = wait_visible(page, title_fields(page).or_(controls(page, ARTICLE)))
+        capture()
+        if unique_visible(title_fields(page)) is None:
+            click_creation_control(page, choice, publication_url, ARTICLE)
+            capture()
+    finally:
+        if listener_installed:
+            page.remove_listener('framenavigated', capture)
 
 
 def locate_title_field(page: Page, publication_url: str):
@@ -136,12 +160,14 @@ def title_value(field) -> str:
 
 def enter_title(page, field, title: str, publication_url: str) -> None:
     require_publication(page, publication_url)
-    if title_value(field):
+    if not field.is_visible() or not field.is_editable() or title_value(field):
         raise BrowserSessionError("Expected an empty new-post title; existing content was left untouched.")
     field.fill(title)
-    if title_value(field) != title:
+    current = unique_visible(title_fields(page))
+    if current is None or not current.is_editable() or title_value(current) != title:
         raise BrowserSessionError("The editor did not retain the exact title.")
-    field.blur()
+    current.blur()
+    return current
 
 
 def extract_draft_url(page, publication_url: str) -> str | None:
@@ -160,38 +186,91 @@ def save_visible(page) -> bool:
     return any(item.is_visible() for item in page.get_by_text(SAVED).all())
 
 
-def confirm_draft(page, field, title, publication_url, *, previously_saved=False, timeout=30):
-    """Require fresh saved UI evidence or the exact title in a separately loaded draft.
+def saving_visible(page) -> bool:
+    return any(item.is_visible() for item in page.get_by_text(SAVING).all())
 
-    A URL alone or a stale Saved label never establishes title persistence. Keep
-    the editing tab open while a read-only verification tab checks the known URL.
-    """
+
+def start_save_observation(page) -> None:
+    """Observe a future Saving -> Saved transition without trusting existing text."""
+    if saving_visible(page):
+        raise BrowserSessionError('The editor was already saving before the title edit.')
+    page.evaluate(
+        """key => {
+            const previous = window[key];
+            if (previous && previous.observer) previous.observer.disconnect();
+            const state = {sawSaving: false, sawSavedAfterSaving: false, observer: null};
+            const saving = /^Saving(?: changes)?(?:\\.{3}|…)?$/i;
+            const saved = /^(Saved|Draft saved|All changes saved|Saved to drafts)$/i;
+            const visibleTexts = () =>
+                Array.from(document.querySelectorAll('body *'))
+                    .filter(node => node.children.length === 0 && node.getClientRects().length > 0)
+                    .map(node => (node.textContent || '').trim());
+            const record = text => {
+                text = (text || '').trim();
+                if (saving.test(text)) state.sawSaving = true;
+            };
+            const scan = mutations => {
+                for (const mutation of mutations || []) {
+                    record(mutation.oldValue);
+                    for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                        record(node.textContent);
+                    }
+                }
+                const texts = visibleTexts();
+                const hasSaving = texts.some(text => saving.test(text));
+                const hasSaved = texts.some(text => saved.test(text));
+                if (hasSaving) state.sawSaving = true;
+                if (state.sawSaving && hasSaved && !hasSaving) state.sawSavedAfterSaving = true;
+            };
+            state.observer = new MutationObserver(scan);
+            state.observer.observe(document.documentElement, {
+                subtree: true, childList: true, characterData: true,
+                characterDataOldValue: true
+            });
+            window[key] = state;
+        }""",
+        _SAVE_OBSERVER,
+    )
+
+
+def observed_save_transition(page) -> tuple[bool, bool]:
+    result = page.evaluate(
+        """key => {
+            const state = window[key];
+            return state ? [state.sawSaving, state.sawSavedAfterSaving] : [false, false];
+        }""",
+        _SAVE_OBSERVER,
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 2:
+        return False, False
+    return result[0] is True, result[1] is True
+
+
+def confirm_draft(
+    page, field, title, publication_url, *, expected_draft_url: str | None = None,
+    previously_saved=False, timeout=30,
+):
+    """Require the exact title and a fresh same-page Saving -> Saved transition."""
     deadline = monotonic() + timeout
-    saw_unsaved = not previously_saved
-    verification = None
-    next_read = 0.0
-    try:
-        while True:
-            require_publication(page, publication_url)
-            saved = save_visible(page)
-            saving = any(item.is_visible() for item in page.get_by_text(SAVING).all())
-            saw_unsaved = saw_unsaved or not saved or saving
-            if saved and not saving and saw_unsaved and title_value(field) == title:
-                return extract_draft_url(page, publication_url)
-            url = extract_draft_url(page, publication_url)
-            now = monotonic()
-            if url and now >= next_read:
-                if verification is None:
-                    verification = page.context.new_page()
-                verification.goto(url, wait_until='domcontentloaded')
-                require_publication(verification, publication_url)
-                other = unique_visible(title_fields(verification))
-                if other is not None and title_value(other) == title:
-                    return url
-                next_read = monotonic() + 1
-            if monotonic() >= deadline:
-                raise BrowserSessionError("Could not confirm that the title was saved as a draft.")
-            page.wait_for_timeout(250)
-    finally:
-        if verification is not None:
-            verification.close()
+    expected = (expected_draft_url or extract_draft_url(page, publication_url))
+    if expected is None:
+        raise BrowserSessionError('The captured numeric draft URL is unavailable.')
+    expected = expected.rstrip('/')
+    while True:
+        require_publication(page, publication_url)
+        current_url = extract_draft_url(page, publication_url)
+        if current_url is None or current_url.rstrip('/') != expected:
+            raise BrowserSessionError('The editor left the captured numeric draft URL.')
+        current = unique_visible(title_fields(page))
+        if current is None or not current.is_editable() or title_value(current) != title:
+            raise BrowserSessionError('The visible title no longer matches exactly.')
+        saw_saving, saw_saved_after_saving = observed_save_transition(page)
+        saved = save_visible(page)
+        saving = saving_visible(page)
+        if saw_saving and saw_saved_after_saving and saved and not saving:
+            return expected
+        if monotonic() >= deadline:
+            raise BrowserSessionError(
+                'Could not confirm a fresh Saving to Saved transition for the title edit.'
+            )
+        page.wait_for_timeout(100)
