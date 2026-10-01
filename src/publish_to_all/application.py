@@ -17,7 +17,7 @@ from .browser.substack import AuthenticationState, collect_diagnostics, verify_p
 from .errors import BrowserSessionError, SubstackRateLimitError
 from .publishers.substack import (
     SubstackBodyPublisher, SubstackImagePublisher, SubstackPublisher,
-    SubstackTitleRepairPublisher,
+    SubstackSubtitlePublisher, SubstackTitleRepairPublisher,
 )
 
 if TYPE_CHECKING:
@@ -71,6 +71,20 @@ class SocialPreviewReadOnlyResult:
     image_state: str
     local_save_count: int
     local_save_enabled: bool
+
+
+@dataclass(frozen=True)
+class SubtitleControlDiagnostic:
+    draft_url: str
+    title: str
+    subtitle: str
+    body_classification: str
+    social_preview_present: bool
+    editor_saved: bool
+    published_or_sent: bool
+    field_count: int
+    visible_editable_count: int
+    signature: str
 
 
 @dataclass(frozen=True)
@@ -130,6 +144,7 @@ def inspect_substack_publish(
     """Inspect the prepared draft's final publication UI without permitting mutation."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
     from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_inspect import (
         inspect_continue_candidates, install_mutation_guard, select_continue_control,
@@ -335,9 +350,13 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise BrowserSessionError(
                 'The exact story/draft association changed during preflight. Nothing was published.'
             )
-        network = WriteLikeNetworkObserver([]) if dry_run else None
+        network = WriteLikeNetworkObserver([], publication_url) if dry_run else None
+        guard = None
         if network is not None:
-            page.on('request', network.observe)
+            network.set_stage('DRAFT_EDITOR_LOAD')
+            page.on('response', network.observe_response)
+            guard = install_mutation_guard(page, observer=network)
+            guard.set_stage('DRAFT_EDITOR_LOAD')
         monitor = RateLimitMonitor(publication_url)
         page.on('response', monitor.observe)
         try:
@@ -349,6 +368,8 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise
         except (BrowserSessionError, PlaywrightError):
             monitor.require_clear(page)
+            if network is not None:
+                network.require_clear()
             raise BrowserSessionError(
                 'Could not safely verify the linked authenticated Substack editor. '
                 'Nothing was published.'
@@ -384,13 +405,19 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             )
         close_preflight_dialogs(page, monitor)
         monitor.require_clear(page)
+        if network is not None:
+            network.require_clear()
         if page.url.rstrip('/') != draft_url:
             raise BrowserSessionError(
                 'The exact draft editor was not preserved after preflight. Nothing was published.'
             )
 
         continue_control = select_continue_control(page)
-        guard = install_mutation_guard(page)
+        if guard is None:
+            guard = install_mutation_guard(page, observer=network)
+        if network is not None:
+            network.set_stage('CONTINUE_NAVIGATION')
+            guard.set_stage('CONTINUE_NAVIGATION')
         initial_screen = open_and_inspect_final_publication_screen(
             page, publication_url, draft_url, monitor, guard,
             continue_control=continue_control, leave_open=True,
@@ -398,6 +425,8 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
         guard.require_clear()
         if network is not None:
             network.require_clear()
+            network.set_stage('PRE_CLICK_REVALIDATION')
+            guard.set_stage('PRE_CLICK_REVALIDATION')
         if not dry_run:
             # Continue has now been proven read-only. Remove the inspection transport
             # guard so the single explicitly authorized final click can reach Substack.
@@ -422,7 +451,9 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
                'database_sha256_after': database_after,
                'schema_version_before': schema_before,
                'schema_version_after': schema_after,
-               'write_like_network_methods': tuple(network.methods) if network else ()}
+               'write_like_network_methods': tuple(network.methods) if network else (),
+               'suppressed_telemetry': tuple(network.suppressed_telemetry) if network else (),
+               'suppressed_editor_mutations': tuple(network.suppressed_editor_mutations) if network else ()}
         )
 
 
@@ -509,7 +540,7 @@ def forget_deleted_substack_draft(
             'local state unchanged.'
         )
 
-    repository = PublicationRepository(paths.database)
+    repository = PublicationRepository(paths.database, migrate=False)
     removal = repository.remove_verified_deleted_draft(
         story_hash, 'substack', record, draft_url,
     )
@@ -609,11 +640,120 @@ def add_substack_body(root: Path) -> StoryStatus:
                 'The opened editor does not match the linked draft URL. '
                 'The draft was not changed. Nothing was published.'
             )
+        if story.metadata.description is not None:
+            subtitle_publisher = SubstackSubtitlePublisher(
+                repository, page, publication_url, monitor,
+            )
+            record = subtitle_publisher.add_subtitle(story, record)
         publisher = SubstackBodyPublisher(
             repository, page, publication_url, monitor,
         )
         updated = publisher.add_body(story, record)
     return StoryStatus(story, updated)
+
+
+def add_substack_subtitle(root: Path) -> StoryStatus:
+    """Insert Description into the subtitle of the exact linked draft."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    story = inspection.story
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database)
+    record = repository.require_subtitle_candidate(story.source_hash, 'substack')
+    if story.metadata.description is None:
+        return StoryStatus(story, record)
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if draft_url != record.draft_url.rstrip('/'):
+        raise BrowserSessionError('The linked draft URL is not canonical. Nothing was changed.')
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError(
+            'No saved Substack session. Run publish-to-all substack-login first. '
+            'The linked draft was not changed.'
+        )
+    with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except (BrowserSessionError, PlaywrightError):
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'The draft was not changed. Nothing was published.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError(
+                'Substack rate limit encountered before subtitle insertion.\n\n'
+                'Local publication state is unchanged.\n\nNothing was published.'
+            )
+        if not evidence.verified or evidence.inspection is None:
+            raise BrowserSessionError(
+                'Could not safely verify the linked authenticated Substack editor. '
+                'The draft was not changed. Nothing was published.'
+            )
+        if evidence.inspection.draft_url.rstrip('/') != record.draft_url.rstrip('/'):
+            raise BrowserSessionError('The opened editor does not match the linked draft URL. Nothing was changed.')
+        publisher = SubstackSubtitlePublisher(repository, page, publication_url, monitor)
+        updated = publisher.add_subtitle(story, record)
+    return StoryStatus(story, updated)
+
+
+def inspect_substack_subtitle(root: Path, draft_url: str) -> SubtitleControlDiagnostic:
+    """Read-only diagnostic for the semantic subtitle control identity."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser import subtitle as subtitle_editor
+    from .browser.body import RateLimitMonitor
+    from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    supplied_url = validate_supplied_draft_url(draft_url, publication_url)
+    paths = runtime_paths(root)
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError('No saved Substack session. The diagnostic made no changes.')
+    with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, supplied_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+            if not evidence.verified:
+                raise BrowserSessionError('The supplied page was not verified as an authenticated draft editor.')
+            fields = subtitle_editor.subtitle_fields(page)
+            all_fields = fields.all()
+            visible = [field for field in all_fields if field.is_visible() and field.is_editable()]
+            if len(visible) != 1:
+                raise BrowserSessionError('The Substack subtitle field was not uniquely identified.')
+            subtitle = subtitle_editor.subtitle_value(visible[0])
+            draft_inspection = evidence.inspection
+            if draft_inspection is None:
+                raise BrowserSessionError('The supplied page did not produce draft inspection evidence.')
+        except (BrowserSessionError, PlaywrightError):
+            raise BrowserSessionError('Could not inspect the authenticated editor subtitle control safely.') from None
+    return SubtitleControlDiagnostic(
+        supplied_url,
+        draft_inspection.visible_title,
+        subtitle,
+        draft_inspection.body_classification,
+        draft_inspection.image_present,
+        'Saved' in draft_inspection.controls,
+        any(label in draft_inspection.controls for label in ('Published', 'Sent')),
+        len(all_fields),
+        len(visible),
+        'role=textbox; accessible name /^(Subtitle|Add a subtitle)$/i; '
+        'placeholder /^(Subtitle|Add a subtitle)$/i; data-testid=subtitle; '
+        'resolved as one visible editable control',
+    )
 
 
 def add_substack_image(root: Path) -> StoryStatus:
@@ -635,6 +775,11 @@ def add_substack_image(root: Path) -> StoryStatus:
     paths = runtime_paths(root)
     repository = PublicationRepository(paths.database)
     record = repository.require_image_candidate(story.source_hash, 'substack')
+    if story.metadata.description is not None and record.subtitle_status.value != 'subtitle_inserted':
+        raise BrowserSessionError(
+            'The Substack subtitle must be verified from Description before Social Preview image upload. '
+            'Nothing was changed.'
+        )
     draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
     if draft_url != record.draft_url.rstrip('/'):
         raise BrowserSessionError('The linked draft URL is not canonical. Nothing was changed.')
@@ -1123,9 +1268,9 @@ def reconcile_substack(
     from .browser.body import RateLimitMonitor
     from .browser.reconcile import (
         inspect_drafts, DraftEvidence, SuppliedDraftEvidence, supplied_draft_diagnostics,
-        validate_supplied_draft_url, verify_supplied_draft,
+        validate_supplied_draft_url, verify_supplied_draft, verified_not_published_evidence,
     )
-    from .state import PublicationStatus
+    from .state import PublicationStatus, PublicationState
 
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
@@ -1187,6 +1332,33 @@ def reconcile_substack(
                 return _format_supplied_draft_failure(evidence, rate_limited=True)
             if not evidence.verified:
                 return _format_supplied_draft_failure(evidence)
+            if (link and attempt.final_click_attempted
+                    and attempt.publication_verification_status == 'ambiguous'
+                    and attempt.status == PublicationStatus.FAILED):
+                nonpublication_evidence = (
+                    verified_not_published_evidence(evidence.inspection, exact_url)
+                    if evidence.inspection is not None else None
+                )
+                if nonpublication_evidence is None:
+                    return '\n'.join([
+                        'Unable to establish verified non-publication safely.', '',
+                        'The exact editor was not positively classified as an unpublished editable draft.',
+                        '', 'Local state unchanged.', 'Nothing was published.',
+                    ])
+                record = repository.reconcile_publication_not_published(
+                    attempt, nonpublication_evidence,
+                )
+                return '\n'.join([
+                    'Substack reconciliation complete', '',
+                    'Classification: NOT_PUBLISHED_VERIFIED', '',
+                    'Story:', inspection.story.metadata.title, '',
+                    'Draft:', record.draft_url or exact_url, '',
+                    'Local state: Verified not published after final click', '',
+                    'Published URL: None',
+                    'Retry authorization required: Yes', '',
+                    'The original final-click attempt remains in audit history.',
+                    'No remote draft was modified or deleted.', 'Nothing was published.',
+                ])
             if linked:
                 if not replace_linked_draft:
                     return '\n'.join([
@@ -1239,6 +1411,77 @@ def reconcile_substack(
         report.append('Unknown: insufficient evidence to associate a unique draft with the failed attempt. '
                       'Local state unchanged; retry remains blocked. An untitled draft cannot be matched by story title.')
     return '\n'.join(report)
+
+
+def authorize_substack_retry(root: Path) -> StoryStatus:
+    """Reverify the exact draft and explicitly unlock one guarded retry."""
+    from playwright.sync_api import Error as PlaywrightError
+    from .browser.body import RateLimitMonitor
+    from .browser.image_observe import inspect_social_preview_image
+    from .browser.reconcile import (
+        validate_supplied_draft_url, verify_supplied_draft, verified_not_published_evidence,
+    )
+    from .state import PublicationState
+
+    inspection = inspect_project(root)
+    publication_url = inspection.config.require_substack()
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database, migrate=False)
+    record = repository.get_publication(inspection.story.source_hash, 'substack')
+    if record is None or record.publication_state != PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK:
+        raise BrowserSessionError(
+            'Retry authorization requires verified-not-published-after-click state. Nothing was published.'
+        )
+    draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError('No saved Substack session. Retry remains blocked. Nothing was published.')
+    with persistent_browser(paths.substack_browser_profile, paths.diagnostics, headless=False) as context:
+        page = context.new_page()
+        monitor = RateLimitMonitor(publication_url)
+        page.on('response', monitor.observe)
+        try:
+            evidence = verify_supplied_draft(
+                page, publication_url, draft_url, paths.diagnostics,
+                rate_limit_monitor=monitor,
+            )
+        except (BrowserSessionError, PlaywrightError):
+            monitor.require_clear(page)
+            raise BrowserSessionError(
+                'The exact linked draft could not be reverified. Retry remains blocked. Nothing was published.'
+            ) from None
+        if evidence.rate_limited or monitor.encountered:
+            raise SubstackRateLimitError('Substack rate limiting occurred. Retry remains blocked. Nothing was published.')
+        nonpublication_evidence = (
+            verified_not_published_evidence(evidence.inspection, draft_url)
+            if evidence.verified and evidence.inspection is not None else None
+        )
+        if nonpublication_evidence is None:
+            raise BrowserSessionError(
+                'The exact draft or absence of a public URL was not positively reverified. Retry remains blocked.'
+            )
+        remote = evidence.inspection
+        social_preview = inspect_social_preview_image(page, monitor)
+        if (remote.visible_title != inspection.story.metadata.title
+                or remote.body_classification != 'substantial'
+                or social_preview.state.value != 'present'
+                or 'Saved' not in remote.editor_state
+                or 'Saving' in remote.editor_state
+                or remote.canonical_public_urls):
+            raise BrowserSessionError(
+                'The linked draft no longer matches the current saved title, body, image, or unpublished state. '
+                'Retry remains blocked. Nothing was published.'
+            )
+        repository = PublicationRepository(paths.database)
+        current = repository.get_publication(inspection.story.source_hash, 'substack')
+        if current != record:
+            raise BrowserSessionError(
+                'The local publication record changed during re-verification. Retry remains blocked. Nothing was published.'
+            )
+        updated = repository.authorize_retry(
+            current, story_hash=inspection.story.source_hash,
+            remote_draft_reverified=True, no_public_url=True,
+        )
+    return StoryStatus(inspection.story, updated)
 
 
 def _format_supplied_draft_failure(evidence, *, rate_limited: bool = False) -> str:

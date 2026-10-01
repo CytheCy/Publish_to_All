@@ -4,10 +4,11 @@ A local Python utility for preparing a finished Markdown story and its cover
 image for publishing destinations. Phase 1 targets Substack drafts for manual
 review, with no automatic final publication.
 
-**Current milestone: guarded title, body, and cover stages for a linked Substack draft.**
+**Current milestone: guarded title, subtitle, body, and cover stages for a linked Substack draft.**
 `publish-to-all substack` still creates a title-only draft. The separate
 `publish-to-all substack-title` command repairs an empty title on an existing
-linked draft, `publish-to-all substack-body` adds the parsed story body, and
+linked draft, `publish-to-all substack-subtitle` maps front-matter `Description`
+to the Substack subtitle, `publish-to-all substack-body` adds the parsed story body, and
 `publish-to-all substack-image` uploads its matching Social Preview image. None publishes,
 sends, schedules, or configures publication settings.
 
@@ -408,7 +409,7 @@ The browser uses the configured publication's dashboard and visible creation
 controls (Create → Article, or the older New post workflow), following
 [Substack's documented editor workflow](https://support.substack.com/hc/en-us/articles/360037831771-How-do-I-publish-a-new-post-on-Substack).
 The parsed front-matter title is the only field filled. The command deliberately
-does **not** insert the story body, subtitle, description, cover image, tags,
+does **not** insert the story body, subtitle, Description, cover image, tags,
 series, or episode, and does not change audience, email, SEO, or scheduling.
 Publish, Send, Schedule, and Continue controls are never used. The publisher's
 final-publication method is disabled.
@@ -508,6 +509,19 @@ is marked for manual reconciliation because the title may or may not have saved.
 
 Run this only after the exact current story has a reconciled `draft_created`
 record with a numeric editor URL:
+
+When the story has a front-matter `Description`, prepare its Substack
+subtitle on the exact linked draft with:
+
+```bash
+publish-to-all substack-subtitle
+```
+
+The command uses the semantic subtitle control, fills it once only when empty,
+accepts an exact existing match as prepared, and refuses different existing
+content. It verifies the visible subtitle and a fresh `Saving` to `Saved`
+transition while preserving the title, body, and draft URL. `substack-body`
+performs this step first for stories with a Description.
 
 ```bash
 publish-to-all substack-body

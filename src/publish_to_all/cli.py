@@ -5,18 +5,20 @@ from pathlib import Path
 import sys
 
 from .application import (
-    add_substack_body, add_substack_image, inspect_project, inspect_status,
+    add_substack_body, add_substack_image, add_substack_subtitle, inspect_project, inspect_status,
+    inspect_substack_subtitle,
     inspect_substack_draft, inspect_substack_publish, inspect_substack_social_preview,
     observe_substack_image,
     prepare_substack_draft, repair_substack_title,
     reassociate_substack_version, reconcile_substack, reconcile_substack_image,
     forget_deleted_substack_draft, validate_substack_publish_configuration,
-    diagnose_substack_final_action, publish_substack,
+    diagnose_substack_final_action, publish_substack, authorize_substack_retry,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
 from .presentation import (
     format_check, format_preview, format_status, format_substack_body, format_substack_image,
+    format_substack_subtitle,
     format_substack_title,
     format_social_preview_inspection,
     format_substack_image_observation,
@@ -51,6 +53,15 @@ def main(argv: list[str] | None = None) -> int:
         "substack-body",
         help="Insert the story body into the already-linked Substack draft; never publish.",
     )
+    commands.add_parser(
+        "substack-subtitle",
+        help="Insert Markdown Description as the subtitle of the already-linked draft; never publish.",
+    )
+    command = commands.add_parser(
+        "substack-subtitle-inspect",
+        help="Read the linked draft's semantic subtitle control without changing it.",
+    )
+    command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
     commands.add_parser(
         "substack-image",
         help="Upload the story's Social Preview image to the populated linked draft; never publish.",
@@ -115,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
         "--replace-linked-draft", action="store_true",
         help="Explicitly replace the current story's local draft association after verification.",
     )
+    commands.add_parser(
+        "substack-authorize-retry",
+        help="Reverify the exact unpublished draft and explicitly authorize one guarded retry.",
+    )
     command = commands.add_parser(
         "substack-reassociate-version",
         help="Locally move one untouched draft association to the current story version.",
@@ -150,6 +165,16 @@ def main(argv: list[str] | None = None) -> int:
                 replace_linked_draft=args.replace_linked_draft,
             ))
             return 0
+        if args.command == "substack-authorize-retry":
+            result = authorize_substack_retry(Path("."))
+            print("Substack retry authorized\n\nDraft: " + (result.substack.draft_url or "None")
+                  + "\nPrior final click attempts: "
+                  + str(result.substack.final_click_attempt_count)
+                  + "\nRetry authorizations: "
+                  + str(result.substack.retry_authorization_count)
+                  + "\nAuthorized remaining publish attempts: 1"
+                  + "\nNo publication action was performed. Nothing was published.")
+            return 0
         if args.command == "substack-inspect-draft":
             print(inspect_substack_draft(Path("."), args.draft_url))
             return 0
@@ -163,6 +188,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "substack-body":
             print(format_substack_body(add_substack_body(Path("."))))
+            return 0
+        if args.command == "substack-subtitle":
+            print(format_substack_subtitle(add_substack_subtitle(Path("."))))
+            return 0
+        if args.command == "substack-subtitle-inspect":
+            diagnostic = inspect_substack_subtitle(Path("."), args.draft_url)
+            print("Substack subtitle control diagnostic\n\n"
+                  f"Draft: {diagnostic.draft_url}\n"
+                  f"Title: {diagnostic.title}\n"
+                  f"Subtitle: {diagnostic.subtitle}\n"
+                  f"Body: {diagnostic.body_classification}\n"
+                  f"Social Preview: {'present' if diagnostic.social_preview_present else 'absent'}\n"
+                  f"Editor Saved: {'Yes' if diagnostic.editor_saved else 'No'}\n"
+                  f"Published/Sent: {'Yes' if diagnostic.published_or_sent else 'No'}\n"
+                  f"Candidate controls: {diagnostic.field_count}\n"
+                  f"Visible editable controls: {diagnostic.visible_editable_count}\n"
+                  f"Signature: {diagnostic.signature}\n\n"
+                  "No remote changes were made.\nNothing was published.")
             return 0
         if args.command == "substack-image":
             print(format_substack_image(add_substack_image(Path("."))))

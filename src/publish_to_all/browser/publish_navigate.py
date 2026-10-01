@@ -43,10 +43,12 @@ def open_and_inspect_final_publication_screen(
 ):
     """Navigate with Continue, then delegate all DOM reading to the inspector."""
     control = continue_control or select_continue_control(page)
+    guard.set_stage('CONTINUE_NAVIGATION')
     control.locator.click()
     guard.require_clear()
     deadline = monotonic() + 10
     screen = None
+    guard.set_stage('PUBLISH_SCREEN_LOAD')
     while monotonic() < deadline:
         monitor.require_clear(page)
         guard.require_clear()
@@ -62,6 +64,8 @@ def open_and_inspect_final_publication_screen(
             'Continue was clicked once, but the final publication configuration screen '
             'could not be positively identified. No final action was clicked.'
         )
+
+    guard.set_stage('FINAL_ACTION_DISCOVERY')
 
     if leave_open:
         return replace(

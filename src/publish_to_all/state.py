@@ -29,11 +29,25 @@ class PublicationStatus(StrEnum):
     FAILED = "failed"
 
 
+class PublicationState(StrEnum):
+    """State that is orthogonal to the coarse workflow status."""
+
+    STANDARD = "standard"
+    VERIFIED_NOT_PUBLISHED_AFTER_CLICK = "verified_not_published_after_click"
+
+
 class BodyStatus(StrEnum):
     NOT_STARTED = "not_started"
     INSERTING = "body_inserting"
     INSERTED = "body_inserted"
     FAILED = "body_insertion_failed"
+
+
+class SubtitleStatus(StrEnum):
+    NOT_STARTED = "subtitle_not_started"
+    INSERTING = "subtitle_inserting"
+    INSERTED = "subtitle_inserted"
+    FAILED = "subtitle_insertion_failed"
 
 
 class ImageStatus(StrEnum):
@@ -70,6 +84,10 @@ class PublicationRecord:
     body_started_at: str | None = None
     body_inserted_at: str | None = None
     body_error_message: str | None = None
+    subtitle_status: SubtitleStatus = SubtitleStatus.NOT_STARTED
+    subtitle_started_at: str | None = None
+    subtitle_inserted_at: str | None = None
+    subtitle_error_message: str | None = None
     image_status: ImageStatus = ImageStatus.NOT_STARTED
     image_started_at: str | None = None
     image_uploaded_at: str | None = None
@@ -79,6 +97,11 @@ class PublicationRecord:
     publication_verification_status: str = 'not_started'
     publication_verification_evidence: str | None = None
     publication_ambiguity_reason: str | None = None
+    publication_state: PublicationState = PublicationState.STANDARD
+    final_click_attempt_count: int = 0
+    retry_authorized: bool = False
+    retry_authorized_at: str | None = None
+    retry_authorization_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -172,6 +195,37 @@ MIGRATIONS = (
         "ALTER TABLE publications ADD COLUMN publication_verification_evidence TEXT",
         "ALTER TABLE publications ADD COLUMN publication_ambiguity_reason TEXT",
     ),
+    (
+        "ALTER TABLE publications ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'standard' CHECK(publication_state IN ('standard', 'verified_not_published_after_click'))",
+        "ALTER TABLE publications ADD COLUMN final_click_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(final_click_attempt_count >= 0 AND final_click_attempt_count <= 2)",
+        "ALTER TABLE publications ADD COLUMN retry_authorized INTEGER NOT NULL DEFAULT 0 CHECK(retry_authorized IN (0, 1))",
+        "ALTER TABLE publications ADD COLUMN retry_authorized_at TEXT",
+        """CREATE TABLE publication_audit_events (
+            id INTEGER PRIMARY KEY,
+            publication_id INTEGER NOT NULL REFERENCES publications(id),
+            event_type TEXT NOT NULL CHECK(event_type IN ('final_click_attempt', 'verified_not_published', 'retry_authorized')),
+            recorded_at TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            draft_url TEXT,
+            evidence TEXT
+        )""",
+        "CREATE INDEX publication_audit_events_publication ON publication_audit_events(publication_id, id)",
+        """INSERT INTO publication_audit_events
+           (publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+           SELECT p.id, 'final_click_attempt', COALESCE(p.final_click_attempted_at, p.updated_at),
+                  s.source_hash, p.draft_url, 'Migrated from preserved final_click_attempt record'
+           FROM publications p JOIN stories s ON s.id = p.story_id
+           WHERE p.final_click_attempted = 1""",
+        "UPDATE publications SET final_click_attempt_count = 1 WHERE final_click_attempted = 1 AND final_click_attempt_count = 0",
+    ),
+    (
+        "ALTER TABLE publications ADD COLUMN retry_authorization_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_authorization_count >= 0 AND retry_authorization_count <= 1)",
+        "UPDATE publications SET retry_authorization_count = 1 WHERE retry_authorized = 1",
+        "ALTER TABLE publications ADD COLUMN subtitle_status TEXT NOT NULL DEFAULT 'subtitle_not_started' CHECK(subtitle_status IN ('subtitle_not_started', 'subtitle_inserting', 'subtitle_inserted', 'subtitle_insertion_failed'))",
+        "ALTER TABLE publications ADD COLUMN subtitle_started_at TEXT",
+        "ALTER TABLE publications ADD COLUMN subtitle_inserted_at TEXT",
+        "ALTER TABLE publications ADD COLUMN subtitle_error_message TEXT",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -244,6 +298,15 @@ class PublicationRepository:
                 for statement in MIGRATIONS[index]:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {index + 1}")
+            # Databases created at schema version 9 before subtitle support
+            # need the same columns, while the established public schema
+            # version remains 9.
+            columns = {
+                row[1] for row in connection.execute('PRAGMA table_info(publications)').fetchall()
+            }
+            if version == SCHEMA_VERSION and 'subtitle_status' not in columns:
+                for statement in MIGRATIONS[-1][2:]:
+                    connection.execute(statement)
 
     @contextmanager
     def _connection(self, *, write=False):
@@ -293,10 +356,16 @@ class PublicationRepository:
         values["status"] = PublicationStatus(values["status"])
         if "body_status" in values:
             values["body_status"] = BodyStatus(values["body_status"])
+        if "subtitle_status" in values:
+            values["subtitle_status"] = SubtitleStatus(values["subtitle_status"])
         if "image_status" in values:
             values["image_status"] = ImageStatus(values["image_status"])
         if "final_click_attempted" in values:
             values["final_click_attempted"] = bool(values["final_click_attempted"])
+        if "publication_state" in values:
+            values["publication_state"] = PublicationState(values["publication_state"])
+        if "retry_authorized" in values:
+            values["retry_authorized"] = bool(values["retry_authorized"])
         return PublicationRecord(**values)
 
     @classmethod
@@ -306,9 +375,11 @@ class PublicationRepository:
         parameters = [source_hash, destination]
         if blocking:
             sql += """ AND (p.status IN (?, ?, ?, ?) OR p.draft_url IS NOT NULL
-                       OR p.published_url IS NOT NULL OR p.needs_reconciliation = 1)"""
+                       OR p.published_url IS NOT NULL OR p.needs_reconciliation = 1
+                       OR p.publication_state = ?)"""
             parameters += [PublicationStatus.DRAFT_CREATING, PublicationStatus.DRAFT_CREATED,
-                           PublicationStatus.PUBLISHING, PublicationStatus.PUBLISHED]
+                           PublicationStatus.PUBLISHING, PublicationStatus.PUBLISHED,
+                           PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK]
         sql += " ORDER BY p.id DESC LIMIT 1"
         return cls._record(connection.execute(sql, parameters).fetchone())
 
@@ -523,11 +594,27 @@ class PublicationRepository:
             ).fetchone())
             if current != expected:
                 raise StateError('Final-click preflight state is stale. The final action was not clicked.')
-            if (current.status != PublicationStatus.DRAFT_CREATED or current.final_click_attempted
-                    or current.published_url or current.needs_reconciliation):
+            retry_click = (
+                current.status == PublicationStatus.DRAFT_CREATED
+                and current.final_click_attempt_count == 1
+                and current.final_click_attempted
+                and current.retry_authorized
+                and current.retry_authorization_count == 1
+            )
+            first_click = (
+                current.status == PublicationStatus.DRAFT_CREATED
+                and current.final_click_attempt_count == 0
+                and not current.final_click_attempted
+            )
+            if (not (first_click or retry_click) or current.published_url
+                    or current.needs_reconciliation):
                 raise StateError(
                     'The publication is not eligible for a first final click. The final action was not clicked.'
                 )
+            if current.final_click_attempt_count >= 2:
+                raise StateError('The maximum guarded final-click attempts has been reached.')
+            if current.final_click_attempt_count == 1 and not retry_click:
+                raise StateError('An explicit retry authorization is required before another final click.')
             owner = connection.execute(
                 '''SELECT s.source_hash, p.destination FROM publications p
                    JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
@@ -543,12 +630,22 @@ class PublicationRepository:
             now = _now()
             connection.execute(
                 '''UPDATE publications SET status = ?, final_click_attempted = 1,
+                   final_click_attempt_count = final_click_attempt_count + 1,
+                   retry_authorized = 0,
                    final_click_attempted_at = ?, publication_verification_status = 'pending',
                    publication_verification_evidence = NULL,
                    publication_ambiguity_reason = NULL, needs_reconciliation = 1,
                    updated_at = ?, last_attempt_at = ?
                    WHERE id = ?''',
                 (PublicationStatus.PUBLISHING, now, now, now, current.id),
+            )
+            connection.execute(
+                '''INSERT INTO publication_audit_events
+                   (publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+                   SELECT p.id, 'final_click_attempt', ?, s.source_hash, p.draft_url,
+                          'Guarded final-action click reserved'
+                   FROM publications p JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
+                (now, current.id),
             )
             return self._record(connection.execute(
                 'SELECT * FROM publications WHERE id = ?', (current.id,),
@@ -647,6 +744,103 @@ class PublicationRepository:
                 'SELECT * FROM publications WHERE id = ?', (current.id,),
             ).fetchone())
 
+    def reconcile_publication_not_published(
+        self, expected: PublicationRecord, evidence: tuple[str, ...],
+    ) -> PublicationRecord:
+        """Resolve an ambiguous click after positive proof that the draft remained unpublished."""
+        if ('classification=NOT_PUBLISHED_VERIFIED' not in evidence
+                or 'published_url=None' not in evidence):
+            raise StateError('Verified non-publication evidence is stale or insufficient. State unchanged.')
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,),
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.FAILED
+                    or not current.final_click_attempted
+                    or current.final_click_attempt_count not in (1, 2)
+                    or not current.needs_reconciliation
+                    or current.publication_verification_status != 'ambiguous'
+                    or current.published_url is not None
+                    or not _is_numeric_draft_url(current.draft_url)):
+                raise StateError('Verified non-publication evidence is stale or insufficient. State unchanged.')
+            now = _now()
+            safe_evidence = self._verification_evidence(evidence)
+            connection.execute(
+                '''UPDATE publications SET status = ?, error_message = NULL,
+                   needs_reconciliation = 0, publication_state = ?,
+                   publication_verification_status = 'not_started',
+                   publication_verification_evidence = ?, publication_ambiguity_reason = NULL,
+                   updated_at = ? WHERE id = ?''',
+                (PublicationStatus.FAILED, PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK,
+                 safe_evidence, now, current.id),
+            )
+            connection.execute(
+                '''INSERT INTO publication_audit_events
+                   (publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+                   SELECT p.id, 'verified_not_published', ?, s.source_hash, p.draft_url, ?
+                   FROM publications p JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
+                (now, safe_evidence, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
+    def authorize_retry(
+        self, expected: PublicationRecord, *, story_hash: str,
+        remote_draft_reverified: bool, no_public_url: bool,
+    ) -> PublicationRecord:
+        """Explicitly unlock the single remaining guarded attempt."""
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+                   WHERE p.id = ? AND s.source_hash = ?''', (expected.id, story_hash),
+            ).fetchone())
+            if (current != expected
+                    or current.publication_state != PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK
+                    or current.status != PublicationStatus.FAILED
+                    or current.final_click_attempt_count != 1
+                    or current.retry_authorized or current.retry_authorization_count != 0
+                    or not current.final_click_attempted or not remote_draft_reverified
+                    or not no_public_url or current.published_url is not None
+                    or current.needs_reconciliation
+                    or current.error_message or current.body_error_message or current.image_error_message
+                    or current.body_status != BodyStatus.INSERTED
+                    or current.image_status != ImageStatus.UPLOADED
+                    or not _is_numeric_draft_url(current.draft_url)
+                    or len(connection.execute(
+                        "SELECT 1 FROM publication_audit_events WHERE publication_id = ? AND event_type = 'final_click_attempt'",
+                        (current.id,),
+                    ).fetchall()) != 1
+                    or story_hash != (connection.execute(
+                        'SELECT source_hash FROM stories WHERE id = ?', (current.story_id,)
+                    ).fetchone()['source_hash'])):
+                raise StateError('Retry authorization requires a reverified exact unpublished draft in the verified-not-published state.')
+            now = _now()
+            connection.execute(
+                '''UPDATE publications SET status = ?, publication_state = ?, retry_authorized = 1,
+                   retry_authorized_at = ?, retry_authorization_count = 1,
+                   publication_verification_status = 'not_started', needs_reconciliation = 0,
+                   updated_at = ? WHERE id = ?''',
+                (PublicationStatus.DRAFT_CREATED, PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK, now, now, current.id),
+            )
+            connection.execute(
+                '''INSERT INTO publication_audit_events
+                   (publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+                   VALUES (?, 'retry_authorized', ?, ?, ?, ?)''',
+                (current.id, now, story_hash, current.draft_url,
+                 'Explicit user authorization; exact draft reverified; no public URL'),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
+    def audit_history(self, publication_id: int) -> tuple[dict, ...]:
+        with self._connection() as connection:
+            return tuple(dict(row) for row in connection.execute(
+                'SELECT * FROM publication_audit_events WHERE publication_id = ? ORDER BY id',
+                (publication_id,),
+            ).fetchall())
+
     def mark_failed(self, record_id: int, error_message: str, *, draft_url: str | None = None,
                     needs_reconciliation: bool = False) -> PublicationRecord:
         """Retain known URLs; block retries when a remote outcome is uncertain.
@@ -741,6 +935,12 @@ class PublicationRepository:
                     f'found {len(old_rows)}. State unchanged.'
                 )
             record = self._record(old_rows[0])
+            if (record.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK
+                    and not record.retry_authorized):
+                raise StateError('The current draft requires explicit retry authorization. Local state unchanged.')
+            if record.retry_authorized and (record.final_click_attempt_count != 1
+                    or record.retry_authorization_count != 1):
+                raise StateError('The retry authorization is invalid or exhausted. Local state unchanged.')
             if record.status != PublicationStatus.DRAFT_CREATED:
                 raise StateError(
                     f'The source publication must be draft_created, not {record.status.value}. State unchanged.'
@@ -819,6 +1019,97 @@ class PublicationRepository:
                 'A previous body insertion has an uncertain outcome. Inspect the linked draft before retrying.'
             )
         return record
+
+    def require_subtitle_candidate(self, source_hash: str, destination: str) -> PublicationRecord:
+        """Return the exact linked draft when subtitle insertion is safe to begin."""
+        with self._connection() as connection:
+            record = self._lookup(connection, source_hash, destination)
+        if record is None:
+            raise StateError('No publication record exists for this exact story version. Nothing was changed.')
+        if record.status != PublicationStatus.DRAFT_CREATED or not record.draft_url:
+            raise StateError('The publication record is not a linked draft. Nothing was changed.')
+        if record.published_url or record.needs_reconciliation or record.error_message:
+            raise StateError('The publication record requires reconciliation. Nothing was changed.')
+        if record.subtitle_status == SubtitleStatus.INSERTED:
+            raise StateError('The story subtitle is already recorded as inserted. Automatic replacement was refused.')
+        if record.subtitle_status in {SubtitleStatus.INSERTING, SubtitleStatus.FAILED}:
+            raise StateError('A previous subtitle insertion has an uncertain outcome. Inspect the linked draft before retrying.')
+        return record
+
+    def mark_subtitle_inserting(self, expected: PublicationRecord) -> PublicationRecord:
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,)
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.DRAFT_CREATED
+                    or not current.draft_url or current.needs_reconciliation
+                    or current.error_message or current.subtitle_status != SubtitleStatus.NOT_STARTED):
+                raise StateError('Subtitle insertion preflight became stale. Nothing was changed remotely.')
+            now = _now()
+            connection.execute(
+                """UPDATE publications SET subtitle_status = ?, subtitle_started_at = ?,
+                   subtitle_inserted_at = NULL, subtitle_error_message = NULL,
+                   updated_at = ?, last_attempt_at = ? WHERE id = ?""",
+                (SubtitleStatus.INSERTING, now, now, now, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
+
+    def mark_subtitle_inserted(self, record_id: int) -> PublicationRecord:
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (record_id,)
+            ).fetchone())
+            if (current is None or current.status != PublicationStatus.DRAFT_CREATED
+                    or current.subtitle_status != SubtitleStatus.INSERTING or not current.draft_url):
+                raise StateError('Cannot record subtitle insertion success from the current state.')
+            now = _now()
+            connection.execute(
+                """UPDATE publications SET subtitle_status = ?, subtitle_inserted_at = ?,
+                   subtitle_error_message = NULL, needs_reconciliation = 0, updated_at = ?
+                   WHERE id = ?""",
+                (SubtitleStatus.INSERTED, now, now, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
+
+    def mark_subtitle_matched(self, expected: PublicationRecord) -> PublicationRecord:
+        """Record a remotely verified matching subtitle without a remote write."""
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (expected.id,)
+            ).fetchone())
+            if (current != expected or current.status != PublicationStatus.DRAFT_CREATED
+                    or current.subtitle_status != SubtitleStatus.NOT_STARTED
+                    or current.needs_reconciliation):
+                raise StateError('Subtitle match evidence is stale. Local state unchanged.')
+            now = _now()
+            connection.execute(
+                """UPDATE publications SET subtitle_status = ?, subtitle_inserted_at = ?,
+                   subtitle_error_message = NULL, updated_at = ? WHERE id = ?""",
+                (SubtitleStatus.INSERTED, now, now, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
+
+    def mark_subtitle_insertion_failed(self, record_id: int, error_message: str) -> PublicationRecord:
+        with self._connection(write=True) as connection:
+            current = self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (record_id,)
+            ).fetchone())
+            if current is None or current.subtitle_status != SubtitleStatus.INSERTING:
+                raise StateError('Cannot record subtitle insertion failure from the current state.')
+            connection.execute(
+                """UPDATE publications SET subtitle_status = ?, subtitle_error_message = ?,
+                   needs_reconciliation = 1, updated_at = ? WHERE id = ?""",
+                (SubtitleStatus.FAILED, error_message, _now(), current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
 
     def require_title_repair_candidate(
         self, source_hash: str, destination: str,
@@ -1045,6 +1336,14 @@ class PublicationRepository:
                     'No publication record exists for the exact current story hash. '
                     'Local state unchanged.'
                 )
+            if (record.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK
+                    and not record.retry_authorized):
+                raise StateError('The current draft requires explicit retry authorization. Local state unchanged.')
+            if record.retry_authorized and (
+                    record.final_click_attempt_count != 1
+                    or record.retry_authorization_count != 1
+            ):
+                raise StateError('The retry authorization is invalid or exhausted. Local state unchanged.')
             if record.status != PublicationStatus.DRAFT_CREATED:
                 raise StateError(
                     f'Publication state must be draft_created, not {record.status.value}. '

@@ -11,7 +11,7 @@ from .application import (
 )
 from .browser.publish_validate import ValidationStatus
 from .browser.publish_inspect import AttributeEvidence
-from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationStatus
+from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationState, PublicationStatus
 from .browser.substack import AuthenticationState, SessionResult
 
 
@@ -93,6 +93,8 @@ def format_preview(result: Inspection) -> str:
         if value is not None and value != ():
             value = ", ".join(value) if field == "tags" else value
             lines.append(f"{field.capitalize()}: {value}")
+    if metadata.description is not None:
+        lines.append("Substack subtitle: Description")
     lines += [f"Words: {story.word_count}", f"Image: {story.image.name if story.image else 'none'}",
               *_substack_image_lines(story),
               "", "Destination", "", "Substack"]
@@ -116,6 +118,14 @@ STATUS_LABELS = {
 }
 
 
+def _publication_label(record) -> str:
+    if record.retry_authorized:
+        return 'Retry authorized'
+    if record.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK:
+        return 'Verified not published after final click'
+    return STATUS_LABELS[record.status]
+
+
 def format_substack_draft(result: StoryStatus) -> str:
     return "\n".join([
         "Substack draft created", "", "Story:", result.story.metadata.title, "",
@@ -131,6 +141,18 @@ def format_substack_body(result: StoryStatus) -> str:
         "Draft:", result.substack.draft_url, "", "Added:", "Story body", "",
         "Not added yet:", "Cover image", "", "Status:", "Body inserted", "",
         "Nothing was published.",
+    ])
+
+
+def format_substack_subtitle(result: StoryStatus) -> str:
+    description = result.story.metadata.description
+    return "\n".join([
+        "Substack draft subtitle prepared", "", "Story:", result.story.metadata.title, "",
+        "Description:", description or "(absent; subtitle left unset)", "",
+        "Substack subtitle:", "Matched or inserted from Description", "",
+        "Draft:", result.substack.draft_url if result.substack else "Not available", "",
+        "Title:", "Preserved", "Body:", "Preserved", "Status:",
+        "Subtitle prepared", "", "Nothing was published.",
     ])
 
 
@@ -365,11 +387,29 @@ def format_substack_publish_inspection(
         f'Title: {screen.title}',
         f'Scope: {screen.screen_kind}',
         f'Stable evidence: {evidence}', '',
+        'Visible dialog identity:',
+        *(([f'- {item}' for item in screen.dialog_evidence] or ['- None'])),
+        'Visible headings:',
+        *(([f'- {item}' for item in screen.visible_headings] or ['- None'])),
+        'Stable containers:',
+        *(([f'- {item}' for item in screen.stable_containers] or ['- None'])), '',
         'Visible options/defaults:',
         *options, '',
         *scheduling_lines, '',
         'Final action controls:',
         *(final_actions or ['- None positively identified']),
+        '', 'Final-action evidence:',
+        *(
+            [
+                f'Exact accessible name: {screen.final_action_evidence.exact_accessible_name}',
+                f'Total matches: {screen.final_action_evidence.total_matches}',
+                f'Visible matches: {screen.final_action_evidence.visible_matches}',
+                f'Hidden matches: {screen.final_action_evidence.hidden_matches}',
+                f'Enabled visible matches: {screen.final_action_evidence.enabled_visible_matches}',
+                f'Disabled visible matches: {screen.final_action_evidence.disabled_visible_matches}',
+                f'Publish modal matches: {screen.final_action_evidence.publish_modal_matches}',
+            ] if screen.final_action_evidence is not None else ['Evidence unavailable.']
+        ),
         'Safe navigation controls:',
         *(safe_navigation or ['- None positively identified']), '',
         f'Unexpected mutating network activity: {"Yes" if screen.blocked_mutation_methods else "No"}',
@@ -378,6 +418,8 @@ def format_substack_publish_inspection(
         screen.exit_behavior,
         f'Safe exit control: {screen.safe_exit or "None used"}', '',
         f'SQLite unchanged: {"No" if result.local_state_changed else "Yes"}',
+        f'SQLite SHA-256 before: {result.database_sha256_before}',
+        f'SQLite SHA-256 after: {result.database_sha256_after}',
         f'Local state changed: {"Yes" if result.local_state_changed else "No"}', '',
         'No settings changed.',
         'Nothing published: Yes', '',
@@ -537,6 +579,12 @@ def format_substack_publish_execution(result) -> str:
             f'Unexpected publish/send/schedule network mutation: '
             f'{"Yes" if result.write_like_network_methods else "No"}',
             f'Network methods observed: {", ".join(result.write_like_network_methods) or "None"}',
+            'Suppressed telemetry:',
+            *(item.format_suppressed_telemetry() for item in result.suppressed_telemetry),
+            'None' if not result.suppressed_telemetry else '',
+            'Suppressed editor mutation:',
+            *(item.format_suppressed_editor_mutation() for item in result.suppressed_editor_mutations),
+            'None' if not result.suppressed_editor_mutations else '',
             f'SQLite checksum before: {result.database_sha256_before}',
             f'SQLite checksum after: {result.database_sha256_after}',
             f'SQLite unchanged: {"Yes" if result.database_sha256_before == result.database_sha256_after else "No"}',
@@ -628,12 +676,29 @@ def format_status(result: StoryStatus) -> str:
     status = record.status if record else PublicationStatus.NOT_STARTED
     lines = ["Story status", "", f"File: {story.source.name}",
              f"Title: {story.metadata.title}", f"Hash: {story.source_hash}", "",
-             f"Substack: {STATUS_LABELS[status]}"]
+             f"Substack: {_publication_label(record) if record else STATUS_LABELS[status]}"]
     if record:
         if record.draft_url:
             lines.append(f"Draft: {record.draft_url}")
         if record.published_url:
             lines.append(f"Published: {record.published_url}")
+        if record.retry_authorized:
+            lines += [
+                'Publication: Retry authorized',
+                f'Prior final click attempts: {record.final_click_attempt_count}',
+                f'Retry authorizations: {record.retry_authorization_count}',
+                'Authorized remaining publish attempts: 1',
+                'Draft: linked',
+                'Published URL: None',
+            ]
+        elif record.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK:
+            lines += [
+                f"Publication: {_publication_label(record)}",
+                f"Final click attempts: {record.final_click_attempt_count}",
+                "Draft: linked",
+                "Published URL: None",
+                "Retry authorization required: Yes",
+            ]
         if record.error_message:
             lines.append(f"Error: {record.error_message}")
         if record.needs_reconciliation:

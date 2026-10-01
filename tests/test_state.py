@@ -6,7 +6,8 @@ import sqlite3
 import pytest
 
 from publish_to_all.state import (
-    BodyStatus, DuplicatePublicationError, PublicationRepository, PublicationStatus as Status,
+    BodyStatus, DuplicatePublicationError, PublicationRepository, PublicationState,
+    PublicationStatus as Status,
     SCHEMA_VERSION, StateError,
 )
 from publish_to_all.story import load_story
@@ -26,7 +27,7 @@ def repository(tmp_path):
 
 def test_initialize_and_reopen(repository):
     with sqlite3.connect(repository.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 9
         assert connection.execute("SELECT count(*) FROM stories").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM publications").fetchone()[0] == 0
         columns = {row[1] for row in connection.execute("PRAGMA table_info(stories)")}
@@ -34,7 +35,91 @@ def test_initialize_and_reopen(repository):
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'publication_reassociations'"
         ).fetchone() is not None
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'publication_audit_events'"
+        ).fetchone() is not None
     PublicationRepository(repository.path)
+
+
+def _ambiguous_clicked(repository, story):
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE publications SET body_status = 'body_inserted', image_status = 'image_uploaded' WHERE id = ?",
+            (draft.id,),
+        )
+    draft = repository.get_publication(story.source_hash, 'substack')
+    clicked = repository.mark_final_click_attempted(draft)
+    return repository.mark_publication_uncertain(
+        clicked, 'Outcome was ambiguous', ('publish_modal_count=0',)
+    )
+
+
+def test_ambiguous_click_reconciles_to_verified_not_published_and_preserves_attempt(repository, story):
+    ambiguous = _ambiguous_clicked(repository, story)
+    reconciled = repository.reconcile_publication_not_published(
+        ambiguous, ('classification=NOT_PUBLISHED_VERIFIED', 'published_url=None'),
+    )
+
+    assert reconciled.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK
+    assert reconciled.status == Status.FAILED
+    assert reconciled.final_click_attempted and reconciled.final_click_attempt_count == 1
+    assert reconciled.final_click_attempted_at == ambiguous.final_click_attempted_at
+    assert reconciled.draft_url == ambiguous.draft_url
+    assert reconciled.published_url is None
+    assert not reconciled.needs_reconciliation
+    assert repository.audit_history(reconciled.id)[-2]['event_type'] == 'final_click_attempt'
+    assert repository.audit_history(reconciled.id)[-1]['event_type'] == 'verified_not_published'
+
+
+def test_verified_not_published_blocks_publish_until_explicit_retry_authorization(repository, story):
+    reconciled = repository.reconcile_publication_not_published(
+        _ambiguous_clicked(repository, story),
+        ('classification=NOT_PUBLISHED_VERIFIED', 'published_url=None'),
+    )
+    with pytest.raises(StateError, match='explicit retry authorization'):
+        repository.require_publish_inspection_candidate(story.source_hash, 'substack')
+    authorized = repository.authorize_retry(
+        reconciled, story_hash=story.source_hash,
+        remote_draft_reverified=True, no_public_url=True,
+    )
+    assert authorized.status == Status.DRAFT_CREATED
+    assert authorized.retry_authorized and authorized.final_click_attempt_count == 1
+    assert repository.audit_history(authorized.id)[-1]['event_type'] == 'retry_authorized'
+    assert repository.require_publish_inspection_candidate(story.source_hash, 'substack') == authorized
+    second_click = repository.mark_final_click_attempted(authorized)
+    assert second_click.final_click_attempt_count == 2
+    assert not second_click.retry_authorized
+    with pytest.raises(StateError, match='final action was not clicked'):
+        repository.mark_final_click_attempted(second_click)
+    with pytest.raises(StateError):
+        repository.authorize_retry(second_click, story_hash=story.source_hash,
+                                   remote_draft_reverified=True, no_public_url=True)
+
+
+def test_retry_authorization_requires_exact_state_and_reverification(repository, story):
+    draft = repository.mark_draft_created(
+        repository.begin_attempt(story, 'substack').id,
+        'https://example.substack.com/publish/post/123',
+    )
+    with pytest.raises(StateError, match='verified-not-published'):
+        repository.authorize_retry(draft, story_hash=story.source_hash,
+                                   remote_draft_reverified=True, no_public_url=True)
+    published = repository.mark_published(draft.id, 'https://example.substack.com/p/story')
+    with pytest.raises(StateError):
+        repository.reconcile_publication_not_published(
+            published, ('classification=NOT_PUBLISHED_VERIFIED',)
+        )
+
+
+def test_ambiguous_evidence_cannot_create_verified_not_published_state(repository, story):
+    ambiguous = _ambiguous_clicked(repository, story)
+    with pytest.raises(StateError, match='insufficient'):
+        repository.reconcile_publication_not_published(ambiguous, ('publish_modal_count=0',))
+    assert repository.get_publication(story.source_hash, 'substack') == ambiguous
 
 
 def test_safe_draft_version_reassociation_preserves_history_and_duplicate_protection(

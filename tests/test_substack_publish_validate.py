@@ -6,7 +6,8 @@ from publish_to_all import cli
 from publish_to_all.application import FinalPublishDryRunResult
 from publish_to_all.browser.publish_inspect import FinalScreenInspection, PublicationControl
 from publish_to_all.browser.publish_validate import (
-    ValidationStatus, validate_final_publish_configuration,
+    ValidationStatus, normalized_publication_configuration,
+    validate_final_publish_configuration,
 )
 
 
@@ -242,6 +243,26 @@ def test_dialog_identity_is_required_for_readiness():
     assert not result.dialog_found
     assert not result.ready_for_publish
     assert result.ambiguities[0].startswith('Dialog:')
+
+
+def test_normalized_configuration_ignores_control_order_and_informational_controls():
+    first = screen()
+    reordered = tuple(reversed(first.controls))
+    second = replace(first, controls=reordered)
+    assert normalized_publication_configuration(first) == normalized_publication_configuration(second)
+
+
+def test_normalized_configuration_reports_tags_as_order_independent_semantic_values():
+    controls = replace_control(
+        correct_controls(), 'Select or create tags', 'Tags', enabled=True,
+        value='news, technology',
+    )
+    first = normalized_publication_configuration(screen(controls))
+    controls = replace_control(
+        controls, 'Select or create tags', 'Tags', value='technology,news',
+    )
+    second = normalized_publication_configuration(screen(controls))
+    assert first.tags == ('news', 'technology') == second.tags
 
 
 def test_cli_dry_run_prints_readiness_and_uses_dedicated_validator(monkeypatch, capsys):

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 
 from .publish_inspect import FinalScreenInspection, PublicationControl
 
@@ -37,6 +38,92 @@ class FinalPublishValidation:
     final_action_clicked: bool = False
 
 
+@dataclass(frozen=True)
+class NormalizedPublicationConfiguration:
+    """Only publication settings whose values can change send behavior."""
+
+    audience: str
+    comments: str
+    delivery: str
+    scheduled: bool | None
+    tags: tuple[str, ...]
+
+
+def _selected_group_value(controls: tuple[PublicationControl, ...], group: str) -> str:
+    choices = [
+        control for control in controls
+        if not control.final_action and control.group == group and control.role == 'radio'
+    ]
+    selected = tuple(sorted(control.accessible_name for control in choices if control.selected is True))
+    unknown = any(control.selected is None for control in choices)
+    if unknown:
+        return '<unknown>'
+    aliases = {
+        'Everyone': 'everyone',
+        'Paid subscribers only': 'paid_only',
+        'Subscribers only': 'subscribers_only',
+        'No one (disable comments)': 'no_one',
+    }
+    return '|'.join(aliases.get(item, item.strip().lower()) for item in selected) or '<none>'
+
+
+def _normalized_tags(control: PublicationControl | None) -> tuple[str, ...]:
+    if control is None or control.value in {'', 'None'}:
+        return ()
+    values = re.split(r'[,\n]', control.value)
+    return tuple(sorted(value.strip() for value in values if value.strip()))
+
+
+def normalized_publication_configuration(
+    screen: FinalScreenInspection,
+) -> NormalizedPublicationConfiguration:
+    """Return a stable, order-independent semantic publication configuration."""
+    controls = screen.controls
+    delivery_aliases = {
+        'Send via email and the Substack app': 'email_and_app',
+        'Send via email': 'email',
+        'Send via the Substack app': 'app',
+    }
+    delivery = tuple(sorted(
+        delivery_aliases.get(control.accessible_name, control.accessible_name.strip().lower())
+        for control in controls
+        if not control.final_action and control.group == 'Delivery'
+        and control.selected is True
+    ))
+    scheduling = [
+        control for control in controls
+        if not control.final_action
+        and control.accessible_name == 'Schedule time to email and publish'
+    ]
+    scheduled = scheduling[0].selected if len(scheduling) == 1 else None
+    tag_controls = [
+        control for control in controls
+        if not control.final_action and control.group == 'Tags'
+        and control.accessible_name == 'Select or create tags'
+    ]
+    tags = _normalized_tags(tag_controls[0] if len(tag_controls) == 1 else None)
+    return NormalizedPublicationConfiguration(
+        audience=_selected_group_value(controls, 'Audience'),
+        comments=_selected_group_value(controls, 'Comments'),
+        delivery='|'.join(delivery) if delivery else '<none>',
+        scheduled=scheduled,
+        tags=tags,
+    )
+
+
+def publication_configuration_diff(
+    before: NormalizedPublicationConfiguration,
+    after: NormalizedPublicationConfiguration,
+) -> tuple[str, ...]:
+    """Describe semantic changes without exposing a raw DOM/object comparison."""
+    diffs = []
+    for field in ('audience', 'comments', 'delivery', 'scheduled', 'tags'):
+        old, new = getattr(before, field), getattr(after, field)
+        if old != new:
+            diffs.append(f'{field}: {old} -> {new}')
+    return tuple(diffs)
+
+
 DESIRED_CONFIGURATION = (
     ('audience', 'Everyone'),
     ('comments', 'Everyone'),
@@ -52,6 +139,7 @@ def _has_dialog_identity(screen: FinalScreenInspection) -> bool:
         screen.screen_kind == 'dialog'
         and 'role=dialog' in attributes
         and 'data-testid=publish-modal' in attributes
+        and screen.title.strip() == 'Publish'
         and any(item.startswith('aria-labelledby=') and item != 'aria-labelledby='
                 for item in attributes)
     )
@@ -299,8 +387,8 @@ def validate_final_publish_configuration(
     )
     if not dialog_found:
         ambiguities = (
-            'Dialog: expected role=dialog, data-testid=publish-modal, and non-empty '
-            'aria-labelledby evidence was not positively verified.',
+            'Dialog: expected role=dialog, data-testid=publish-modal, accessible name Publish, '
+            'and non-empty aria-labelledby evidence.',
             *ambiguities,
         )
     accepted = {

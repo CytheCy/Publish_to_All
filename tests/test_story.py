@@ -45,6 +45,39 @@ The body.
     assert body == "The body.\n"
 
 
+@pytest.mark.parametrize("description, expected", [
+    ("Description: A plain description", "A plain description"),
+    ('Description: "A quoted description"', "A quoted description"),
+    ("Description:   A padded description   ", "A padded description"),
+    ("Description: ''", None),
+])
+def test_description_is_parsed_as_substack_subtitle(description, expected):
+    metadata, _ = parse_front_matter(f"---\ntitle: Story\n{description}\n---\nBody")
+    assert metadata.description == expected
+
+
+def test_capitalized_description_is_supported():
+    metadata, _ = parse_front_matter(
+        '---\ntitle: Story\nDescription: "A quoted subtitle"\n---\nBody'
+    )
+    assert metadata.description == "A quoted subtitle"
+
+
+@pytest.mark.parametrize("value", ["{}", "[]", "42", "true"])
+def test_description_must_be_text(value):
+    with pytest.raises(StoryError, match="description must be text"):
+        parse_front_matter(f"---\ntitle: Story\nDescription: {value}\n---\nBody")
+
+
+def test_description_changes_raw_story_hash(tmp_path):
+    first = load_story(write_story(tmp_path, "---\ntitle: Story\nDescription: One\n---\nBody"))
+    (tmp_path / "story.md").write_text("---\ntitle: Story\nDescription: Two\n---\nBody")
+    second = load_story(tmp_path)
+    assert first.metadata.description == "One"
+    assert second.metadata.description == "Two"
+    assert first.source_hash != second.source_hash
+
+
 @pytest.mark.parametrize("text, message", [
     ("Plain text", "title"), ("---\nsubtitle: hi\n---\nBody", "title"),
     ('---\ntitle: " "\n---\nBody', "title"),

@@ -91,6 +91,29 @@ def test_status_after_reconciliation_omits_resolved_error(project, capsys):
     assert output.endswith("Nothing was published by this command.\n")
 
 
+def test_status_reports_verified_not_published_after_click(project, capsys):
+    story = load_story(project / 'In')
+    repository = PublicationRepository(runtime_paths(project).database)
+    attempt = repository.begin_attempt(story, 'substack')
+    draft = repository.mark_draft_created(
+        attempt.id, 'https://example.substack.com/publish/post/123',
+    )
+    clicked = repository.mark_final_click_attempted(draft)
+    ambiguous = repository.mark_publication_uncertain(clicked, 'Ambiguous', ('modal=0',))
+    repository.reconcile_publication_not_published(
+        ambiguous, ('classification=NOT_PUBLISHED_VERIFIED', 'published_url=None'),
+    )
+
+    assert main(['status']) == 0
+    output = capsys.readouterr().out
+    for value in (
+        'Verified not published after final click', 'Final click attempts: 1',
+        'Draft: linked', 'Published URL: None', 'Retry authorization required: Yes',
+    ):
+        assert value in output
+    assert 'Reconciliation required before retrying' not in output
+
+
 @pytest.mark.parametrize("command", ["check", "preview"])
 def test_readonly_commands_do_not_create_runtime_state(project, command):
     paths = runtime_paths(project)

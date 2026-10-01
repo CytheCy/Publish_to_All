@@ -7,6 +7,7 @@ from playwright.sync_api import Error as PlaywrightError
 from ..browser import editor
 from ..browser import body as body_editor
 from ..browser import title as title_editor
+from ..browser import subtitle as subtitle_editor
 from ..browser import image as image_editor
 from ..browser import image_observe as social_preview_image
 from ..browser.session import safe_screenshot
@@ -213,6 +214,86 @@ class SubstackBodyPublisher(Publisher):
                 'The remote draft may contain some or all of the story body.\n\n'
                 'Local state has been protected against automatic retry. Inspect the linked draft '
                 'before any recovery.\n\nNothing was published.'
+            ) from None
+
+
+class SubstackSubtitlePublisher(Publisher):
+    """Add a Markdown Description as the subtitle of one linked draft."""
+
+    name = 'substack'
+
+    def __init__(self, repository, page, publication_url, monitor):
+        super().__init__(repository)
+        self.page = page
+        self.publication_url = publication_url
+        self.monitor = monitor
+
+    def prepare_draft(self, story, attempt):
+        raise PublishToAllError('This workflow only edits an already-linked draft. Nothing was published.')
+
+    def publish(self, story, draft):
+        raise PublishToAllError('Publishing is not implemented. Nothing was published.')
+
+    def add_subtitle(self, story, record):
+        description = story.metadata.description
+        if description is None:
+            return record
+        self.monitor.require_clear(self.page)
+        try:
+            editor.require_publication(self.page, self.publication_url)
+            title_field = editor.unique_visible(editor.title_fields(self.page))
+            body_surface = body_editor.locate_body_surface(self.page)
+            subtitle_field = subtitle_editor.locate_subtitle_field(self.page)
+            title = editor.title_value(title_field).strip() if title_field is not None else None
+            body_text = ' '.join(body_surface.inner_text().split())
+            current = subtitle_editor.subtitle_value(subtitle_field)
+        except (PlaywrightError, BrowserSessionError, AttributeError, TypeError):
+            raise PublishToAllError(
+                'Substack subtitle was not changed.\n\nReason:\n'
+                'The authenticated editor or stable subtitle field could not be inspected safely.\n\n'
+                'Manual review is required before automatic insertion.\n\nNothing was published.'
+            ) from None
+        if title != story.metadata.title:
+            raise PublishToAllError(
+                'Substack subtitle was not changed.\n\nReason:\n'
+                'The visible draft title does not exactly match the current story title.\n\nNothing was published.'
+            )
+        if current.strip() and current != description:
+            raise PublishToAllError(
+                'Substack subtitle was not changed.\n\nReason:\n'
+                'The existing subtitle differs from Description; automatic overwrite was refused.\n\nNothing was published.'
+            )
+        if current == description:
+            return self.repository.mark_subtitle_matched(record)
+
+        self.monitor.require_clear(self.page)
+        try:
+            previously_saved = editor.save_visible(self.page)
+            editor.start_save_observation(self.page)
+            active = self.repository.mark_subtitle_inserting(record)
+            subtitle_editor.insert_exact_subtitle(subtitle_field, description)
+            self.monitor.require_clear(self.page)
+            subtitle_editor.confirm_subtitle_save(
+                self.page, subtitle_field, description, self.publication_url, self.monitor,
+                expected_url=record.draft_url.rstrip('/'), title=story.metadata.title,
+                body_surface=body_surface, body_text=body_text,
+                previously_saved=previously_saved,
+            )
+            return self.repository.mark_subtitle_inserted(active.id)
+        except (Exception, KeyboardInterrupt) as exc:
+            if 'active' not in locals():
+                raise
+            try:
+                self.repository.mark_subtitle_insertion_failed(
+                    active.id, 'Substack subtitle insertion or save confirmation failed; remote subtitle is uncertain.',
+                )
+            except StateError:
+                pass
+            raise PublishToAllError(
+                'Substack subtitle insertion did not complete safely.\n\n'
+                'The remote subtitle may or may not contain Description.\n\n'
+                'Local state has been protected against automatic retry. Inspect the linked draft before recovery.\n\n'
+                'Nothing was published.'
             ) from None
 
 

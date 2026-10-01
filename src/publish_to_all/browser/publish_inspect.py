@@ -1,14 +1,33 @@
 """Read the final Substack publication UI while making publication impossible."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 import re
 from time import monotonic
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 
 from ..errors import BrowserSessionError
 from .substack import trusted_page
+
+
+FIREHOSE_HOST = 'cyporter.substack.com'
+FIREHOSE_PATH = '/api/v1/firehose/batch'
+SENTRY_HOST = 'o350427.ingest.sentry.io'
+SENTRY_PATH = '/api/4504244653457408/envelope/'
+CLOUDFLARE_RUM_HOST = 'cloudflareinsights.com'
+CLOUDFLARE_RUM_PATH = '/cdn-cgi/rum'
+GOOGLE_REMARKETING_HOST = 'www.google.com'
+GOOGLE_REMARKETING_PATH = '/rmkt/collect/316245675/'
+GOOGLE_CCM_PATH = '/ccm/collect'
+WRITER_REFERRAL_HOST = 'cyporter.substack.com'
+WRITER_REFERRAL_PATH = '/api/v1/user/writer_referrals/code'
+SUPPRESSED_DRY_RUN_EDITOR_MUTATION = 'SUPPRESSED_DRY_RUN_EDITOR_MUTATION'
+WRITE_LIKE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
+PRE_CLICK_STAGES = {
+    'DRAFT_EDITOR_LOAD', 'CONTINUE_NAVIGATION', 'PUBLISH_SCREEN_LOAD',
+    'FINAL_ACTION_DISCOVERY', 'PRE_CLICK_REVALIDATION',
+}
 
 
 FINAL_ACTION = re.compile(
@@ -175,6 +194,9 @@ class FinalScreenInspection:
     screen_attributes: tuple[str, ...] = ()
     scheduling: SchedulingControlEvidence | None = None
     final_action_evidence: FinalActionEvidence | None = None
+    dialog_evidence: tuple[str, ...] = ()
+    visible_headings: tuple[str, ...] = ()
+    stable_containers: tuple[str, ...] = ()
 
 
 @dataclass
@@ -182,10 +204,31 @@ class MutationGuard:
     """Abort all mutation transports after Continue is selected."""
 
     blocked_methods: list[str]
+    diagnostics: list['WriteLikeRequestDiagnostic'] = None
+    stage: str = 'PRE_DRAFT_NAVIGATION'
+    observer: object = None
+
+    def set_stage(self, stage: str) -> None:
+        self.stage = stage
+        if self.observer is not None:
+            self.observer.set_stage(stage)
 
     def handle(self, route) -> None:
         method = (route.request.method or '').upper()
-        if method in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+        if method in WRITE_LIKE_METHODS:
+            permitted = False
+            if self.observer is not None:
+                permitted = self.observer.observe(route.request)
+                if self.observer.was_suppressed(route.request):
+                    route.abort()
+                    return
+            elif self.diagnostics is not None:
+                self.diagnostics.append(WriteLikeRequestDiagnostic.from_request(
+                    route.request, self.stage,
+                ))
+            if permitted:
+                route.continue_()
+                return
             if method not in self.blocked_methods:
                 self.blocked_methods.append(method)
             route.abort()
@@ -194,33 +237,249 @@ class MutationGuard:
 
     def require_clear(self) -> None:
         if self.blocked_methods:
+            detail = ''
+            if self.diagnostics:
+                detail = f' {self.diagnostics[0].format()}'
             raise BrowserSessionError(
                 'Unexpected write-like network activity was blocked during the read-only '
-                'publication inspection. No final action was clicked.'
+                f'publication inspection.{detail} No final action was clicked.'
             )
 
 
 @dataclass
 class WriteLikeNetworkObserver:
-    """Record write-like request methods without retaining request data."""
+    """Record redacted write-like metadata and suppress exact dry-run exceptions."""
 
     methods: list[str]
+    publication_url: str | None = None
+    diagnostics: list['WriteLikeRequestDiagnostic'] = None
+    suppressed_telemetry: list['WriteLikeRequestDiagnostic'] = None
+    suppressed_editor_mutations: list['WriteLikeRequestDiagnostic'] = None
+    stage: str = 'PRE_DRAFT_NAVIGATION'
+    _requests: dict[int, 'WriteLikeRequestDiagnostic'] = None
+    _suppressed_request_ids: set[int] = None
 
-    def observe(self, request) -> None:
+    def __post_init__(self):
+        if self.diagnostics is None:
+            self.diagnostics = []
+        if self.suppressed_telemetry is None:
+            self.suppressed_telemetry = []
+        if self.suppressed_editor_mutations is None:
+            self.suppressed_editor_mutations = []
+        if self._requests is None:
+            self._requests = {}
+        if self._suppressed_request_ids is None:
+            self._suppressed_request_ids = set()
+
+    def observe(self, request) -> bool:
         method = (getattr(request, 'method', '') or '').upper()
-        if method in {'POST', 'PUT', 'PATCH', 'DELETE'} and method not in self.methods:
+        if method not in WRITE_LIKE_METHODS:
+            return False
+        item = WriteLikeRequestDiagnostic.from_request(request, self.stage)
+        suppression = self._suppression_kind(item)
+        if suppression is not None:
+            self._requests[id(request)] = item
+            self._suppressed_request_ids.add(id(request))
+            if suppression == 'telemetry':
+                self.suppressed_telemetry.append(item)
+            else:
+                self.suppressed_editor_mutations.append(item)
+            return False
+        if method not in self.methods:
             self.methods.append(method)
+        key = id(request)
+        if key not in self._requests:
+            self._requests[key] = item
+            self.diagnostics.append(item)
+        return False
+
+    def _suppression_kind(self, item) -> str | None:
+        if (
+            item.http_method == 'PUT'
+            and item.host == WRITER_REFERRAL_HOST
+            and item.path == WRITER_REFERRAL_PATH
+            and item.resource_type == 'fetch'
+            and item.timing_stage == 'DRAFT_EDITOR_LOAD'
+        ):
+            return 'editor_mutation'
+        if item.http_method != 'POST' or item.timing_stage not in PRE_CLICK_STAGES:
+            return None
+        if item.redirect_target is not None:
+            return None
+        firehose = (
+            item.host == FIREHOSE_HOST
+            and item.path == FIREHOSE_PATH
+            and item.resource_type == 'ping'
+        )
+        sentry = (
+            item.host == SENTRY_HOST
+            and item.path == SENTRY_PATH
+            and item.resource_type == 'fetch'
+        )
+        cloudflare_rum = (
+            item.host == CLOUDFLARE_RUM_HOST
+            and item.path == CLOUDFLARE_RUM_PATH
+            and item.resource_type == 'xhr'
+        )
+        google_remarketing = (
+            item.host == GOOGLE_REMARKETING_HOST
+            and item.path == GOOGLE_REMARKETING_PATH
+            and item.resource_type == 'fetch'
+        )
+        google_ccm = (
+            item.host == GOOGLE_REMARKETING_HOST
+            and item.path == GOOGLE_CCM_PATH
+            and item.resource_type == 'fetch'
+        )
+        return 'telemetry' if (firehose or sentry or cloudflare_rum or google_remarketing or google_ccm) else None
+
+    def observe_response(self, response) -> None:
+        request = getattr(response, 'request', None)
+        item = self._requests.get(id(request))
+        if item is None:
+            return
+        updated = item.with_response(
+            getattr(response, 'status', None), getattr(response, 'url', ''),
+        )
+        self._requests[id(request)] = updated
+        if id(request) in self._suppressed_request_ids:
+            if updated.redirect_target is not None:
+                self._suppressed_request_ids.remove(id(request))
+                suppressed = self.suppressed_telemetry
+                if item not in suppressed:
+                    suppressed = self.suppressed_editor_mutations
+                suppressed.remove(item)
+                if item.http_method not in self.methods:
+                    self.methods.append(item.http_method)
+                self.diagnostics.append(updated)
+            else:
+                suppressed = self.suppressed_telemetry
+                if item not in suppressed:
+                    suppressed = self.suppressed_editor_mutations
+                suppressed[suppressed.index(item)] = updated
+            return
+        self.diagnostics[self.diagnostics.index(item)] = updated
+
+    def set_stage(self, stage: str) -> None:
+        self.stage = stage
+
+    def was_suppressed(self, request) -> bool:
+        return id(request) in self._suppressed_request_ids
+
+    @property
+    def first_diagnostic(self):
+        return self.diagnostics[0] if self.diagnostics else None
+
+    @property
+    def first_suppressed_telemetry(self):
+        return self.suppressed_telemetry[0] if self.suppressed_telemetry else None
+
+    @property
+    def first_suppressed_editor_mutation(self):
+        return self.suppressed_editor_mutations[0] if self.suppressed_editor_mutations else None
 
     def require_clear(self) -> None:
         if self.methods:
+            detail = self.first_diagnostic.format() if self.first_diagnostic else 'Metadata unavailable.'
             raise BrowserSessionError(
                 'Unexpected write-like network activity occurred during dry-run. '
-                'No final action was clicked.'
+                f'{detail} No final action was clicked.'
             )
 
 
-def install_mutation_guard(page) -> MutationGuard:
-    guard = MutationGuard([])
+@dataclass(frozen=True)
+class WriteLikeRequestDiagnostic:
+    http_method: str
+    host: str
+    path: str
+    query_parameter_names: tuple[str, ...]
+    resource_type: str
+    initiator_type: str
+    timing_stage: str
+    response_status: int | None = None
+    redirect_target: str | None = None
+    operation_name: str | None = None
+
+    @classmethod
+    def from_request(cls, request, stage: str):
+        raw_url = getattr(request, 'url', '') or ''
+        parsed = urlsplit(raw_url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        operation = next((value for name, value in query
+                          if name.lower() in {'operationname', 'operation_name'}
+                          and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,80}', value)), None)
+        redirected_from = getattr(request, 'redirected_from', None)
+        initiator = getattr(request, 'initiator', None)
+        initiator_type = getattr(initiator, 'type', '') if initiator is not None else ''
+        host = parsed.hostname or '[unknown]'
+        if parsed.port is not None:
+            host += f':{parsed.port}'
+        return cls(
+            http_method=(getattr(request, 'method', '') or '').upper(),
+            host=host, path=parsed.path or '/',
+            query_parameter_names=tuple(sorted({name for name, _ in query})),
+            resource_type=getattr(request, 'resource_type', '') or '[unknown]',
+            initiator_type=initiator_type or '[unavailable]', timing_stage=stage,
+            redirect_target=cls._safe_target(getattr(redirected_from, 'url', '')),
+            operation_name=operation,
+        )
+
+    def with_response(self, status, response_url):
+        redirect = self.redirect_target
+        safe_response = self._safe_target(response_url)
+        if safe_response and safe_response != f'{self.host}{self.path}':
+            redirect = safe_response
+        return dataclass_replace(self, response_status=status, redirect_target=redirect)
+
+    @staticmethod
+    def _safe_target(raw_url):
+        if not raw_url:
+            return None
+        parsed = urlsplit(raw_url)
+        return f'{parsed.netloc or "[unknown]"}{parsed.path or "/"}'
+
+    def format(self) -> str:
+        fields = [
+            f'HTTP method: {self.http_method}', f'Host: {self.host}',
+            f'Path: {self.path}',
+            'Query parameter names: ' + (', '.join(self.query_parameter_names) or 'none'),
+            f'Resource type: {self.resource_type}', f'Initiator type: {self.initiator_type}',
+            f'Timing stage: {self.timing_stage}',
+            f'Response status: {self.response_status if self.response_status is not None else "unavailable"}',
+            f'Redirect target: {self.redirect_target or "none"}',
+        ]
+        if self.operation_name:
+            fields.append(f'Safe operation name: {self.operation_name}')
+        return ' '.join(fields)
+
+    def format_suppressed_telemetry(self) -> str:
+        return '\n'.join([
+            'Suppressed telemetry:', f'{self.http_method} {self.host}{self.path}',
+            f'resource type: {self.resource_type}',
+            f'stage: {self.timing_stage}',
+            f'status: {self.response_status if self.response_status is not None else "unavailable"}',
+        ])
+
+    def format_suppressed_editor_mutation(self) -> str:
+        return '\n'.join([
+            'Suppressed editor mutation:', f'{self.http_method} {self.host}{self.path}',
+            f'stage: {self.timing_stage}',
+            f'classification: {SUPPRESSED_DRY_RUN_EDITOR_MUTATION}',
+            'reason: known referral-code initialization mutation',
+        ])
+
+
+def _request_host(publication_url: str) -> str:
+    parsed = urlsplit(publication_url)
+    host = parsed.hostname or '[unknown]'
+    if parsed.port is not None:
+        host += f':{parsed.port}'
+    return host
+
+
+def install_mutation_guard(page, *, observer=None) -> MutationGuard:
+    guard = MutationGuard([], observer.diagnostics if observer is not None else None,
+                          observer.stage if observer is not None else 'PRE_DRAFT_NAVIGATION', observer)
     page.route('**/*', guard.handle)
     return guard
 
@@ -659,6 +918,49 @@ def _screen_evidence(scope, scope_kind: str) -> tuple[str, tuple[str, ...]]:
     return _safe_text(raw.get('title')), tuple(attributes)
 
 
+def _screen_identity(page) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Read visible dialog, heading, and stable-container identity without interaction."""
+    try:
+        raw = page.evaluate(
+        """() => {
+            const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+            const visible = node => {
+                const style = getComputedStyle(node), rect = node.getBoundingClientRect();
+                return !node.hidden && style.visibility !== 'hidden' && style.display !== 'none' &&
+                    style.opacity !== '0' && (rect.width > 0 || rect.height > 0);
+            };
+            const name = node => clean(node.getAttribute('aria-label')) ||
+                clean(node.getAttribute('aria-labelledby')?.split(/\\s+/).map(id =>
+                    document.getElementById(id)?.innerText || '').join(' ')) ||
+                clean(node.innerText || node.textContent);
+            const signature = node => {
+                const attrs = [];
+                for (const key of ['role', 'data-testid', 'aria-label', 'aria-labelledby']) {
+                    if (node.hasAttribute(key)) attrs.push(`${key}=${clean(node.getAttribute(key))}`);
+                }
+                const classes = [...node.classList].filter(item => item.length <= 80).slice(0, 8);
+                if (classes.length) attrs.push(`class=${classes.join(' ')}`);
+                return node.tagName.toLowerCase() + (attrs.length ? '[' + attrs.join(', ') + ']' : '');
+            };
+            const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible)
+                .map(node => `${signature(node)}; name=${JSON.stringify(name(node))}`);
+            const headings = [...document.querySelectorAll('h1, h2, h3, h4, [role="heading"]')]
+                .filter(visible).map(name).filter(Boolean).slice(0, 32);
+            const containers = [...document.querySelectorAll('[data-testid], [role="dialog"]')]
+                .filter(visible).map(signature).filter((item, index, all) => all.indexOf(item) === index)
+                .slice(0, 32);
+            return {dialogs, headings, containers};
+        }"""
+        )
+    except (PlaywrightError, AttributeError, TypeError, ValueError):
+        return (), (), ()
+    return (
+        tuple(_safe_text(item) for item in raw.get('dialogs', ()) if _safe_text(item)),
+        tuple(_safe_text(item) for item in raw.get('headings', ()) if _safe_text(item)),
+        tuple(_safe_text(item) for item in raw.get('containers', ()) if _safe_text(item)),
+    )
+
+
 def _scheduling_evidence(scope) -> SchedulingControlEvidence:
     """Capture the scheduling checkbox's live DOM semantics without interacting with it."""
     raw = scope.evaluate(
@@ -1021,6 +1323,7 @@ def inspect_open_final_publication_screen(page, publication_url: str) -> FinalSc
         screen_title, screen_attributes = _screen_evidence(scope, scope_kind)
         scheduling = _scheduling_evidence(scope)
         action_evidence = inspect_final_action_evidence(page)
+        dialog_evidence, visible_headings, stable_containers = _screen_identity(page)
         browser_title = page.title()
     except BrowserSessionError:
         raise
@@ -1034,4 +1337,5 @@ def inspect_open_final_publication_screen(page, publication_url: str) -> FinalSc
         controls, final_actions, None,
         'Browser remains on the final publication screen.', (),
         scope_kind, screen_attributes, scheduling, action_evidence,
+        dialog_evidence, visible_headings, stable_containers,
     )

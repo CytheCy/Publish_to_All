@@ -13,6 +13,10 @@ from .publish_inspect import (
     inspect_final_action_evidence,
 )
 from .publish_validate import FinalPublishValidation, validate_final_publish_configuration
+from .publish_validate import (
+    NormalizedPublicationConfiguration, normalized_publication_configuration,
+    publication_configuration_diff,
+)
 from .substack import trusted_page
 from ..state import StateError
 
@@ -280,6 +284,8 @@ class PublishExecutionResult:
     schema_version_before: int | None = None
     schema_version_after: int | None = None
     write_like_network_methods: tuple[str, ...] = ()
+    suppressed_telemetry: tuple[object, ...] = ()
+    suppressed_editor_mutations: tuple[object, ...] = ()
 
 
 class GuardedFinalPublishExecutor:
@@ -295,6 +301,7 @@ class GuardedFinalPublishExecutor:
         self.inspect_screen = inspect_screen
         self.verifier = verifier
         self._final_click_attempted = False
+        self._dry_run = False
 
     @property
     def final_click_attempted(self) -> bool:
@@ -303,19 +310,91 @@ class GuardedFinalPublishExecutor:
     def _blocked(self, failures, validation=None, guard=None):
         return PublishExecutionResult(
             ExecutionStatus.BLOCKED, self._final_click_attempted, tuple(failures),
-            validation, guard,
+            validation, guard, dry_run=self._dry_run,
         )
 
     @staticmethod
-    def _dom_snapshot(screen: FinalScreenInspection):
-        return (
-            screen.url, screen.title, screen.controls, screen.final_actions,
-            screen.screen_kind, screen.screen_attributes, screen.scheduling,
-            screen.final_action_evidence,
+    def _action_snapshot(evidence):
+        if evidence is None:
+            return None
+        candidates = tuple(
+            (
+                item.tag_name, item.role, item.accessible_name, item.visible,
+                item.enabled, item.effective_type, item.element_type,
+                item.href, item.target, item.rel, item.form_attribute,
+                item.form_owner is not None, item.nearest_form is not None,
+                item.formaction, item.formmethod, item.publish_modal_ancestry,
+                item.publish_modal_ancestor_count,
+                item.belongs_to_exactly_one_publish_modal,
+            )
+            for item in evidence.candidates
         )
+        return (
+            evidence.exact_accessible_name, evidence.total_matches,
+            evidence.visible_matches, evidence.hidden_matches,
+            evidence.enabled_visible_matches, evidence.disabled_visible_matches,
+            evidence.publish_modal_matches, evidence.multiple_publish_modals,
+            evidence.ambiguity, candidates,
+        )
+
+    @classmethod
+    def _dom_snapshot(cls, screen: FinalScreenInspection):
+        """Return stable screen identity, semantic settings, and action semantics."""
+        attributes = {
+            item.split('=', 1)[0]: item.split('=', 1)[1]
+            for item in screen.screen_attributes if '=' in item
+        }
+        # aria-labelledby contains generated framework IDs. The title is the resolved
+        # accessible name; role and test ID are the stable modal identity.
+        modal_identity = (
+            screen.screen_kind,
+            attributes.get('role'),
+            attributes.get('data-testid'),
+            screen.title.strip(),
+            len(screen.dialog_evidence) if screen.dialog_evidence else 1,
+        )
+        configuration = normalized_publication_configuration(screen)
+        return screen.url, modal_identity, configuration, cls._action_snapshot(
+            screen.final_action_evidence
+        )
+
+    @staticmethod
+    def _configuration_diff(before: FinalScreenInspection, after: FinalScreenInspection):
+        return publication_configuration_diff(
+            normalized_publication_configuration(before),
+            normalized_publication_configuration(after),
+        )
+
+    def _settle_screen(self, seed: FinalScreenInspection | None = None):
+        """Require two equal semantic observations within a bounded window."""
+        deadline = monotonic() + 1.0
+        previous = seed
+        stable_count = 0
+        while monotonic() <= deadline:
+            try:
+                observed = self.inspect_screen()
+            except (PlaywrightError, AttributeError, TypeError, ValueError):
+                return None
+            if previous is not None:
+                if self._dom_snapshot(observed) == self._dom_snapshot(previous):
+                    stable_count += 1
+                else:
+                    stable_count = 0
+            previous = observed
+            if stable_count >= 1:
+                if seed is None:
+                    return observed
+                # The supplied initial inspection must itself agree with the settled UI.
+                return seed if self._dom_snapshot(seed) == self._dom_snapshot(observed) else None
+            try:
+                self.page.wait_for_timeout(100)
+            except (PlaywrightError, AttributeError, TypeError):
+                pass
+        return None
 
     def execute(self, preconditions: PublishPreconditions,
                 initial_screen: FinalScreenInspection, *, dry_run: bool = False) -> PublishExecutionResult:
+        self._dry_run = dry_run
         if self._final_click_attempted:
             return self._blocked(('This execution already attempted the final click.',))
         failures = []
@@ -327,6 +406,9 @@ class GuardedFinalPublishExecutor:
             failures.append('The current draft identity does not match the publication attempt.')
         initial_validation = validate_final_publish_configuration(initial_screen)
         initial_guard = validate_final_action(initial_screen.final_action_evidence)
+        settled_initial = self._settle_screen(initial_screen)
+        if settled_initial is None:
+            failures.append('The initial final-screen semantic snapshot did not stabilize.')
         if not initial_validation.ready_for_publish:
             failures.extend((*initial_validation.mismatches, *initial_validation.ambiguities))
         if not initial_guard.allowed:
@@ -336,16 +418,17 @@ class GuardedFinalPublishExecutor:
         if failures:
             return self._blocked(failures, initial_validation, initial_guard)
 
-        try:
-            current_screen = self.inspect_screen()
-        except (PlaywrightError, AttributeError, TypeError, ValueError):
+        current_screen = self._settle_screen()
+        if current_screen is None:
             return self._blocked(('Final-screen pre-click inspection failed.',))
         current_validation = validate_final_publish_configuration(current_screen)
         current_guard = validate_final_action(current_screen.final_action_evidence)
         if self._dom_snapshot(current_screen) != self._dom_snapshot(initial_screen):
-            failures.append('The final-screen inspection changed before the click.')
-        if current_validation != initial_validation:
-            failures.append('The publish configuration changed before the click.')
+            configuration_diff = self._configuration_diff(initial_screen, current_screen)
+            if configuration_diff:
+                failures.append('Configuration changed: ' + '; '.join(configuration_diff))
+            else:
+                failures.append('The final-screen semantic identity or final action changed before the click.')
         if not current_validation.ready_for_publish:
             failures.extend((*current_validation.mismatches, *current_validation.ambiguities))
         if not current_guard.allowed:
@@ -360,7 +443,9 @@ class GuardedFinalPublishExecutor:
         except (PlaywrightError, AttributeError, TypeError, ValueError) as exc:
             return self._blocked((f'Final-action candidate could not be pinned: {exc}',),
                                  current_validation, current_guard)
-        if target.evidence != current_screen.final_action_evidence:
+        if self._action_snapshot(target.evidence) != self._action_snapshot(
+                current_screen.final_action_evidence
+        ):
             return self._blocked(('Final-action evidence changed while pinning the candidate.',),
                                  current_validation, current_guard)
         if self.page.url.rstrip('/') != self.draft_url:

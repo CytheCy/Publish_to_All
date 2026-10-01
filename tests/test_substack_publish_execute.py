@@ -182,6 +182,41 @@ def test_changed_preclick_snapshot_blocks_without_persistence_or_click(monkeypat
                                       'substack') == record
 
 
+def test_transient_modal_and_dom_ids_are_ignored_in_semantic_snapshot(monkeypatch, tmp_path):
+    _repository, _record, _page, _handle, screen, executor = make_executor(
+        monkeypatch, tmp_path,
+    )
+    rerendered = replace(
+        screen,
+        screen_attributes=(
+            'scope=dialog', 'role=dialog', 'data-testid=publish-modal',
+            'aria-labelledby=radix-:r99:',
+        ),
+        final_action_evidence=action_evidence(
+            candidate(id=AttributeEvidence(True, 'radix-:r99:')),
+        ),
+    )
+    assert executor._dom_snapshot(screen) == executor._dom_snapshot(rerendered)
+
+
+def test_modal_semantic_identity_is_not_ignored(monkeypatch, tmp_path):
+    _repository, _record, _page, _handle, screen, executor = make_executor(
+        monkeypatch, tmp_path,
+    )
+    changed = replace(screen, title='Other dialog')
+    assert executor._dom_snapshot(screen) != executor._dom_snapshot(changed)
+
+
+def test_informational_control_appearance_is_ignored(monkeypatch, tmp_path):
+    _repository, _record, _page, _handle, screen, executor = make_executor(
+        monkeypatch, tmp_path,
+    )
+    extra = control('Social Preview Edit', 'Social preview', role='button',
+                    selected=None, final_action=False)
+    changed = replace(screen, controls=(*screen.controls, extra))
+    assert executor._dom_snapshot(screen) == executor._dom_snapshot(changed)
+
+
 def test_dry_run_uses_same_pinned_candidate_path_without_click_or_state_change(
         monkeypatch, tmp_path):
     repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
@@ -198,6 +233,33 @@ def test_dry_run_uses_same_pinned_candidate_path_without_click_or_state_change(
     handle.click.assert_not_called()
     assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == before[0]
     assert repository.path.read_bytes() == before[1]
+
+
+def test_retry_authorized_dry_run_is_eligible_without_consuming_authorization(
+        monkeypatch, tmp_path):
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    reconciled = repository.reconcile_publication_not_published(
+        repository.mark_publication_uncertain(
+            repository.mark_final_click_attempted(record), 'Ambiguous', ('modal=0',),
+        ),
+        ('classification=NOT_PUBLISHED_VERIFIED', 'published_url=None'),
+    )
+    authorized = repository.authorize_retry(
+        reconciled, story_hash=load_story(tmp_path / 'In').source_hash,
+        remote_draft_reverified=True, no_public_url=True,
+    )
+    executor.record = authorized
+    before = repository.path.read_bytes()
+
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+
+    assert result.status is ExecutionStatus.DRY_RUN_VERIFIED
+    assert not result.final_click_attempted
+    assert authorized.retry_authorized
+    assert authorized.final_click_attempt_count == 1
+    assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == authorized
+    assert repository.path.read_bytes() == before
+    handle.click.assert_not_called()
 
 
 def test_dry_run_reuses_candidate_discovery_and_revalidation_and_fails_closed(

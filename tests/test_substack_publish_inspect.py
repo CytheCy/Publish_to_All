@@ -436,6 +436,238 @@ def test_mutation_guard_blocks_publish_transports():
         guard.require_clear()
 
 
+@pytest.mark.parametrize('method', ['POST', 'PUT', 'PATCH', 'DELETE'])
+def test_write_like_request_records_redacted_diagnostic_metadata(method):
+    request = SimpleNamespace(
+        method=method,
+        url='https://example.substack.com/api/graphql?operationName=LoadConfig&csrf=secret',
+        resource_type='fetch',
+        redirected_from=None,
+        initiator=None,
+    )
+    observer = publish_inspect.WriteLikeNetworkObserver([])
+    observer.set_stage('PUBLISH_SCREEN_LOAD')
+    observer.observe(request)
+
+    item = observer.first_diagnostic
+    assert item.http_method == method
+    assert item.host == 'example.substack.com'
+    assert item.path == '/api/graphql'
+    assert item.query_parameter_names == ('csrf', 'operationName')
+    assert item.resource_type == 'fetch'
+    assert item.initiator_type == '[unavailable]'
+    assert item.timing_stage == 'PUBLISH_SCREEN_LOAD'
+    assert item.operation_name == 'LoadConfig'
+    rendered = item.format()
+    assert 'secret' not in rendered
+    assert 'csrf=secret' not in rendered
+    assert 'cookie' not in rendered.lower()
+    assert 'authorization' not in rendered.lower()
+    assert 'body' not in rendered.lower()
+
+
+def request(method, url, resource_type):
+    return SimpleNamespace(method=method, url=url, resource_type=resource_type,
+                           redirected_from=None, initiator=None)
+
+
+TELEMETRY = [
+    ('firehose', request('POST', 'https://cyporter.substack.com/api/v1/firehose/batch', 'ping')),
+    ('sentry', request('POST', 'https://o350427.ingest.sentry.io/api/4504244653457408/envelope/', 'fetch')),
+    ('cloudflare', request('POST', 'https://cloudflareinsights.com/cdn-cgi/rum', 'xhr')),
+    ('remarketing', request('POST', 'https://www.google.com/rmkt/collect/316245675/', 'fetch')),
+    ('ccm', request('POST', 'https://www.google.com/ccm/collect', 'fetch')),
+]
+
+
+REFERRAL = request(
+    'PUT', 'https://cyporter.substack.com/api/v1/user/writer_referrals/code', 'fetch',
+)
+
+
+@pytest.mark.parametrize('name, telemetry', TELEMETRY)
+def test_exact_known_telemetry_is_aborted_and_recorded_as_suppressed(name, telemetry):
+    route = SimpleNamespace(request=telemetry, continue_=MagicMock(), abort=MagicMock())
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    guard = publish_inspect.MutationGuard([], observer.diagnostics, observer=observer)
+    guard.set_stage('DRAFT_EDITOR_LOAD')
+    guard.handle(route)
+    route.abort.assert_called_once_with()
+    route.continue_.assert_not_called()
+    assert observer.methods == []
+    assert len(observer.suppressed_telemetry) == 1
+    assert observer.suppressed_telemetry[0].host in telemetry.url
+    assert 'Suppressed telemetry:' in observer.suppressed_telemetry[0].format_suppressed_telemetry()
+
+
+@pytest.mark.parametrize('telemetry', [item[1] for item in TELEMETRY])
+@pytest.mark.parametrize('change', [
+    {'method': 'GET'}, {'url_suffix': 'x'}, {'host': 'other.example.test'},
+    {'resource_type': 'beacon'},
+])
+def test_known_telemetry_requires_exact_method_host_path_and_resource(telemetry, change):
+    from urllib.parse import urlsplit
+    parsed = urlsplit(telemetry.url)
+    url = telemetry.url
+    if 'url_suffix' in change:
+        url += change['url_suffix']
+    if 'host' in change:
+        url = f'https://{change["host"]}{parsed.path}'
+    altered = request(change.get('method', telemetry.method), url,
+                      change.get('resource_type', telemetry.resource_type))
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('DRAFT_EDITOR_LOAD')
+    observer.observe(altered)
+    assert not observer.suppressed_telemetry
+    if altered.method == 'POST':
+        assert observer.methods == ['POST']
+
+
+@pytest.mark.parametrize('path', [
+    '/api/v1/posts/123', '/api/v1/publish/123', '/api/v1/send/123',
+    '/api/v1/schedule/123', '/api/graphql',
+])
+def test_publication_and_graphql_write_endpoints_remain_blocked(path):
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.observe(request('POST', f'{URL}{path}', 'fetch'))
+    with pytest.raises(BrowserSessionError):
+        observer.require_clear()
+
+
+def test_suppressed_request_is_never_transmitted():
+    telemetry = TELEMETRY[-1][1]
+    route = SimpleNamespace(request=telemetry, continue_=MagicMock(), abort=MagicMock())
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    guard = publish_inspect.MutationGuard([], observer.diagnostics, observer=observer)
+    guard.set_stage('DRAFT_EDITOR_LOAD')
+    guard.handle(route)
+    route.continue_.assert_not_called()
+    route.abort.assert_called_once_with()
+
+
+def test_exact_referral_put_is_aborted_and_classified_as_editor_mutation():
+    route = SimpleNamespace(request=REFERRAL, continue_=MagicMock(), abort=MagicMock())
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('DRAFT_EDITOR_LOAD')
+    guard = publish_inspect.MutationGuard([], observer.diagnostics, observer=observer)
+    guard.handle(route)
+
+    route.abort.assert_called_once_with()
+    route.continue_.assert_not_called()
+    assert observer.methods == []
+    assert len(observer.suppressed_editor_mutations) == 1
+    assert not observer.suppressed_telemetry
+    report = observer.suppressed_editor_mutations[0].format_suppressed_editor_mutation()
+    assert 'Suppressed editor mutation:' in report
+    assert 'known referral-code initialization mutation' in report
+
+
+@pytest.mark.parametrize('altered', [
+    request('POST', 'https://cyporter.substack.com/api/v1/user/writer_referrals/code', 'fetch'),
+    request('PUT', 'https://other.substack.com/api/v1/user/writer_referrals/code', 'fetch'),
+    request('PUT', 'https://cyporter.substack.com/api/v1/user/writer_referrals/other', 'fetch'),
+    request('PUT', 'https://cyporter.substack.com/api/v1/user/other/code', 'fetch'),
+    request('PUT', 'https://cyporter.substack.com/api/v1/user/writer_referrals/code', 'xhr'),
+])
+def test_referral_suppression_requires_every_exact_signature_field(altered):
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('DRAFT_EDITOR_LOAD')
+    observer.observe(altered)
+
+    assert not observer.suppressed_editor_mutations
+    assert altered.method in observer.methods
+    with pytest.raises(BrowserSessionError, match='write-like network activity'):
+        observer.require_clear()
+
+
+def test_referral_suppression_requires_draft_editor_load_stage():
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('PUBLISH_SCREEN_LOAD')
+    observer.observe(REFERRAL)
+
+    assert not observer.suppressed_editor_mutations
+    assert observer.methods == ['PUT']
+
+
+@pytest.mark.parametrize('path', [
+    '/api/v1/posts/123', '/api/v1/drafts/123', '/api/v1/publish/123',
+    '/api/v1/send/123', '/api/v1/schedule/123',
+])
+def test_substack_mutation_puts_remain_blocked(path):
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('DRAFT_EDITOR_LOAD')
+    observer.observe(request('PUT', f'https://cyporter.substack.com{path}', 'fetch'))
+
+    assert not observer.suppressed_editor_mutations
+    assert observer.methods == ['PUT']
+
+
+def test_real_publishing_guard_does_not_inherit_dry_run_referral_suppression():
+    route = SimpleNamespace(request=REFERRAL, continue_=MagicMock(), abort=MagicMock())
+    guard = publish_inspect.MutationGuard([])
+    guard.set_stage('DRAFT_EDITOR_LOAD')
+    guard.handle(route)
+
+    route.abort.assert_called_once_with()
+    route.continue_.assert_not_called()
+    assert guard.blocked_methods == ['PUT']
+
+
+def test_write_like_response_status_and_redirect_are_safe():
+    request = SimpleNamespace(
+        method='POST', url='https://example.substack.com/api/save?token=secret',
+        resource_type='xhr', redirected_from=None, initiator=None,
+    )
+    response = SimpleNamespace(
+        request=request, status=307,
+        url='https://example.substack.com/login?session=secret',
+    )
+    observer = publish_inspect.WriteLikeNetworkObserver([])
+    observer.observe(request)
+    observer.observe_response(response)
+    item = observer.first_diagnostic
+    assert item.response_status == 307
+    assert item.redirect_target == 'example.substack.com/login'
+    assert 'secret' not in item.format()
+
+
+def test_write_like_request_does_not_retain_body_or_sensitive_headers():
+    request = SimpleNamespace(
+        method='POST', url='https://example.substack.com/api/save',
+        resource_type='fetch', redirected_from=None, initiator=None,
+        post_data='password=secret',
+        headers={'authorization': 'Bearer secret', 'cookie': 'sid=secret'},
+    )
+    observer = publish_inspect.WriteLikeNetworkObserver([])
+    observer.observe(request)
+    item = observer.first_diagnostic
+    assert not hasattr(item, 'post_data')
+    assert not hasattr(item, 'headers')
+    assert 'secret' not in repr(item)
+
+
+def test_unknown_write_like_request_fails_closed_with_stage_and_no_click():
+    request = SimpleNamespace(
+        method='POST', url='https://example.substack.com/api/publish',
+        resource_type='fetch', redirected_from=None, initiator=None,
+    )
+    observer = publish_inspect.WriteLikeNetworkObserver([])
+    observer.set_stage('FINAL_ACTION_DISCOVERY')
+    observer.observe(request)
+    with pytest.raises(BrowserSessionError, match='FINAL_ACTION_DISCOVERY'):
+        observer.require_clear()
+
+
+def test_read_only_get_navigation_is_allowed():
+    observer = publish_inspect.WriteLikeNetworkObserver([])
+    observer.observe(SimpleNamespace(
+        method='GET', url='https://example.substack.com/publish/post/123',
+        resource_type='document', redirected_from=None, initiator=None,
+    ))
+    observer.require_clear()
+    assert observer.methods == []
+
+
 def test_unexpected_write_like_activity_stops_final_screen_before_exit(monkeypatch):
     continue_node, back = Node(), Node()
     page = FinalPage(FinalScope(back), back)

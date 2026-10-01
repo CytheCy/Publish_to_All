@@ -126,7 +126,12 @@ def parse_front_matter(text: str) -> tuple[Metadata, str]:
         raise StoryError("A non-empty title is required in YAML front matter (title: \"Story Title\").")
     optional = {}
     for field in ("subtitle", "description", "series"):
+        # Existing metadata uses lower-case keys, while the story contract
+        # documents Description with an initial capital. Accept that spelling
+        # for this source concept without changing the rest of the convention.
         value = data.get(field)
+        if value is None and field == "description":
+            value = data.get("Description")
         if value is not None and not isinstance(value, str):
             raise StoryError(f"Front-matter {field} must be text when supplied.")
         optional[field] = value.strip() or None if value is not None else None

@@ -43,6 +43,27 @@ class DraftInspection:
     controls: tuple[str, ...]
     cover_state: str = 'unknown'
     cover_diagnostics: cover_image.CoverDiagnostics = cover_image.CoverDiagnostics()
+    canonical_public_urls: tuple[str, ...] = ()
+
+
+def verified_not_published_evidence(
+    inspection: DraftInspection, draft_url: str,
+) -> tuple[str, ...] | None:
+    """Return fixed evidence labels only for a stable editable draft surface."""
+    if (inspection.final_url.rstrip('/') != draft_url.rstrip('/')
+            or not inspection.definitely_draft_editor
+            or 'Saved' not in inspection.controls
+            or 'Continue' not in inspection.controls
+            or any(label in inspection.controls for label in ('Published', 'Sent'))):
+        return None
+    if inspection.canonical_public_urls:
+        return None
+    return (
+        'classification=NOT_PUBLISHED_VERIFIED',
+        f'editor_url={draft_url.rstrip("/")}',
+        'published_url=None',
+        'editable_draft_controls=Saved,Continue',
+    )
 
 
 @dataclass(frozen=True)
@@ -249,6 +270,23 @@ def _safe_page_identity(page, publication_url: str) -> tuple[str, str]:
     return final_url, title
 
 
+def _canonical_public_urls(page, publication_url: str) -> tuple[str, ...]:
+    """Return only trusted canonical public post URLs visible in the page DOM."""
+    host = urlsplit(publication_url).hostname
+    urls = []
+    try:
+        for link in page.locator('link[rel="canonical"][href]').all():
+            value = link.get_attribute('href')
+            parsed = urlsplit(value or '')
+            if (parsed.scheme == 'https' and parsed.hostname == host
+                    and not parsed.query and not parsed.fragment
+                    and re.fullmatch(r'/p/[^/]+', parsed.path.rstrip('/'))):
+                urls.append(f'https://{host}{parsed.path.rstrip("/")}')
+    except (PlaywrightError, AttributeError, TypeError, ValueError):
+        return ()
+    return tuple(dict.fromkeys(urls))
+
+
 def supplied_draft_diagnostics(
     page, publication_url: str, directory: Path | None, snapshot: _EditorSnapshot | None = None,
 ) -> SuppliedDraftDiagnostics:
@@ -334,6 +372,7 @@ def verify_supplied_draft(
                 tuple(label for label in second.controls if label in {'Draft', 'Saved', 'Saving'}),
                 True, final_url, page_title, second.controls, second.cover_state,
                 second.cover_diagnostics,
+                _canonical_public_urls(page, publication_url),
             )
         return SuppliedDraftEvidence(True, evidence.reason, inspection=inspection)
     return SuppliedDraftEvidence(
