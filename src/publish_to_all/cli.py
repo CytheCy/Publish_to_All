@@ -13,6 +13,7 @@ from .application import (
     reassociate_substack_version, reconcile_substack, reconcile_substack_image,
     forget_deleted_substack_draft, validate_substack_publish_configuration,
     diagnose_substack_final_action, publish_substack, authorize_substack_retry,
+    inspect_substack_history, retire_substack_test_publication, start_new_substack_cycle,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
@@ -27,6 +28,7 @@ from .presentation import (
     format_deleted_draft_cleanup, format_substack_publish_inspection,
     format_final_publish_validation, format_final_action_diagnostic,
     format_substack_publish_execution,
+    format_substack_history, format_substack_retirement, format_new_cycle,
 )
 
 
@@ -48,6 +50,19 @@ def main(argv: list[str] | None = None) -> int:
         command.set_defaults(formatter=formatter)
     command = commands.add_parser("status", help="Show local publication state for the current story version.")
     command.set_defaults(formatter=format_status)
+    command = commands.add_parser(
+        "substack-retire-test-publication",
+        help="Verify and retire the known public Substack test artifact locally.",
+    )
+    command.add_argument("--public-url", required=True, help="Exact known public test-post URL.")
+    commands.add_parser(
+        "substack-start-new-cycle",
+        help="Create a fresh local Substack cycle after test-publication retirement; never contacts Substack.",
+    )
+    commands.add_parser(
+        "substack-history",
+        help="Show all local Substack cycles and audit history for the current story version.",
+    )
     commands.add_parser("substack", help="Create a Substack draft containing only the title; never publish.")
     commands.add_parser(
         "substack-body",
@@ -154,6 +169,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "substack-forget-deleted-draft":
             result = forget_deleted_substack_draft(Path("."), args.story_hash)
             print(format_deleted_draft_cleanup(result))
+            return 0
+        if args.command == "substack-retire-test-publication":
+            result = retire_substack_test_publication(Path("."), args.public_url)
+            print(format_substack_retirement(result))
+            return 0
+        if args.command == "substack-start-new-cycle":
+            result = start_new_substack_cycle(Path("."))
+            print(format_new_cycle(result))
+            return 0
+        if args.command == "substack-history":
+            print(format_substack_history(inspect_substack_history(Path("."))))
             return 0
         if args.command == "substack-reassociate-version":
             result = reassociate_substack_version(Path("."), args.from_hash)

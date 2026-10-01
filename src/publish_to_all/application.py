@@ -13,6 +13,10 @@ from .state import (
     PublicationRepository, StoryVersion,
 )
 from .browser.session import persistent_browser
+from .browser.public_post import (
+    PublicPostVerification, validate_test_public_url,
+    verify_test_public_post,
+)
 from .browser.substack import AuthenticationState, collect_diagnostics, verify_page
 from .errors import BrowserSessionError, SubstackRateLimitError
 from .publishers.substack import (
@@ -40,6 +44,28 @@ def inspect_project(root: Path) -> Inspection:
 class StoryStatus:
     story: Story
     substack: PublicationRecord | None
+
+
+@dataclass(frozen=True)
+class TestPublicationRetirementResult:
+    story: Story
+    previous: PublicationRecord
+    retired: PublicationRecord
+    verification: PublicPostVerification
+
+
+@dataclass(frozen=True)
+class NewCycleResult:
+    story: Story
+    retired: PublicationRecord
+    active: PublicationRecord
+
+
+@dataclass(frozen=True)
+class SubstackHistoryResult:
+    story: Story
+    records: tuple[PublicationRecord, ...]
+    audit: dict[int, tuple[dict, ...]]
 
 
 @dataclass(frozen=True)
@@ -134,7 +160,59 @@ def inspect_status(root: Path) -> StoryStatus:
     """Read exact-version state, initializing only the schema if necessary."""
     story = load_story(root / "In")
     repository = PublicationRepository(runtime_paths(root).database)
-    return StoryStatus(story, repository.get_publication(story.source_hash, "substack"))
+    current = repository.get_publication(story.source_hash, "substack")
+    if current is None:
+        # Historical display is explicit.  This is not used for duplicate
+        # protection or any operation that can mutate the active cycle.
+        current = repository.latest_retired_publication(story.source_hash, "substack")
+    return StoryStatus(story, current)
+
+
+def retire_substack_test_publication(
+    root: Path, public_url: str,
+) -> TestPublicationRetirementResult:
+    """Verify the exact public test artifact, then retire only local state."""
+    exact_url = validate_test_public_url(public_url)
+    verification = verify_test_public_post(exact_url)
+    story = load_story(root / 'In')
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database, migrate=False)
+    previous = repository.get_publication(story.source_hash, 'substack')
+    if previous is None:
+        raise BrowserSessionError(
+            'No publication record exists for the exact current story hash. Local state unchanged.'
+        )
+    evidence = (
+        f'public_url={verification.url} | http_status={verification.status} | '
+        f'heading={verification.title} | public_post=True | editor_ui=False | publish_modal=False'
+    )
+    retired = repository.retire_test_publication(
+        story.source_hash, 'substack', exact_url, evidence,
+    )
+    return TestPublicationRetirementResult(story, previous, retired, verification)
+
+
+def start_new_substack_cycle(root: Path) -> NewCycleResult:
+    """Create a fresh local cycle after, and only after, test retirement."""
+    story = load_story(root / 'In')
+    repository = PublicationRepository(runtime_paths(root).database)
+    active = repository.get_publication(story.source_hash, 'substack')
+    retired = repository.latest_retired_publication(story.source_hash, 'substack')
+    if active is not None or retired is None:
+        raise BrowserSessionError(
+            'Starting a new cycle requires a retired_test_publication record. Local state unchanged.'
+        )
+    active = repository.start_new_cycle(story, 'substack')
+    return NewCycleResult(story, retired, active)
+
+
+def inspect_substack_history(root: Path) -> SubstackHistoryResult:
+    """Read all local cycles and audit events for the current story hash."""
+    story = load_story(root / 'In')
+    repository = PublicationRepository(runtime_paths(root).database)
+    records = repository.publication_history(story.source_hash, 'substack')
+    audit = {record.id: repository.audit_history(record.id) for record in records}
+    return SubstackHistoryResult(story, records, audit)
 
 
 def inspect_substack_publish(
@@ -1428,6 +1506,11 @@ def authorize_substack_retry(root: Path) -> StoryStatus:
     paths = runtime_paths(root)
     repository = PublicationRepository(paths.database, migrate=False)
     record = repository.get_publication(inspection.story.source_hash, 'substack')
+    if record is not None and record.lifecycle_status == 'retired_test_publication':
+        raise BrowserSessionError(
+            'The retired test publication cannot authorize a retry. Start a new cycle explicitly. '
+            'Nothing was published.'
+        )
     if record is None or record.publication_state != PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK:
         raise BrowserSessionError(
             'Retry authorization requires verified-not-published-after-click state. Nothing was published.'

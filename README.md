@@ -168,6 +168,39 @@ publication attempt. It never changes a stored publication status or publishes
 anything. `check` and `preview` remain read-only and do not access the database.
 Expected database errors appear on stderr without a traceback (exit code 1).
 
+### Retire the known public test artifact
+
+The exact test publication can be verified and retired locally with:
+
+```bash
+publish-to-all substack-retire-test-publication \
+  --public-url "https://cyporter.substack.com/p/saturation-of-artificial-intelligence"
+```
+
+The command performs one read-only HTTPS GET and requires the exact host and
+path, HTTP 200, a public post page without editor or publish-modal UI, and an
+article heading of either `Saturation of Artificial Intelligence` or
+`TEST—Saturation of Artificial Intelligence`. It then stores the public URL,
+adds a retirement audit event, and moves the local cycle to
+`retired_test_publication` without removing draft, click, retry, body, image,
+subtitle, ambiguity, or reconciliation history. It does not edit or delete
+the remote post.
+
+Inspect retired cycles and audit events with:
+
+```bash
+publish-to-all substack-history
+```
+
+Retired cycles reject publishing, retry authorization, reconciliation, and
+body, subtitle, image, or title changes. A fresh local cycle is available only
+through the explicit command below; it performs no remote action and starts
+with empty URLs and zero counters:
+
+```bash
+publish-to-all substack-start-new-cycle
+```
+
 The database is outside the repository:
 
 | Runtime data | Location (default) | Override |
@@ -184,7 +217,7 @@ automatically when opening the database repository. Browser commands create the
 Substack profile directory; diagnostics are created on browser failure if a page
 can be captured. The logs directory remains reserved.
 
-The current schema version is **6**, stored in SQLite's `PRAGMA user_version`.
+The current schema version is **9**, stored in SQLite's `PRAGMA user_version`.
 Ordered migrations run transactionally when opening the database; a newer,
 unsupported version fails clearly without downgrading it. Tests use temporary
 databases and isolated XDG directories, never the user's application database.

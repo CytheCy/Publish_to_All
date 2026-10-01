@@ -265,6 +265,7 @@ def test_retry_authorized_dry_run_is_eligible_without_consuming_authorization(
 def test_dry_run_reuses_candidate_discovery_and_revalidation_and_fails_closed(
         monkeypatch, tmp_path):
     repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    before = repository.path.read_bytes()
     calls = []
     original = publish_execute.collect_final_action_target
 
@@ -273,10 +274,10 @@ def test_dry_run_reuses_candidate_discovery_and_revalidation_and_fails_closed(
         return original(page_arg)
 
     monkeypatch.setattr(publish_execute, 'collect_final_action_target', collect)
-    # A changed accessible name is rejected by the same pre-click guard used by live execution.
-    changed = replace(screen, final_action_evidence=action_evidence(
-        candidate(accessible_name='Send to subscribers now'),
-    ))
+    # Ambiguous DOM evidence is rejected by the same pre-click guard used by live execution.
+    changed = replace(
+        screen, final_action_evidence=action_evidence(ambiguity=True),
+    )
     executor.inspect_screen = lambda: changed
 
     result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
@@ -287,6 +288,29 @@ def test_dry_run_reuses_candidate_discovery_and_revalidation_and_fails_closed(
     assert not result.final_click_attempted
     handle.click.assert_not_called()
     assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == record
+    assert repository.path.read_bytes() == before
+
+
+def test_dry_run_candidate_validation_exception_leaves_sqlite_unchanged(
+        monkeypatch, tmp_path):
+    repository, record, _page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    before = repository.path.read_bytes()
+
+    def reject_candidate(_page):
+        raise ValueError('candidate changed during validation')
+
+    monkeypatch.setattr(publish_execute, 'collect_final_action_target', reject_candidate)
+
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+
+    assert result.status is ExecutionStatus.BLOCKED
+    assert not result.final_click_attempted
+    assert 'candidate changed during validation' in ' '.join(result.failures)
+    handle.click.assert_not_called()
+    assert repository.get_publication(
+        load_story(tmp_path / 'In').source_hash, 'substack',
+    ) == record
+    assert repository.path.read_bytes() == before
 
 
 def test_click_exception_is_uncertain_and_never_retried(monkeypatch, tmp_path):

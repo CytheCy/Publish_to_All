@@ -27,6 +27,7 @@ class PublicationStatus(StrEnum):
     PUBLISHING = "publishing"
     PUBLISHED = "published"
     FAILED = "failed"
+    RETIRED_TEST_PUBLICATION = "retired_test_publication"
 
 
 class PublicationState(StrEnum):
@@ -102,6 +103,9 @@ class PublicationRecord:
     retry_authorized: bool = False
     retry_authorized_at: str | None = None
     retry_authorization_count: int = 0
+    lifecycle_status: str = 'active'
+    retired_at: str | None = None
+    cycle_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,41 @@ class DeletedDraftRemoval:
     reassociations_removed: int
     story_removed: bool
     removed_at: str
+
+
+# These statements extend the established schema-9 database without changing
+# its public schema version. They are also included in the final migration so
+# a new database has the same shape.
+RETIREMENT_SCHEMA_MIGRATIONS = (
+    "ALTER TABLE publications ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle_status IN ('active', 'retired_test_publication'))",
+    "ALTER TABLE publications ADD COLUMN retired_at TEXT",
+    "ALTER TABLE publication_audit_events RENAME TO publication_audit_events_legacy",
+    "DROP INDEX IF EXISTS publication_audit_events_publication",
+    """CREATE TABLE publication_audit_events (
+            id INTEGER PRIMARY KEY,
+            publication_id INTEGER NOT NULL REFERENCES publications(id),
+            event_type TEXT NOT NULL CHECK(event_type IN ('final_click_attempt', 'verified_not_published', 'retry_authorized', 'retired_test_publication')),
+            recorded_at TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            draft_url TEXT,
+            evidence TEXT
+        )""",
+    """INSERT INTO publication_audit_events
+           (id, publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+           SELECT id, publication_id, event_type, recorded_at, source_hash, draft_url, evidence
+           FROM publication_audit_events_legacy""",
+    "DROP TABLE publication_audit_events_legacy",
+    "CREATE INDEX publication_audit_events_publication ON publication_audit_events(publication_id, id)",
+)
+
+# Publication rows are still individual attempts.  This groups retries into
+# the publication cycle that owns them so a retired cycle cannot be selected
+# merely because it has a larger blocking history than the current cycle.
+CYCLE_SCHEMA_MIGRATIONS = (
+    "ALTER TABLE publications ADD COLUMN cycle_id INTEGER",
+    "UPDATE publications SET cycle_id = id WHERE cycle_id IS NULL",
+    "CREATE INDEX publications_story_destination_cycle ON publications(story_id, destination, cycle_id, id)",
+)
 
 
 # Each entry migrates the preceding version. Execute individually inside one
@@ -225,6 +264,8 @@ MIGRATIONS = (
         "ALTER TABLE publications ADD COLUMN subtitle_started_at TEXT",
         "ALTER TABLE publications ADD COLUMN subtitle_inserted_at TEXT",
         "ALTER TABLE publications ADD COLUMN subtitle_error_message TEXT",
+        *RETIREMENT_SCHEMA_MIGRATIONS,
+        *CYCLE_SCHEMA_MIGRATIONS,
     ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -298,14 +339,33 @@ class PublicationRepository:
                 for statement in MIGRATIONS[index]:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {index + 1}")
-            # Databases created at schema version 9 before subtitle support
-            # need the same columns, while the established public schema
-            # version remains 9.
+            # Databases created at schema version 9 before subtitle or
+            # retirement support need the same columns, while the established
+            # public schema version remains 9.
             columns = {
                 row[1] for row in connection.execute('PRAGMA table_info(publications)').fetchall()
             }
             if version == SCHEMA_VERSION and 'subtitle_status' not in columns:
-                for statement in MIGRATIONS[-1][2:]:
+                for statement in MIGRATIONS[-1][2:6]:
+                    connection.execute(statement)
+                columns = {
+                    row[1] for row in connection.execute('PRAGMA table_info(publications)').fetchall()
+                }
+            if version == SCHEMA_VERSION and 'lifecycle_status' not in columns:
+                for statement in RETIREMENT_SCHEMA_MIGRATIONS[:2]:
+                    connection.execute(statement)
+            if version == SCHEMA_VERSION:
+                audit_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publication_audit_events'"
+                ).fetchone()
+                if audit_sql and 'retired_test_publication' not in (audit_sql[0] or ''):
+                    for statement in RETIREMENT_SCHEMA_MIGRATIONS[2:]:
+                        connection.execute(statement)
+            columns = {
+                row[1] for row in connection.execute('PRAGMA table_info(publications)').fetchall()
+            }
+            if version == SCHEMA_VERSION and 'cycle_id' not in columns:
+                for statement in CYCLE_SCHEMA_MIGRATIONS:
                     connection.execute(statement)
 
     @contextmanager
@@ -366,13 +426,81 @@ class PublicationRepository:
             values["publication_state"] = PublicationState(values["publication_state"])
         if "retry_authorized" in values:
             values["retry_authorized"] = bool(values["retry_authorized"])
+        values.setdefault("cycle_id", values["id"])
+        lifecycle_status = values.get("lifecycle_status", 'active')
+        values["lifecycle_status"] = lifecycle_status
+        if lifecycle_status == 'retired_test_publication':
+            values["status"] = PublicationStatus.RETIRED_TEST_PUBLICATION
         return PublicationRecord(**values)
 
+    @staticmethod
+    def _is_retired_lifecycle(value: str | None) -> bool:
+        return value in {
+            'retired_test_publication', 'retired', 'historical', 'terminal',
+        } or bool(value and value.startswith(('retired_', 'historical_', 'terminal_')))
+
     @classmethod
-    def _lookup(cls, connection, source_hash, destination, *, blocking=False):
+    def _select_active_cycle(
+        cls, connection, source_hash: str, destination: str,
+        *, designated_cycle_id: int | None = None, required: bool = False,
+    ) -> PublicationRecord | None:
+        rows = connection.execute(
+            '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+               WHERE s.source_hash = ? AND p.destination = ? ORDER BY p.id''',
+            (source_hash, destination),
+        ).fetchall()
+        records = [cls._record(row) for row in rows]
+        active = [record for record in records if not cls._is_retired_lifecycle(record.lifecycle_status)]
+        active_cycle_ids = {record.cycle_id for record in active}
+        if designated_cycle_id is not None:
+            if designated_cycle_id not in active_cycle_ids:
+                raise StateError(
+                    'The designated active publication cycle is missing or retired. '
+                    'Local state unchanged.'
+                )
+            active_cycle_ids = {designated_cycle_id}
+        if len(active_cycle_ids) > 1:
+            raise StateError(
+                'More than one active publication cycle exists for the exact story hash and destination. '
+                'Local state unchanged.'
+            )
+        if not active_cycle_ids:
+            if required and records:
+                raise StateError(
+                    'No active publication cycle exists for the exact story hash and destination. '
+                    'Start a new cycle explicitly. Local state unchanged.'
+                )
+            return None
+        cycle_id = next(iter(active_cycle_ids))
+        return next(
+            record for record in reversed(active)
+            if record.cycle_id == cycle_id
+        )
+
+    def select_active_cycle(
+        self, source_hash: str, destination: str, *, designated_cycle_id: int | None = None,
+        required: bool = False,
+    ) -> PublicationRecord | None:
+        """Resolve exactly one non-retired cycle for an exact story hash."""
+        with self._connection() as connection:
+            return self._select_active_cycle(
+                connection, source_hash, destination,
+                designated_cycle_id=designated_cycle_id, required=required,
+            )
+
+    @classmethod
+    def _lookup(cls, connection, source_hash, destination, *, blocking=False, require_active=True):
+        active_cycle = cls._select_active_cycle(
+            connection, source_hash, destination, required=require_active,
+        )
+        if active_cycle is None:
+            return None
         sql = """SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
-                 WHERE s.source_hash = ? AND p.destination = ?"""
-        parameters = [source_hash, destination]
+                 WHERE s.source_hash = ? AND p.destination = ? AND p.cycle_id = ?
+                   AND p.lifecycle_status NOT LIKE 'retired%'
+                   AND p.lifecycle_status NOT LIKE 'historical%'
+                   AND p.lifecycle_status NOT LIKE 'terminal%'"""
+        parameters = [source_hash, destination, active_cycle.cycle_id]
         if blocking:
             sql += """ AND (p.status IN (?, ?, ?, ?) OR p.draft_url IS NOT NULL
                        OR p.published_url IS NOT NULL OR p.needs_reconciliation = 1
@@ -384,14 +512,30 @@ class PublicationRepository:
         return cls._record(connection.execute(sql, parameters).fetchone())
 
     def get_publication(self, source_hash: str, destination: str) -> PublicationRecord | None:
-        """Return the latest attempt for exactly this hash and destination."""
+        """Return the current active-cycle attempt for exactly this hash."""
         with self._connection() as connection:
-            return self._lookup(connection, source_hash, destination)
+            return self._lookup(connection, source_hash, destination, require_active=False)
 
     def find_duplicate(self, source_hash: str, destination: str) -> PublicationRecord | None:
-        """Return any known remote copy or unresolved attempt, across all history."""
+        """Return a blocker from the current active cycle, never retired history."""
         with self._connection() as connection:
             return self._lookup(connection, source_hash, destination, blocking=True)
+
+    def latest_retired_publication(
+        self, source_hash: str, destination: str,
+    ) -> PublicationRecord | None:
+        """Return retired history for explicit historical display or cycle setup."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+                   WHERE s.source_hash = ? AND p.destination = ? ORDER BY p.id DESC''',
+                (source_hash, destination),
+            ).fetchall()
+        for row in rows:
+            record = self._record(row)
+            if self._is_retired_lifecycle(record.lifecycle_status):
+                return record
+        return None
 
     def require_deleted_draft_removal_candidate(
         self, source_hash: str, destination: str,
@@ -515,6 +659,9 @@ class PublicationRepository:
         if not destination or destination != destination.strip().lower():
             raise StateError("Destination must be a non-empty lowercase provider name.")
         with self._connection(write=True) as connection:
+            active_cycle = self._select_active_cycle(
+                connection, story.source_hash, destination, required=False,
+            )
             duplicate = self._lookup(connection, story.source_hash, destination, blocking=True)
             if duplicate:
                 provider = "Substack" if destination == "substack" else destination
@@ -527,13 +674,42 @@ class PublicationRepository:
                 lines.append("Reconcile unresolved attempts before retrying. Intentional duplicate copies are not supported yet.")
                 lines.append("No new draft was created.")
                 raise DuplicatePublicationError("\n".join(lines))
+            if active_cycle is not None and active_cycle.status == PublicationStatus.NOT_STARTED:
+                version = self._register(connection, story)
+                now = _now()
+                connection.execute(
+                    '''UPDATE publications SET story_id = ?, status = ?, updated_at = ?,
+                       last_attempt_at = ? WHERE id = ?''',
+                    (version.id, PublicationStatus.DRAFT_CREATING, now, now, active_cycle.id),
+                )
+                return self._record(connection.execute(
+                    'SELECT * FROM publications WHERE id = ?', (active_cycle.id,)
+                ).fetchone())
+            if active_cycle is None:
+                existing = connection.execute(
+                    '''SELECT 1 FROM publications p JOIN stories s ON s.id = p.story_id
+                       WHERE s.source_hash = ? AND p.destination = ? LIMIT 1''',
+                    (story.source_hash, destination),
+                ).fetchone()
+                if existing:
+                    raise StateError(
+                        'No active publication cycle exists for the exact story hash and destination. '
+                        'Start a new cycle explicitly. Local state unchanged.'
+                    )
             version = self._register(connection, story)
             now = _now()
             cursor = connection.execute(
-                """INSERT INTO publications (story_id, destination, status, created_at, updated_at, last_attempt_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (version.id, destination, PublicationStatus.DRAFT_CREATING, now, now, now),
+                """INSERT INTO publications
+                   (story_id, destination, status, created_at, updated_at, last_attempt_at, cycle_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (version.id, destination, PublicationStatus.DRAFT_CREATING, now, now, now,
+                 active_cycle.cycle_id if active_cycle is not None else None),
             )
+            if active_cycle is None:
+                connection.execute(
+                    'UPDATE publications SET cycle_id = ? WHERE id = ?',
+                    (cursor.lastrowid, cursor.lastrowid),
+                )
             return self._record(connection.execute("SELECT * FROM publications WHERE id = ?", (cursor.lastrowid,)).fetchone())
 
     def _transition(self, record_id, status, allowed, *, draft_url=None, published_url=None, error=None,
@@ -840,6 +1016,108 @@ class PublicationRepository:
                 'SELECT * FROM publication_audit_events WHERE publication_id = ? ORDER BY id',
                 (publication_id,),
             ).fetchall())
+
+    def publication_history(self, source_hash: str, destination: str) -> tuple[PublicationRecord, ...]:
+        """Return every local cycle for one exact story hash in creation order."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+                   WHERE s.source_hash = ? AND p.destination = ? ORDER BY p.id''',
+                (source_hash, destination),
+            ).fetchall()
+        return tuple(self._record(row) for row in rows)
+
+    @staticmethod
+    def _is_canonical_public_post_url(value: str) -> bool:
+        try:
+            parsed = urlsplit(value)
+            return bool(
+                parsed.scheme == 'https' and parsed.hostname
+                and parsed.username is None and parsed.password is None
+                and parsed.port is None and not parsed.query and not parsed.fragment
+                and len(parsed.path.rstrip('/').split('/')) == 3
+                and parsed.path.rstrip('/').split('/')[1] == 'p'
+                and parsed.path.rstrip('/').split('/')[2]
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def retire_test_publication(
+        self, source_hash: str, destination: str, public_url: str, evidence: str,
+    ) -> PublicationRecord:
+        """Close one verified public test artifact while retaining its full history."""
+        if not self._is_canonical_public_post_url(public_url):
+            raise StateError('The supplied public URL is not canonical. Local state unchanged.')
+        with self._connection(write=True) as connection:
+            current = self._select_active_cycle(
+                connection, source_hash, destination, required=True,
+            )
+            if current is None:
+                raise StateError(
+                    'No publication record exists for the exact current story hash. Local state unchanged.'
+                )
+            owner = connection.execute(
+                '''SELECT id FROM publications
+                   WHERE published_url = ? AND id != ? LIMIT 1''',
+                (public_url, current.id),
+            ).fetchone()
+            if owner is not None:
+                raise StateError('The exact public URL is already stored on another cycle. Local state unchanged.')
+            now = _now()
+            safe_evidence = ' '.join(str(evidence).split())[:2000]
+            connection.execute(
+                '''UPDATE publications SET published_url = ?, lifecycle_status = ?,
+                   retired_at = ?, updated_at = ? WHERE id = ?''',
+                (public_url, 'retired_test_publication', now, now, current.id),
+            )
+            connection.execute(
+                '''INSERT INTO publication_audit_events
+                   (publication_id, event_type, recorded_at, source_hash, draft_url, evidence)
+                   VALUES (?, 'retired_test_publication', ?, ?, ?, ?)''',
+                (current.id, now, source_hash, current.draft_url, safe_evidence),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,)
+            ).fetchone())
+
+    def start_new_cycle(self, story: Story, destination: str) -> PublicationRecord:
+        """Create a clean local cycle only after the latest cycle was retired."""
+        if not destination or destination != destination.strip().lower():
+            raise StateError('Destination must be a non-empty lowercase provider name.')
+        with self._connection(write=True) as connection:
+            rows = connection.execute(
+                '''SELECT p.* FROM publications p JOIN stories s ON s.id = p.story_id
+                   WHERE s.source_hash = ? AND p.destination = ? ORDER BY p.id DESC''',
+                (story.source_hash, destination),
+            ).fetchall()
+            if not rows:
+                raise StateError(
+                    'Starting a new cycle requires a retired_test_publication record. Local state unchanged.'
+                )
+            latest = self._record(rows[0])
+            active = self._select_active_cycle(
+                connection, story.source_hash, destination, required=False,
+            )
+            if active is not None or not self._is_retired_lifecycle(latest.lifecycle_status):
+                raise StateError(
+                    'Starting a new cycle requires the latest cycle to be retired_test_publication. '
+                    'Local state unchanged.'
+                )
+            version = self._register(connection, story)
+            now = _now()
+            cursor = connection.execute(
+                '''INSERT INTO publications
+                   (story_id, destination, status, created_at, updated_at, last_attempt_at, cycle_id)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL)''',
+                (version.id, destination, PublicationStatus.NOT_STARTED, now, now, now),
+            )
+            connection.execute(
+                'UPDATE publications SET cycle_id = ? WHERE id = ?',
+                (cursor.lastrowid, cursor.lastrowid),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (cursor.lastrowid,)
+            ).fetchone())
 
     def mark_failed(self, record_id: int, error_message: str, *, draft_url: str | None = None,
                     needs_reconciliation: bool = False) -> PublicationRecord:

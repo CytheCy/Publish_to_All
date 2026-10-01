@@ -6,12 +6,13 @@ import re
 from .application import (
     DeletedDraftCleanupResult, FinalPublishDryRunResult, ImageObservationResult,
     ImageReconciliationResult, Inspection,
+    NewCycleResult, SubstackHistoryResult, TestPublicationRetirementResult,
     PublishContinueDiagnosticResult, PublishInspectionResult, SocialPreviewReadOnlyResult,
     StoryStatus,
 )
 from .browser.publish_validate import ValidationStatus
 from .browser.publish_inspect import AttributeEvidence
-from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationState, PublicationStatus
+from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationState, PublicationStatus, SubtitleStatus
 from .browser.substack import AuthenticationState, SessionResult
 
 
@@ -119,6 +120,8 @@ STATUS_LABELS = {
 
 
 def _publication_label(record) -> str:
+    if record.status == PublicationStatus.RETIRED_TEST_PUBLICATION:
+        return 'Retired test publication'
     if record.retry_authorized:
         return 'Retry authorized'
     if record.publication_state == PublicationState.VERIFIED_NOT_PUBLISHED_AFTER_CLICK:
@@ -678,6 +681,26 @@ def format_status(result: StoryStatus) -> str:
              f"Title: {story.metadata.title}", f"Hash: {story.source_hash}", "",
              f"Substack: {_publication_label(record) if record else STATUS_LABELS[status]}"]
     if record:
+        if record.status == PublicationStatus.RETIRED_TEST_PUBLICATION:
+            lines += [
+                'Retired history',
+                'State: Retired test publication',
+                f'Public URL: {record.published_url or "None"}',
+                f'Draft URL (historical): {record.draft_url or "None"}',
+                f'Historical final click attempts: {record.final_click_attempt_count}',
+                f'Retry authorizations: {record.retry_authorization_count}',
+                'Old draft/public URLs are historical only.',
+                'Retired cycle blocked from publishing, retry authorization, reconciliation, and content changes.',
+            ]
+            if record.body_status != BodyStatus.NOT_STARTED:
+                lines.append(f'Historical body state: {record.body_status.value}')
+            if record.subtitle_status != SubtitleStatus.NOT_STARTED:
+                lines.append(f'Historical subtitle state: {record.subtitle_status.value}')
+            if record.image_status != ImageStatus.NOT_STARTED:
+                lines.append(f'Historical image state: {record.image_status.value}')
+            if record.needs_reconciliation:
+                lines.append('Historical reconciliation flag preserved: Yes')
+            return "\n".join([*lines, "", "Nothing was published by this command."])
         if record.draft_url:
             lines.append(f"Draft: {record.draft_url}")
         if record.published_url:
@@ -722,3 +745,75 @@ def format_status(result: StoryStatus) -> str:
         if record.image_error_message:
             lines.append(f"Image error: {record.image_error_message}")
     return "\n".join([*lines, "", "Nothing was published by this command."])
+
+
+def format_substack_retirement(result: TestPublicationRetirementResult) -> str:
+    record = result.retired
+    return "\n".join([
+        'Substack test publication retired', '',
+        'Story:', result.story.metadata.title, '',
+        'Story hash:', result.story.source_hash, '',
+        'Public verification:',
+        f'URL: {result.verification.url}',
+        f'HTTP status: {result.verification.status}',
+        f'Article heading: {result.verification.title}',
+        'Public post page: Yes',
+        'Editor UI: No',
+        'Publish modal: No', '',
+        'Previous state:', _publication_label(result.previous), '',
+        'New state: Retired test publication',
+        'Public URL stored:', record.published_url or 'None',
+        'Draft URL preserved historically:', record.draft_url or 'None',
+        'Historical final click attempts:', str(record.final_click_attempt_count),
+        'Retry authorizations preserved:', str(record.retry_authorization_count),
+        'Audit event: retired_test_publication', '',
+        'No remote changes were made.',
+        'Nothing was published.',
+    ])
+
+
+def format_new_cycle(result: NewCycleResult) -> str:
+    record = result.active
+    return "\n".join([
+        'New Substack publication cycle created', '',
+        'Story:', result.story.metadata.title, '',
+        'Retired cycle:', result.retired.published_url or 'None',
+        'Active state: Not started',
+        'Draft URL: None',
+        'Public URL: None',
+        'Body: Not started',
+        'Subtitle: Not started',
+        'Image: Not started',
+        'Final click attempts: 0',
+        'Retry authorizations: 0',
+        'Reconciliation required: No',
+        f'New cycle record: {record.id}', '',
+        'No remote changes were made.',
+        'Nothing was published.',
+    ])
+
+
+def format_substack_history(result: SubstackHistoryResult) -> str:
+    lines = [
+        'Substack publication history', '',
+        'Story:', result.story.metadata.title,
+        'Story hash:', result.story.source_hash,
+    ]
+    if not result.records:
+        lines += ['', 'No local publication cycles recorded.']
+    for index, record in enumerate(result.records, 1):
+        lines += [
+            '', f'Cycle {index} (record {record.id})',
+            f'State: {_publication_label(record)}',
+            f'Draft URL: {record.draft_url or "None"}',
+            f'Public URL: {record.published_url or "None"}',
+            f'Final click attempts: {record.final_click_attempt_count}',
+            f'Retry authorizations: {record.retry_authorization_count}',
+            f'Body: {record.body_status.value}',
+            f'Subtitle: {record.subtitle_status.value}',
+            f'Image: {record.image_status.value}',
+            f'Reconciliation required: {"Yes" if record.needs_reconciliation else "No"}',
+        ]
+        events = result.audit.get(record.id, ())
+        lines.append('Audit events: ' + (', '.join(event['event_type'] for event in events) or 'None'))
+    return "\n".join([*lines, '', 'No remote changes were made.', 'Nothing was published.'])
