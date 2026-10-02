@@ -25,6 +25,7 @@ from .publishers.substack import (
 )
 
 if TYPE_CHECKING:
+    from .browser.subtitle_reconcile import SubtitleEvidence
     from .browser.publish_execute import PublishExecutionResult
     from .browser.publish_validate import FinalPublishValidation
 
@@ -111,6 +112,15 @@ class SubtitleControlDiagnostic:
     field_count: int
     visible_editable_count: int
     signature: str
+
+
+@dataclass(frozen=True)
+class SubtitleReconciliationResult:
+    previous: PublicationRecord
+    substack: PublicationRecord
+    evidence: 'SubtitleEvidence'
+    database_sha256_before: str
+    database_sha256_after: str
 
 
 @dataclass(frozen=True)
@@ -781,6 +791,65 @@ def add_substack_subtitle(root: Path) -> StoryStatus:
         publisher = SubstackSubtitlePublisher(repository, page, publication_url, monitor)
         updated = publisher.add_subtitle(story, record)
     return StoryStatus(story, updated)
+
+
+def reconcile_substack_subtitle(
+    root: Path, *, story_hash: str, cycle_id: int, draft_url: str,
+) -> SubtitleReconciliationResult:
+    """Inspect one failed subtitle read-only, then reconcile only local state."""
+    from .browser.body import RateLimitMonitor
+    from .browser.reconcile import validate_supplied_draft_url
+    from .browser.subtitle_reconcile import (
+        SubtitleClassification, SubtitleEvidence, inspect_subtitle_for_reconciliation,
+    )
+    from .state import StateError
+
+    inspection = inspect_project(root)
+    story = inspection.story
+    if story.source_hash != story_hash or not story.metadata.description:
+        raise StateError('The exact story hash and Description are required. Local state unchanged.')
+    publication_url = inspection.config.require_substack()
+    if validate_supplied_draft_url(draft_url, publication_url) != draft_url:
+        raise StateError('An exact canonical draft URL is required. Local state unchanged.')
+    paths = runtime_paths(root)
+    repository = PublicationRepository(paths.database, migrate=False)
+    before = sha256(paths.database.read_bytes()).hexdigest()
+    record = repository.require_subtitle_reconciliation_candidate(story_hash, cycle_id, draft_url)
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError('No saved Substack session. Local state unchanged.')
+    monitor = RateLimitMonitor(publication_url)
+    try:
+        with persistent_browser(
+            paths.substack_browser_profile, paths.diagnostics, headless=False, read_only=True,
+        ) as context:
+            page = context.new_page()
+            page.on('response', monitor.observe)
+            evidence = inspect_subtitle_for_reconciliation(
+                page, publication_url, draft_url, story.metadata.title,
+                story.metadata.description, monitor,
+            )
+    except BrowserSessionError:
+        evidence = SubtitleEvidence(
+            SubtitleClassification.UNKNOWN, None, 'The browser inspection could not complete safely.',
+            rate_limited=monitor.encountered,
+        )
+    if monitor.encountered:
+        evidence = SubtitleEvidence(
+            SubtitleClassification.UNKNOWN, None, 'Rate limiting; local state unchanged.',
+            rate_limited=True,
+        )
+    if sha256(paths.database.read_bytes()).hexdigest() != before:
+        raise StateError('SQLite changed during read-only inspection; reconciliation was refused.')
+    if inspect_project(root).story != story:
+        raise StateError('The story changed during inspection; reconciliation was refused.')
+    updated = record
+    if evidence.classification != SubtitleClassification.UNKNOWN and not evidence.rate_limited:
+        updated = repository.reconcile_subtitle(
+            record, story_hash, remote_value=evidence.value, description=story.metadata.description,
+        )
+    return SubtitleReconciliationResult(
+        record, updated, evidence, before, sha256(paths.database.read_bytes()).hexdigest(),
+    )
 
 
 def inspect_substack_subtitle(root: Path, draft_url: str) -> SubtitleControlDiagnostic:

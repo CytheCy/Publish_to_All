@@ -71,8 +71,18 @@ def browser_failure(context: BrowserContext | None, diagnostics: Path) -> Browse
     return BrowserSessionError(message)
 
 
+def allow_read_only_request(route) -> None:
+    """Prevent a read-only editor inspection from sending writes or autosaves."""
+    if route.request.method in {'GET', 'HEAD', 'OPTIONS'}:
+        route.continue_()
+    else:
+        route.abort()
+
+
 @contextmanager
-def persistent_browser(profile: Path, diagnostics: Path, *, headless: bool = False):
+def persistent_browser(
+    profile: Path, diagnostics: Path, *, headless: bool = False, read_only: bool = False,
+):
     """Use a dedicated profile; closing the persistent context closes Chromium."""
     context = None
     try:
@@ -80,10 +90,16 @@ def persistent_browser(profile: Path, diagnostics: Path, *, headless: bool = Fal
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(profile), headless=headless, accept_downloads=False,
+                **({'service_workers': 'block'} if read_only else {}),
             )
             try:
                 context.set_default_timeout(5000)
                 context.set_default_navigation_timeout(30000)
+                if read_only:
+                    # Routing also disables the HTTP cache; fresh locators on a
+                    # newly navigated page must read server-loaded editor data.
+                    context.route('**/*', allow_read_only_request)
+                    context.route_web_socket('**/*', lambda socket: socket.close())
                 yield context
             except (PlaywrightError, OSError):
                 raise browser_failure(context, diagnostics) from None

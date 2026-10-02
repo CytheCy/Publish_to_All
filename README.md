@@ -556,6 +556,24 @@ content. It verifies the visible subtitle and a fresh `Saving` to `Saved`
 transition while preserving the title, body, and draft URL. `substack-body`
 performs this step first for stories with a Description.
 
+If subtitle insertion failed, inspect and reconcile it without a remote edit:
+
+```bash
+publish-to-all substack-subtitle-reconcile \
+  --story-hash "EXACT-CURRENT-STORY-HASH" --cycle-id 2 \
+  --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/123456"
+```
+
+This requires exclusive ownership by the exact active cycle, untouched body and
+image stages, and no publication attempt. It opens only that draft, blocks write
+requests, verifies the exact title and empty unpublished body, and reads the live
+subtitle twice. An exact Description match resolves to `subtitle_inserted`; a
+clearly empty field resets to `subtitle_not_started`, permitting one later guarded
+insertion. A different nonempty value, inaccessible field, or rate limit leaves
+the failed state blocked. The command never retries subtitle insertion or starts
+the body. It reports SQLite checksums; only successful local reconciliation may
+change the database. Existing attempt timestamps and other cycles are preserved.
+
 ```bash
 publish-to-all substack-body
 ```

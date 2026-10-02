@@ -6,7 +6,7 @@ import sys
 
 from .application import (
     add_substack_body, add_substack_image, add_substack_subtitle, inspect_project, inspect_status,
-    inspect_substack_subtitle,
+    inspect_substack_subtitle, reconcile_substack_subtitle,
     inspect_substack_draft, inspect_substack_publish, inspect_substack_social_preview,
     observe_substack_image,
     prepare_substack_draft, repair_substack_title,
@@ -77,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Read the linked draft's semantic subtitle control without changing it.",
     )
     command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
+    command = commands.add_parser(
+        'substack-subtitle-reconcile',
+        help='Inspect a failed subtitle without remote writes and reconcile only local subtitle state.',
+    )
+    command.add_argument('--story-hash', required=True)
+    command.add_argument('--cycle-id', required=True, type=int)
+    command.add_argument('--draft-url', required=True)
     commands.add_parser(
         "substack-image",
         help="Upload the story's Social Preview image to the populated linked draft; never publish.",
@@ -217,6 +224,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "substack-subtitle":
             print(format_substack_subtitle(add_substack_subtitle(Path("."))))
+            return 0
+        if args.command == 'substack-subtitle-reconcile':
+            result = reconcile_substack_subtitle(
+                Path('.'), story_hash=args.story_hash, cycle_id=args.cycle_id, draft_url=args.draft_url,
+            )
+            print(
+                f'Remote subtitle classification: {result.evidence.classification.value}\n'
+                f'Remote subtitle value: {result.evidence.value!r}\n'
+                f'Reason: {result.evidence.reason}\n'
+                f'Local subtitle state before: {result.previous.subtitle_status.value}\n'
+                f'Local subtitle state after: {result.substack.subtitle_status.value}\n'
+                f'Reconciliation required: {result.substack.needs_reconciliation}\n'
+                f'Body state: {result.substack.body_status.value}\n'
+                f'Image state: {result.substack.image_status.value}\n'
+                f'Draft unpublished verified: {result.evidence.unpublished_verified}\n'
+                f'Rate limiting: {result.evidence.rate_limited}\n'
+                f'SQLite SHA-256 before: {result.database_sha256_before}\n'
+                f'SQLite SHA-256 after: {result.database_sha256_after}\n'
+                'Remote changes made: No\nSubtitle retried: No\n'
+                'Body insertion attempted: No\nNothing published: Yes'
+            )
             return 0
         if args.command == "substack-subtitle-inspect":
             diagnostic = inspect_substack_subtitle(Path("."), args.draft_url)

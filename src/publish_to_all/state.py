@@ -1389,6 +1389,87 @@ class PublicationRepository:
                 'SELECT * FROM publications WHERE id = ?', (current.id,)
             ).fetchone())
 
+    @classmethod
+    def _subtitle_reconciliation_candidate(
+        cls, connection, source_hash: str, cycle_id: int, draft_url: str,
+    ) -> PublicationRecord:
+        record = cls._select_active_cycle(connection, source_hash, 'substack', required=True)
+        if (record is None or record.cycle_id != cycle_id
+                or record.draft_url != draft_url or not _is_numeric_draft_url(draft_url)
+                or record.status != PublicationStatus.DRAFT_CREATED):
+            raise StateError('Subtitle reconciliation ownership does not match. Local state unchanged.')
+        draft_id = urlsplit(draft_url).path.rstrip('/').split('/')[-1]
+        owners = connection.execute(
+            'SELECT id, draft_url FROM publications WHERE draft_url IS NOT NULL'
+        ).fetchall()
+        if [row['id'] for row in owners
+                if urlsplit(row['draft_url']).path.rstrip('/').split('/')[-1] == draft_id] != [record.id]:
+            raise StateError('The numeric draft ID is not exclusively owned. Local state unchanged.')
+        cycle_rows = connection.execute(
+            'SELECT * FROM publications WHERE cycle_id = ?', (cycle_id,),
+        ).fetchall()
+        for row in cycle_rows:
+            candidate = cls._record(row)
+            if (candidate.published_url or candidate.final_click_attempted
+                    or candidate.final_click_attempt_count or candidate.final_click_attempted_at
+                    or candidate.publication_verification_status != 'not_started'
+                    or candidate.publication_verification_evidence or candidate.publication_ambiguity_reason
+                    or candidate.publication_state != PublicationState.STANDARD
+                    or candidate.retry_authorized or candidate.retry_authorized_at
+                    or candidate.retry_authorization_count
+                    or candidate.status in {PublicationStatus.PUBLISHING, PublicationStatus.PUBLISHED}):
+                raise StateError('The cycle has publication activity. Local state unchanged.')
+        if connection.execute(
+            '''SELECT 1 FROM publication_audit_events WHERE publication_id IN
+               (SELECT id FROM publications WHERE cycle_id = ?) LIMIT 1''', (cycle_id,),
+        ).fetchone():
+            raise StateError('The cycle has publication audit history. Local state unchanged.')
+        if (record.body_status != BodyStatus.NOT_STARTED or record.body_started_at
+                or record.body_inserted_at or record.body_error_message
+                or record.image_status != ImageStatus.NOT_STARTED or record.image_started_at
+                or record.image_uploaded_at or record.image_error_message or record.error_message):
+            raise StateError('The draft has body, image, or other unresolved activity. Local state unchanged.')
+        if (record.subtitle_status != SubtitleStatus.FAILED
+                or not record.needs_reconciliation or not record.subtitle_error_message):
+            raise StateError('The subtitle is not a failed reconciliation candidate. Local state unchanged.')
+        return record
+
+    def require_subtitle_reconciliation_candidate(
+        self, source_hash: str, cycle_id: int, draft_url: str,
+    ) -> PublicationRecord:
+        with self._connection() as connection:
+            return self._subtitle_reconciliation_candidate(connection, source_hash, cycle_id, draft_url)
+
+    def reconcile_subtitle(
+        self, expected: PublicationRecord, source_hash: str, *, remote_value: str, description: str,
+    ) -> PublicationRecord:
+        """Resolve only a failed subtitle; an empty result permits one later attempt.
+
+        The later insertion atomically consumes NOT_STARTED before its remote
+        write. Preserve the original attempt timestamps and every other stage.
+        """
+        if (not isinstance(remote_value, str) or not isinstance(description, str)
+                or not description.strip() or (remote_value.strip() and remote_value != description)):
+            raise StateError('Subtitle evidence is ambiguous. Local state unchanged.')
+        with self._connection(write=True) as connection:
+            current = self._subtitle_reconciliation_candidate(
+                connection, source_hash, expected.cycle_id, expected.draft_url,
+            )
+            if current != expected:
+                raise StateError('Subtitle reconciliation evidence is stale. Local state unchanged.')
+            exact = remote_value == description
+            now = _now()
+            connection.execute(
+                '''UPDATE publications SET subtitle_status = ?, subtitle_inserted_at = ?,
+                   subtitle_error_message = NULL, needs_reconciliation = 0, updated_at = ?
+                   WHERE id = ?''',
+                (SubtitleStatus.INSERTED if exact else SubtitleStatus.NOT_STARTED,
+                 now if exact else None, now, current.id),
+            )
+            return self._record(connection.execute(
+                'SELECT * FROM publications WHERE id = ?', (current.id,),
+            ).fetchone())
+
     def require_title_repair_candidate(
         self, source_hash: str, destination: str,
     ) -> PublicationRecord:

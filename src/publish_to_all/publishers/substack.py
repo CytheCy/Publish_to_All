@@ -13,7 +13,7 @@ from ..browser import image_observe as social_preview_image
 from ..browser.session import safe_screenshot
 from ..browser.substack import collect_diagnostics
 from ..errors import BrowserSessionError, PublishToAllError, SubstackRateLimitError
-from ..state import StateError
+from ..state import StateError, SubtitleStatus
 from .base import Publisher
 
 
@@ -264,6 +264,8 @@ class SubstackSubtitlePublisher(Publisher):
                 'The existing subtitle differs from Description; automatic overwrite was refused.\n\nNothing was published.'
             )
         if current == description:
+            if record.subtitle_status == SubtitleStatus.INSERTED:
+                return record
             return self.repository.mark_subtitle_matched(record)
 
         self.monitor.require_clear(self.page)
