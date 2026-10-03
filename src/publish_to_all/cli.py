@@ -7,7 +7,8 @@ import sys
 from .application import (
     add_substack_body, add_substack_image, add_substack_subtitle, inspect_project, inspect_status,
     inspect_substack_subtitle, reconcile_substack_subtitle,
-    inspect_substack_draft, inspect_substack_publish, inspect_substack_social_preview,
+    inspect_substack_draft, inspect_substack_body_formatting,
+    inspect_substack_publish, inspect_substack_social_preview,
     observe_substack_image,
     prepare_substack_draft, repair_substack_title,
     reassociate_substack_version, reconcile_substack, reconcile_substack_image,
@@ -67,6 +68,15 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser(
         "substack-body",
         help="Insert the story body into the already-linked Substack draft; never publish.",
+    )
+    command = commands.add_parser(
+        'substack-body-spacing-repair',
+        help='Remove only the 36 verified cycle-2 separator blanks; never reinsert or publish.',
+    )
+    command.add_argument('--dry-run', action='store_true', help='Inspect with no remote or SQLite writes.')
+    commands.add_parser(
+        'substack-body-spacing-reconcile',
+        help='Read cycle-2 spacing twice with remote writes blocked; reconcile only local uncertainty.',
     )
     commands.add_parser(
         "substack-subtitle",
@@ -132,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
         "substack-inspect-draft", help="Inspect one supplied Substack draft editor without changing it.",
     )
     command.add_argument("--draft-url", required=True, help="Numeric Substack draft editor URL to inspect.")
+    command.add_argument(
+        "--body-formatting", action="store_true",
+        help="Compare meaningful body blocks read-only, without opening image settings or SQLite.",
+    )
     command = commands.add_parser(
         "substack-social-preview-inspect",
         help="Navigate to one draft's Social Preview editor without changing it.",
@@ -209,7 +223,8 @@ def main(argv: list[str] | None = None) -> int:
                   + "\nNo publication action was performed. Nothing was published.")
             return 0
         if args.command == "substack-inspect-draft":
-            print(inspect_substack_draft(Path("."), args.draft_url))
+            inspect = inspect_substack_body_formatting if args.body_formatting else inspect_substack_draft
+            print(inspect(Path("."), args.draft_url))
             return 0
         if args.command == "substack-social-preview-inspect":
             print(format_social_preview_inspection(
@@ -221,6 +236,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "substack-body":
             print(format_substack_body(add_substack_body(Path("."))))
+            return 0
+        if args.command == 'substack-body-spacing-repair':
+            from .spacing_repair import repair_body_spacing
+            print(repair_body_spacing(Path('.'), dry_run=args.dry_run))
+            return 0
+        if args.command == 'substack-body-spacing-reconcile':
+            from .spacing_reconcile import reconcile_body_spacing
+            print(reconcile_body_spacing(Path('.')))
             return 0
         if args.command == "substack-subtitle":
             print(format_substack_subtitle(add_substack_subtitle(Path("."))))

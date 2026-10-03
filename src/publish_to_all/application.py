@@ -1251,6 +1251,65 @@ def repair_substack_title(root: Path) -> StoryStatus:
     return StoryStatus(story, updated)
 
 
+def inspect_substack_body_formatting(root: Path, draft_url: str) -> str:
+    """Compare body blocks with production HTML; no database or remote writes."""
+    from .browser.body import RateLimitMonitor, locate_body_surface, prepare_story_body
+    from .browser.body_inspect import format_body_formatting, inspect_body_formatting
+    from .browser.reconcile import (
+        validate_supplied_draft_url, verified_not_published_evidence, verify_supplied_draft,
+    )
+    from .browser.subtitle import inspect_subtitle
+
+    project = inspect_project(root)
+    publication_url = project.config.require_substack()
+    supplied_url = validate_supplied_draft_url(draft_url, publication_url)
+    paths = runtime_paths(root)
+    if not paths.substack_browser_profile.is_dir():
+        raise BrowserSessionError('No saved Substack session. Local SQLite state unchanged.')
+    before = sha256(paths.database.read_bytes()).hexdigest() if paths.database.exists() else None
+    try:
+        with persistent_browser(
+            paths.substack_browser_profile, paths.diagnostics, headless=False, read_only=True,
+        ) as context:
+            page = context.new_page()
+            monitor = RateLimitMonitor(publication_url)
+            page.on('response', monitor.observe)
+            evidence = verify_supplied_draft(
+                page, publication_url, supplied_url, rate_limit_monitor=monitor,
+            )
+            monitor.require_clear(page)
+            if (not evidence.verified or evidence.inspection is None
+                    or verified_not_published_evidence(evidence.inspection, supplied_url) is None
+                    or evidence.inspection.visible_title != project.story.metadata.title):
+                raise BrowserSessionError(
+                    'FORMATTING STATE UNKNOWN: exact saved unpublished draft could not be verified.',
+                )
+            _, subtitle = inspect_subtitle(page)
+            expected_subtitle = project.story.metadata.description or project.story.metadata.subtitle
+            if expected_subtitle is not None and subtitle != expected_subtitle:
+                raise BrowserSessionError('FORMATTING STATE UNKNOWN: subtitle does not match.')
+            surface = locate_body_surface(page)
+            prepared = prepare_story_body(project.story)
+            report = inspect_body_formatting(surface, prepared)
+            # A changing body is uncertainty, never a reason to update lifecycle.
+            if report != inspect_body_formatting(surface, prepared):
+                raise BrowserSessionError('FORMATTING STATE UNKNOWN: body changed during inspection.')
+            monitor.require_clear(page)
+    finally:
+        after = sha256(paths.database.read_bytes()).hexdigest() if paths.database.exists() else None
+        if before != after:
+            raise BrowserSessionError('SQLite changed during read-only formatting inspection; task failed.')
+    return '\n'.join([
+        format_body_formatting(report),
+        'Title preserved: Yes',
+        'Subtitle matches: ' + ('Yes' if expected_subtitle is not None else 'No canonical value supplied'),
+        'Editor Saved: Yes', 'Draft unpublished: Yes',
+        f'SQLite checksum before: {before}', f'SQLite checksum after: {after}',
+        'SQLite unchanged: Yes', 'Remote changes made: No',
+        'Body insertion attempts during this task: 0', 'Nothing published: Yes',
+    ])
+
+
 def inspect_substack_draft(root: Path, draft_url: str) -> str:
     """Inspect one explicitly supplied editor URL without reading or writing SQLite."""
     from playwright.sync_api import Error as PlaywrightError

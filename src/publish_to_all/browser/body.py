@@ -128,10 +128,26 @@ class RateLimitMonitor:
             raise SubstackRateLimitError('Substack rate limit encountered during body insertion or save confirmation.')
 
 
-_INSERT_HTML = """
+_INSERT_HTML = r"""
 (element, content) => {
   if (!element.isContentEditable) throw new Error('body is not contenteditable');
   if (element.innerText.trim().length !== 0) throw new Error('body changed before insertion');
+  // CommonMark serializes block boundaries with newlines. In an editor using
+  // pre-wrap/break-spaces, Chromium insertHTML turns those text nodes into
+  // visible paragraphs. Remove only serialization whitespace in block-only
+  // containers; retain inline spaces, BRs, explicit empty blocks and code.
+  const fragment = document.createElement('div');
+  fragment.innerHTML = content.html;
+  const block = 'p,h1,h2,h3,h4,h5,h6,blockquote,ul,ol,li,pre,hr';
+  for (const parent of [fragment, ...fragment.querySelectorAll('blockquote,ul,ol,li')]) {
+    if (parent.closest('pre,code')) continue;
+    for (const node of [...parent.childNodes]) {
+      const boundary = n => !n || (n.nodeType === 1 && n.matches(block));
+      if (node.nodeType === 3 && /^[\t\r\n ]+$/.test(node.nodeValue)
+          && node.nodeValue.includes('\n')
+          && boundary(node.previousSibling) && boundary(node.nextSibling)) node.remove();
+    }
+  }
   element.focus();
   const selection = window.getSelection();
   const range = document.createRange();
@@ -139,7 +155,7 @@ _INSERT_HTML = """
   range.collapse(true);
   selection.removeAllRanges();
   selection.addRange(range);
-  const inserted = document.execCommand('insertHTML', false, content.html);
+  const inserted = document.execCommand('insertHTML', false, fragment.innerHTML);
   if (!inserted) throw new Error('formatted insertion was rejected');
   element.dispatchEvent(new InputEvent('input', {
     bubbles: true, inputType: 'insertFromPaste', data: content.text

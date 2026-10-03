@@ -593,6 +593,12 @@ is inserted as rendered HTML, preserving paragraphs, headings, bold, italics,
 block quotes, lists, horizontal rules, and links. The source Markdown is not
 changed.
 
+Before `insertHTML`, the insertion payload removes CommonMark serialization
+newlines between block elements. Chromium otherwise turns each newline into a
+visible empty paragraph in editors using `white-space: pre-wrap` or `break-spaces`.
+Inline whitespace, intentional hard breaks, explicit empty blocks, and code
+spacing remain intact. Local Chromium regression fixtures cover this behavior.
+
 After the one-shot insertion, the command waits on the same page for an exact
 rendered-body check and a fresh `Saving` to `Saved` transition or equivalent
 fresh saved state. It does not reload, reopen the editor, navigate away, retry,
@@ -605,6 +611,54 @@ immediately without navigation or retry. If insertion has begun, the draft may
 contain some or all of the story; local state is marked conservatively to block
 another automatic insertion. Use `substack-inspect-draft` with the retained URL
 to inspect an uncertain result before any recovery.
+
+### Repair the confirmed cycle-2 separator blanks
+
+This dedicated operation is pinned to cycle 2, draft `218388044`, and the exact
+verified story hash/title/subtitle. It accepts only 36 matching meaningful blocks
+(18 headings and 18 paragraphs), each followed by the confirmed top-level
+`<p><br><br class="ProseMirror-trailingBreak"></p>` signature. Any different
+content, lifecycle, ownership, save state, rate limit, or blank structure stops it.
+
+```bash
+.venv/bin/publish-to-all substack-body-spacing-repair --dry-run
+.venv/bin/publish-to-all substack-body-spacing-repair
+```
+
+The dry run blocks remote writes, opens SQLite in read-only mode, checks its
+before/after SHA-256, and records a local certificate under the runtime state
+directory. The live command requires that unchanged certificate and permits one
+attempt, recorded in a separate runtime audit file. It removes only the approved
+nodes without selecting or rewriting the article. A reconciliation guard is
+committed before deletion; it clears only after a fresh Saving → Saved transition
+and a server-loaded read-only verification of exact meaningful HTML/text and
+metadata. Uncertainty blocks retries. No schema migration is needed, and body
+insertion timestamps, all stage states, publication fields, and cycle 1 stay intact.
+
+To resolve this single repair's uncertain save without another edit:
+
+```bash
+.venv/bin/publish-to-all substack-body-spacing-reconcile
+```
+
+The command requires the exact uncertain cycle-2 state and one prior repair
+attempt. It loads the linked draft on two separate pages in a fresh context with
+only saved login cookies, remote writes and WebSockets blocked, service workers
+disabled, and no cached editor or origin storage. The existing semantic inspector
+must verify all 36 meaningful blocks, 18 headings, and 18 story paragraphs on both
+reads, with the exact title/subtitle and an unpublished draft. Matching zero-blank
+reads mean `SPACING REPAIR PERSISTED`; matching reads with the original 36 safe
+blank signatures mean `SPACING REPAIR DID NOT PERSIST`. Any discrepancy or rate
+limit means `SPACING REPAIR STATE UNKNOWN`, leaving local recovery state untouched.
+Loaded body content determines persistence; `Saved` alone is not evidence.
+
+Only a conclusive classification clears the local reconciliation flag and spacing
+uncertainty. A defect that did not persist is recorded as still present, with any
+future repair requiring explicit authorization. No retry is performed or enabled.
+The command preserves all lifecycle states, timestamps, original attempt records,
+and cycle 1, reports SQLite SHA-256 before/after inspection and reconciliation, and
+writes a separate local reconciliation receipt. It never focuses or edits the
+body, starts image work, or publishes.
 
 ## Upload the article Social Preview image
 
@@ -839,6 +893,30 @@ URL/title diagnostics. Run it once for each draft you want to compare. It clicks
 only the settings controls needed to inspect Social Preview state; it does not
 type, save, upload, reload, or access SQLite. HTTP 429 and rendered
 `Too many requests` evidence stop inspection immediately without retrying.
+
+To inspect only body formatting, add `--body-formatting`:
+
+```bash
+publish-to-all substack-inspect-draft --draft-url "https://YOUR-PUBLICATION.substack.com/publish/post/123456" --body-formatting
+```
+
+This mode compares meaningful content blocks against the exact production-rendered
+body HTML, excluding front matter. It reports heading levels, paragraph alignment,
+repeated text hashes, visible blanks, caret helpers, hidden paragraphs, and line-break
+differences. Raw paragraph counts are diagnostic only. Consecutive remote paragraphs
+that together match one prepared paragraph are reported as splitting; extra visible
+empty paragraphs remain spacing defects even when the complete text matches.
+Unsupported content is reported as unknown. The comparison covers block structure
+and line spacing, not typography or every inline mark/link attribute.
+
+The formatting inspector opens only the supplied editor, requires the canonical
+title/subtitle and a saved unpublished draft, and never clicks controls or changes
+content. Its browser session blocks write requests, service workers, and WebSockets.
+It hashes an existing SQLite file before and after without opening a database
+connection, applying migrations, or changing lifecycle state. It fails if the hash
+changes. The normal body insertion and save-confirmation workflow is unchanged.
+The formatting tests use local HTML fixtures in headless Chromium (install with
+`python -m playwright install chromium`); they never contact Substack.
 
 From the project directory, with the virtual environment active, run:
 
