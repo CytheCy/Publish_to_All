@@ -155,6 +155,33 @@ split a word. Counts are approximate for prose.
 
 ## Publication status and runtime storage
 
+To resolve an ambiguous final publication click without publishing again, run:
+
+```bash
+.venv/bin/publish-to-all substack-publish-reconcile
+```
+
+This command requires exactly one audited final click, ambiguous verification,
+and no retry authorization. It reads the public archive and makes two fresh
+anonymous GETs for a matching public post. Both reads must establish the exact
+draft/post ID, trusted canonical URL, title, subtitle, complete normalized story
+body, and a publication timestamp within five minutes after the recorded click.
+Retired cycle IDs and public URLs are excluded. Matching titles alone, HTTP 200,
+an absent modal, and an editable editor cannot establish publication status.
+
+The saved-session editor and published-post dashboard provide supporting evidence
+with writes and sockets blocked. A 429 or rate-limit page stops verification and
+leaves publication state unchanged. Multiple candidates, inaccessible or conflicting
+evidence, and missing public proof also leave the outcome unknown. The command
+never infers non-publication from absence and never authorizes a retry.
+
+Only verified public evidence updates the existing local record to `published`
+and verification to `verified`, stores the public URL, and clears reconciliation.
+It preserves click history and creates no publication action. SQLite SHA-256 is
+checked before reads, after reads, and under the local write transaction before
+updating. A separate private diagnostic receipt records evidence and all three
+checksums. No schema migration runs. Unknown outcomes leave SQLite unchanged.
+
 ```bash
 publish-to-all status
 ```
@@ -814,6 +841,21 @@ pinning and pre-click revalidation, then stop before the click, run:
 ```bash
 publish-to-all substack-publish --dry-run
 ```
+
+Both publication modes install the same context-wide network observer and mutation
+guard before authentication. The existing narrow endpoint classifications apply
+through draft verification, Continue, final configuration, candidate discovery,
+and complete pre-click revalidation. Unknown mutations abort the run; known
+telemetry and referral initialization remain blocked under their existing rules.
+Service workers and WebSockets cannot bypass the routed publication checks.
+
+Real execution records durable click intent before arming the irreversible
+boundary and invoking one native Playwright click. Arming changes the existing
+guard to observation; it never removes the route or response observer. Post-click
+network evidence remains available during publication verification. Ambiguous
+verification, click exceptions, or post-boundary rate limiting require
+reconciliation and never trigger another click. Dry runs never arm that boundary
+or write click intent, and keep strict blocking through browser shutdown.
 
 This mode uses the production executor's candidate discovery, allowlist, and
 pre-click checks. It keeps the read-only network guard installed, opens the

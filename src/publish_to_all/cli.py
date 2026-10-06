@@ -126,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="Run the authenticated path through final-action revalidation, then stop before clicking.",
     )
+    commands.add_parser(
+        'substack-publish-reconcile',
+        help='Read public evidence for one ambiguous final click; never publish or authorize retries.',
+    )
     command = commands.add_parser(
         "substack-image-reconcile",
         help="Reconcile one uncertain Social Preview image upload; never upload or publish.",
@@ -187,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--debug", action="store_true", help="Show redacted session diagnostics for any result.")
     args = parser.parse_args(argv)
     try:
+        if args.command == 'substack-publish-reconcile':
+            import json
+            from .publication_reconcile import reconcile_publication
+            print(json.dumps(reconcile_publication(Path('.')), indent=2))
+            return 0
         if args.command == "substack-forget-deleted-draft":
             result = forget_deleted_substack_draft(Path("."), args.story_hash)
             print(format_deleted_draft_cleanup(result))
@@ -305,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "substack-publish":
             result = publish_substack(Path("."), dry_run=args.dry_run)
             print(format_substack_publish_execution(result))
-            return 0 if result.status.value == 'published' else 1
+            return 0 if result.status.value in {'published', 'dry_run_verified'} else 1
         if args.command == "substack-image-reconcile":
             print(format_substack_image_reconciliation(
                 reconcile_substack_image(Path("."), args.story_hash)

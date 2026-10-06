@@ -890,3 +890,89 @@ def test_rate_limit_stops_before_social_preview_or_continue(tmp_path, monkeypatc
     assert paths.database.read_bytes() == before
     social.assert_not_called()
     final.assert_not_called()
+
+
+def test_request_identity_survives_wrapper_collection_and_cannot_inherit_suppression():
+    import gc
+    import weakref
+
+    class Request:
+        method = 'POST'
+        url = 'https://cyporter.substack.com/api/v1/firehose/batch'
+        resource_type = 'ping'
+        redirected_from = None
+        initiator = None
+
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL)
+    observer.set_stage('AUTHENTICATION')
+    telemetry = Request()
+    retained = weakref.ref(telemetry)
+    observer.observe(telemetry)
+    del telemetry
+    gc.collect()
+    assert retained() is not None
+
+    unknown = request('POST', URL + '/api/v1/session/ping', 'fetch')
+    observer.observe(unknown)
+    assert not observer.was_suppressed(unknown)
+    assert observer.first_diagnostic.path == '/api/v1/session/ping'
+    with pytest.raises(BrowserSessionError, match='/api/v1/session/ping'):
+        observer.require_clear()
+
+
+@pytest.mark.parametrize('url, expected', [
+    ('https://cyporter.substack.com/api/v1/firehose/batch', 'EXPECTED NON-PUBLISHING'),
+    ('https://o350427.ingest.sentry.io/api/4504244653457408/envelope/', 'EXPECTED NON-PUBLISHING'),
+    ('https://example.substack.com/api/v1/posts/123', 'PUBLICATION-LIKE'),
+    ('https://example.substack.com/api/v1/send/123', 'PUBLICATION-LIKE'),
+    ('https://example.substack.com/api/v1/schedule/123', 'PUBLICATION-LIKE'),
+    ('https://example.substack.com/api/v1/session/ping', 'UNKNOWN'),
+    ('https://example.substack.com/api/graphql', 'UNKNOWN'),
+])
+def test_diagnostic_classification_never_changes_guard_decision(url, expected):
+    emitted = []
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL, diagnostic_sink=emitted.append)
+    guard = publish_inspect.MutationGuard([], observer.diagnostics, observer=observer)
+    guard.set_stage('PRE_CLICK_REVALIDATION')
+    route = SimpleNamespace(request=request('POST', url, 'xhr'),
+                            abort=MagicMock(), continue_=MagicMock())
+    guard.handle(route)
+    assert emitted[0]['classification'] == expected
+    assert emitted[0]['relative_to_continue'] == 'DURING_OR_AFTER'
+    assert emitted[0]['disposition'] == 'BLOCKED'
+    route.abort.assert_called_once()
+    route.continue_.assert_not_called()
+    # Diagnostic recognition alone cannot expand the resource-type allowlist.
+    with pytest.raises(BrowserSessionError):
+        guard.require_clear()
+
+
+def test_immediate_request_diagnostic_excludes_credentials_queries_and_private_data():
+    import json
+
+    class PrivateRequest:
+        method = 'POST'
+        url = 'https://user:password@example.substack.com/api/session/token/opaque-secret?token=query-secret#fragment-secret'
+        resource_type = 'fetch'
+        redirected_from = None
+        initiator = None
+
+        @property
+        def headers(self):
+            raise AssertionError('Headers must not be read')
+
+        @property
+        def post_data(self):
+            raise AssertionError('Body must not be read')
+
+    emitted = []
+    observer = publish_inspect.WriteLikeNetworkObserver([], URL, diagnostic_sink=emitted.append)
+    observer.set_stage('AUTHENTICATION')
+    observer.observe(PrivateRequest())
+    item = emitted[0]
+    assert item['origin'] == 'https://example.substack.com'
+    assert item['path'] == '/api/session/token/[redacted]'
+    assert item['relative_to_continue'] == 'BEFORE'
+    rendered = json.dumps(item) + observer.first_diagnostic.format()
+    for secret in ('password', 'opaque-secret', 'query-secret', 'fragment-secret', 'user:'):
+        assert secret not in rendered

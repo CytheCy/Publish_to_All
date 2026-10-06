@@ -1,6 +1,6 @@
 """Guarded, single-attempt execution of a positively identified final action."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import re
 from time import monotonic
@@ -18,6 +18,7 @@ from .publish_validate import (
     publication_configuration_diff,
 )
 from .substack import trusted_page
+from ..errors import BrowserSessionError, SubstackRateLimitError
 from ..state import StateError
 
 
@@ -286,13 +287,18 @@ class PublishExecutionResult:
     write_like_network_methods: tuple[str, ...] = ()
     suppressed_telemetry: tuple[object, ...] = ()
     suppressed_editor_mutations: tuple[object, ...] = ()
+    remote_preflight: tuple[str, ...] = ()
+    final_screen: FinalScreenInspection | None = None
+    post_boundary_network: tuple[object, ...] = ()
+    boundary_events: tuple[str, ...] = ()
 
 
 class GuardedFinalPublishExecutor:
     """Perform at most one click on one pinned, fully revalidated DOM node."""
 
     def __init__(self, repository, page, publication_url: str, record, draft_url: str,
-                 inspect_screen, *, verifier=verify_publication):
+                 inspect_screen, *, mutation_guard, verifier=verify_publication,
+                 pre_click_check=None, post_click_check=None):
         self.repository = repository
         self.page = page
         self.publication_url = publication_url.rstrip('/')
@@ -300,8 +306,36 @@ class GuardedFinalPublishExecutor:
         self.draft_url = draft_url.rstrip('/')
         self.inspect_screen = inspect_screen
         self.verifier = verifier
+        self.pre_click_check = pre_click_check
+        self.post_click_check = post_click_check
+        self.mutation_guard = mutation_guard
         self._final_click_attempted = False
+        self._intent_write_started = False
+        self._pre_click_validated = False
+        self._final_action_armed = False
+        self._click_called = False
         self._dry_run = False
+        self.boundary_events: list[str] = []
+
+    def _arm_final_action(self) -> None:
+        """The sole irreversible boundary; no browser calls or cleanup here."""
+        if (self._dry_run or not self._pre_click_validated
+                or not self._final_click_attempted or self._final_action_armed):
+            raise BrowserSessionError('The final action cannot be armed before durable click intent.')
+        self.mutation_guard.arm_final_action(self.record)
+        self._final_action_armed = True
+        self.boundary_events.append('FINAL_ACTION_ARMED')
+
+    def _click_final_action(self, target) -> None:
+        if (not self._final_action_armed or self._dry_run or self._click_called
+                or self.mutation_guard.strict_blocking):
+            raise BrowserSessionError('Exactly one armed final action is required before clicking.')
+        self._click_called = True
+        self.boundary_events.append('PLAYWRIGHT_CLICK_CALLED')
+        target.element_handle.click()
+
+    def _network_evidence(self) -> tuple[str, ...]:
+        return tuple(item.format() for item in self.mutation_guard.observer.post_boundary_diagnostics)
 
     @property
     def final_click_attempted(self) -> bool:
@@ -395,8 +429,11 @@ class GuardedFinalPublishExecutor:
     def execute(self, preconditions: PublishPreconditions,
                 initial_screen: FinalScreenInspection, *, dry_run: bool = False) -> PublishExecutionResult:
         self._dry_run = dry_run
-        if self._final_click_attempted:
+        if self._intent_write_started:
             return self._blocked(('This execution already attempted the final click.',))
+        if not self.mutation_guard.strict_blocking or self.mutation_guard.observer is None:
+            return self._blocked(('An active strict mutation guard and observer are required.',))
+        self.mutation_guard.require_clear()
         failures = []
         if not preconditions.authenticated:
             failures.append('Authenticated Substack preflight did not succeed.')
@@ -438,6 +475,13 @@ class GuardedFinalPublishExecutor:
         if failures:
             return self._blocked(failures, current_validation, current_guard)
 
+        # Share the live reservation's complete eligibility check without any
+        # SQLite write. The live path still repeats it atomically when reserving.
+        try:
+            self.repository.require_final_click_eligible(self.record)
+        except StateError as exc:
+            return self._blocked((str(exc),), current_validation, current_guard)
+
         try:
             target = collect_final_action_target(self.page)
         except (PlaywrightError, AttributeError, TypeError, ValueError) as exc:
@@ -452,27 +496,42 @@ class GuardedFinalPublishExecutor:
             return self._blocked(('The draft URL changed immediately before the click.',),
                                  current_validation, current_guard)
 
+        # Pinning, content checks and rate-limit detection can dispatch browser
+        # events. Check the shared guard only AFTER all of those reads finish.
+        if self.pre_click_check is not None:
+            self.pre_click_check()
+        self.mutation_guard.require_clear()
+        self._pre_click_validated = True
+        self.boundary_events.append('PRE_CLICK_VALIDATED')
+
         if dry_run:
             return PublishExecutionResult(
                 ExecutionStatus.DRY_RUN_VERIFIED, False, (), current_validation, current_guard,
                 None, None, target.candidate, len(target.evidence.candidates), True, True,
             )
 
-        # This durable compare-and-set is the final operation before Playwright is invoked.
-        # If it fails, no browser mutation is attempted.
+        # Synchronous durable compare-and-set, then a synchronous in-memory
+        # boundary, then ONE native click. No browser reads, awaits or unroute
+        # calls can open an unguarded pre-click interval between these steps.
+        self._intent_write_started = True
         try:
             active = self.repository.mark_final_click_attempted(self.record)
         except StateError as exc:
             return self._blocked((str(exc),), current_validation, current_guard)
+        except (Exception, KeyboardInterrupt):
+            return self._blocked(('Durable click-intent persistence failed; no click was made.',),
+                                 current_validation, current_guard)
         self.record = active
         self._final_click_attempted = True
+        self.boundary_events.append('CLICK_INTENT_DURABLY_RECORDED')
         try:
-            target.element_handle.click()
+            self._arm_final_action()
+            self._click_final_action(target)
         except (Exception, KeyboardInterrupt):
             reason = ('The guarded final click raised an exception. A remote publication may have '
                       'occurred; no retry was attempted.')
             try:
-                failed = self.repository.mark_publication_uncertain(active, reason, ())
+                failed = self.repository.mark_publication_uncertain(active, reason, self._network_evidence())
             except StateError:
                 failed = active
                 reason += ' Local uncertainty persistence also failed; inspect SQLite before recovery.'
@@ -480,14 +539,30 @@ class GuardedFinalPublishExecutor:
                 ExecutionStatus.UNCERTAIN, True, (reason,), current_validation,
                 current_guard, None, failed,
             )
+        finally:
+            if self._final_action_armed:
+                self.mutation_guard.set_stage('POST_CLICK')
 
         try:
+            if self.post_click_check is not None:
+                self.post_click_check()
             verification = self.verifier(self.page, self.publication_url)
+            if self.post_click_check is not None:
+                self.post_click_check()
+        except SubstackRateLimitError:
+            verification = PublicationVerification(
+                VerificationStatus.AMBIGUOUS, None, (),
+                'Rate limiting appeared after the irreversible boundary; publication may have occurred. '
+                'Reconciliation is required; no retry was attempted.',
+            )
         except (Exception, KeyboardInterrupt):
             verification = PublicationVerification(
                 VerificationStatus.AMBIGUOUS, None, (),
                 'Post-click publication verification raised an exception.',
             )
+        verification = replace(
+            verification, evidence=verification.evidence + self._network_evidence(),
+        )
         if verification.status is VerificationStatus.PUBLISHED and verification.published_url:
             try:
                 published = self.repository.mark_publication_verified(

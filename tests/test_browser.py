@@ -166,6 +166,18 @@ def test_persistent_browser_headed_and_closed(tmp_path, mocked_browser):
     assert profile.stat().st_mode & 0o777 == 0o700
 
 
+def test_guarded_publication_prevents_service_worker_and_socket_bypasses(tmp_path, mocked_browser):
+    driver, context, _ = mocked_browser
+    with session.persistent_browser(tmp_path / 'profile', tmp_path / 'diagnostics',
+                                    guarded_publication=True):
+        assert driver.chromium.launch_persistent_context.call_args.kwargs['service_workers'] == 'block'
+        socket = MagicMock()
+        context.route_web_socket.call_args.args[1](socket)
+        socket.connect_to_server.assert_not_called()
+        # Publication installs the single shared mutation guard on the context.
+        context.route.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", ["navigation", "launch", "screenshot", "close"])
 def test_browser_errors_are_sanitized_and_cleanup(tmp_path, mocked_browser, failure):
     driver, context, page = mocked_browser
@@ -435,3 +447,38 @@ def test_navigation_with_rendered_dashboard_or_login(redirect, controls, expecte
     page.goto = MagicMock(side_effect=navigate)
     assert substack.verify_page(page, URL, timeout=0) == expected
     assert page.goto.call_count == 2
+
+
+def test_read_only_websocket_does_not_connect_or_deadlock(tmp_path):
+    # A subprocess timeout also catches a dispatcher deadlock, where Playwright's
+    # own timeouts cannot run. The only endpoint is an isolated localhost socket.
+    import subprocess
+    import sys
+    script = r'''
+from pathlib import Path
+import socket
+import sys
+from publish_to_all.browser.session import persistent_browser
+root = Path(sys.argv[1])
+with socket.socket() as listener:
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    listener.settimeout(0.1)
+    with persistent_browser(root / 'profile', root / 'diagnostics',
+                            headless=True, read_only=True) as context:
+        page = context.new_page()
+        page.evaluate("port => { window.testSocket = new WebSocket('ws://127.0.0.1:' + port); }",
+                      listener.getsockname()[1])
+        page.wait_for_function('window.testSocket.readyState === WebSocket.OPEN', timeout=3000)
+        page.evaluate("window.testSocket.send('isolated test')")
+        try:
+            connection, address = listener.accept()
+        except TimeoutError:
+            pass
+        else:
+            connection.close()
+            raise AssertionError('Read-only WebSocket reached the server')
+'''
+    completed = subprocess.run([sys.executable, '-c', script, str(tmp_path)],
+                               capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stderr

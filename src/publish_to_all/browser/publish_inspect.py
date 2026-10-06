@@ -1,6 +1,6 @@
 """Read the final Substack publication UI while making publication impossible."""
 
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass, field, replace as dataclass_replace
 import re
 from time import monotonic
 from urllib.parse import parse_qsl, urlsplit
@@ -20,13 +20,25 @@ CLOUDFLARE_RUM_PATH = '/cdn-cgi/rum'
 GOOGLE_REMARKETING_HOST = 'www.google.com'
 GOOGLE_REMARKETING_PATH = '/rmkt/collect/316245675/'
 GOOGLE_CCM_PATH = '/ccm/collect'
+CLOUDFLARE_CHALLENGE_ORIGIN = 'https://cyporter.substack.com'
+CLOUDFLARE_CHALLENGE_PREFIX = '/cdn-cgi/challenge-platform/'
+DOUBLECLICK_MEASUREMENT_ORIGIN = 'https://ad.doubleclick.net'
+DOUBLECLICK_MEASUREMENT_PATH = '/ccm/s/collect'
 WRITER_REFERRAL_HOST = 'cyporter.substack.com'
 WRITER_REFERRAL_PATH = '/api/v1/user/writer_referrals/code'
 SUPPRESSED_DRY_RUN_EDITOR_MUTATION = 'SUPPRESSED_DRY_RUN_EDITOR_MUTATION'
 WRITE_LIKE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 PRE_CLICK_STAGES = {
-    'DRAFT_EDITOR_LOAD', 'CONTINUE_NAVIGATION', 'PUBLISH_SCREEN_LOAD',
+    'AUTHENTICATION', 'DRAFT_EDITOR_LOAD', 'CONTINUE_NAVIGATION', 'PUBLISH_SCREEN_LOAD',
     'FINAL_ACTION_DISCOVERY', 'PRE_CLICK_REVALIDATION',
+}
+REQUEST_REPORT_STAGES = {
+    'AUTHENTICATION': 'AUTHENTICATION',
+    'DRAFT_EDITOR_LOAD': 'DRAFT_VERIFICATION',
+    'CONTINUE_NAVIGATION': 'CONTINUE_NAVIGATION',
+    'PUBLISH_SCREEN_LOAD': 'FINAL_CONFIGURATION',
+    'FINAL_ACTION_DISCOVERY': 'FINAL_CONFIGURATION',
+    'PRE_CLICK_REVALIDATION': 'PRE_CLICK',
 }
 
 
@@ -201,12 +213,31 @@ class FinalScreenInspection:
 
 @dataclass
 class MutationGuard:
-    """Abort all mutation transports after Continue is selected."""
+    """Block mutations until the executor commits a durable, single click intent.
+
+    Arming changes routing policy, never removes the route or response observer.
+    """
 
     blocked_methods: list[str]
     diagnostics: list['WriteLikeRequestDiagnostic'] = None
     stage: str = 'PRE_DRAFT_NAVIGATION'
     observer: object = None
+    _final_action_armed: bool = field(default=False, init=False)
+
+    @property
+    def strict_blocking(self) -> bool:
+        return not self._final_action_armed
+
+    def arm_final_action(self, click_intent) -> None:
+        if (self._final_action_armed or self.observer is None
+                or not click_intent.final_click_attempted
+                or click_intent.final_click_attempt_count < 1
+                or not click_intent.needs_reconciliation
+                or click_intent.publication_verification_status != 'pending'):
+            raise BrowserSessionError('A durable pending click intent is required to arm the final action.')
+        self.require_clear()
+        self._final_action_armed = True
+        self.set_stage('FINAL_ACTION_ARMED')
 
     def set_stage(self, stage: str) -> None:
         self.stage = stage
@@ -216,6 +247,10 @@ class MutationGuard:
     def handle(self, route) -> None:
         method = (route.request.method or '').upper()
         if method in WRITE_LIKE_METHODS:
+            if not self.strict_blocking:
+                self.observer.observe(route.request, blocking=False)
+                route.continue_()
+                return
             permitted = False
             if self.observer is not None:
                 permitted = self.observer.observe(route.request)
@@ -241,14 +276,16 @@ class MutationGuard:
             if self.diagnostics:
                 detail = f' {self.diagnostics[0].format()}'
             raise BrowserSessionError(
-                'Unexpected write-like network activity was blocked during the read-only '
-                f'publication inspection.{detail} No final action was clicked.'
+                'Unexpected write-like network activity was blocked during '
+                f'publication preflight.{detail} No final action was clicked.'
             )
+        if self.observer is not None:
+            self.observer.require_clear()
 
 
 @dataclass
 class WriteLikeNetworkObserver:
-    """Record redacted write-like metadata and suppress exact dry-run exceptions."""
+    """Share exact pre-click exceptions and retain post-boundary network evidence."""
 
     methods: list[str]
     publication_url: str | None = None
@@ -258,6 +295,10 @@ class WriteLikeNetworkObserver:
     stage: str = 'PRE_DRAFT_NAVIGATION'
     _requests: dict[int, 'WriteLikeRequestDiagnostic'] = None
     _suppressed_request_ids: set[int] = None
+    _request_refs: dict[int, object] = field(default_factory=dict, repr=False)
+    diagnostic_sink: object = field(default=None, repr=False)
+    post_boundary_diagnostics: list['WriteLikeRequestDiagnostic'] = field(default_factory=list)
+    _post_boundary_request_ids: set[int] = field(default_factory=set, repr=False)
 
     def __post_init__(self):
         if self.diagnostics is None:
@@ -271,11 +312,21 @@ class WriteLikeNetworkObserver:
         if self._suppressed_request_ids is None:
             self._suppressed_request_ids = set()
 
-    def observe(self, request) -> bool:
+    def observe(self, request, *, blocking: bool = True) -> bool:
         method = (getattr(request, 'method', '') or '').upper()
         if method not in WRITE_LIKE_METHODS:
             return False
+        # Playwright's temporary API wrappers can otherwise be collected and
+        # their Python IDs reused, losing diagnostics or inheriting suppression.
+        self._request_refs[id(request)] = request
         item = WriteLikeRequestDiagnostic.from_request(request, self.stage)
+        if not blocking:
+            if id(request) not in self._requests:
+                self._requests[id(request)] = item
+                self._post_boundary_request_ids.add(id(request))
+                self.post_boundary_diagnostics.append(item)
+                self._emit(item, None, blocking=False)
+            return False
         suppression = self._suppression_kind(item)
         if suppression is not None:
             self._requests[id(request)] = item
@@ -284,6 +335,7 @@ class WriteLikeNetworkObserver:
                 self.suppressed_telemetry.append(item)
             else:
                 self.suppressed_editor_mutations.append(item)
+            self._emit(item, suppression)
             return False
         if method not in self.methods:
             self.methods.append(method)
@@ -291,7 +343,17 @@ class WriteLikeNetworkObserver:
         if key not in self._requests:
             self._requests[key] = item
             self.diagnostics.append(item)
+        self._emit(item, None)
         return False
+
+    def _emit(self, item, suppression, *, blocking=True):
+        if self.diagnostic_sink is not None:
+            # Emit before the route callback returns, even if later browser
+            # work stalls or raises. Never pass the request object to the sink.
+            report = item.safe_report(suppression=suppression)
+            if not blocking:
+                report['disposition'] = 'OBSERVED_AFTER_IRREVERSIBLE_BOUNDARY'
+            self.diagnostic_sink(report)
 
     def _suppression_kind(self, item) -> str | None:
         if (
@@ -306,6 +368,11 @@ class WriteLikeNetworkObserver:
             return None
         if item.redirect_target is not None:
             return None
+        browser_endpoint = item._known_browser_endpoint()
+        if browser_endpoint is not None and item.resource_type == browser_endpoint[1]:
+            # Exempt only from the unexpected-mutation failure. The route is
+            # still aborted, just like every existing suppressed telemetry POST.
+            return 'telemetry'
         firehose = (
             item.host == FIREHOSE_HOST
             and item.path == FIREHOSE_PATH
@@ -342,6 +409,9 @@ class WriteLikeNetworkObserver:
             getattr(response, 'status', None), getattr(response, 'url', ''),
         )
         self._requests[id(request)] = updated
+        if id(request) in self._post_boundary_request_ids:
+            self.post_boundary_diagnostics[self.post_boundary_diagnostics.index(item)] = updated
+            return
         if id(request) in self._suppressed_request_ids:
             if updated.redirect_target is not None:
                 self._suppressed_request_ids.remove(id(request))
@@ -382,7 +452,7 @@ class WriteLikeNetworkObserver:
         if self.methods:
             detail = self.first_diagnostic.format() if self.first_diagnostic else 'Metadata unavailable.'
             raise BrowserSessionError(
-                'Unexpected write-like network activity occurred during dry-run. '
+                'Unexpected write-like network activity occurred during publication preflight. '
                 f'{detail} No final action was clicked.'
             )
 
@@ -399,6 +469,7 @@ class WriteLikeRequestDiagnostic:
     response_status: int | None = None
     redirect_target: str | None = None
     operation_name: str | None = None
+    origin: str = '[unknown]'
 
     @classmethod
     def from_request(cls, request, stage: str):
@@ -422,6 +493,7 @@ class WriteLikeRequestDiagnostic:
             initiator_type=initiator_type or '[unavailable]', timing_stage=stage,
             redirect_target=cls._safe_target(getattr(redirected_from, 'url', '')),
             operation_name=operation,
+            origin=f'{parsed.scheme}://{host}' if parsed.scheme in {'http', 'https'} else '[unknown]',
         )
 
     def with_response(self, status, response_url):
@@ -436,25 +508,70 @@ class WriteLikeRequestDiagnostic:
         if not raw_url:
             return None
         parsed = urlsplit(raw_url)
-        return f'{parsed.netloc or "[unknown]"}{parsed.path or "/"}'
+        return f'{_request_host(raw_url)}{_safe_endpoint_path(parsed.path or "/")}'
+
+    def _known_browser_endpoint(self) -> tuple[str, str] | None:
+        """Return the reason and observed transport for two verified endpoints."""
+        if self.http_method != 'POST' or self.redirect_target is not None:
+            return None
+        if (self.origin == CLOUDFLARE_CHALLENGE_ORIGIN
+                and self.path.startswith(CLOUDFLARE_CHALLENGE_PREFIX)):
+            return 'Known Cloudflare browser challenge verification', 'xhr'
+        if (self.origin == DOUBLECLICK_MEASUREMENT_ORIGIN
+                and self.path == DOUBLECLICK_MEASUREMENT_PATH):
+            return 'Known Google advertising measurement endpoint', 'fetch'
+        return None
+
+    def safe_report(self, *, suppression=None):
+        """Classification is diagnostic only; it never grants network access."""
+        telemetry_endpoints = {
+            (FIREHOSE_HOST, FIREHOSE_PATH), (SENTRY_HOST, SENTRY_PATH),
+            (CLOUDFLARE_RUM_HOST, CLOUDFLARE_RUM_PATH),
+            (GOOGLE_REMARKETING_HOST, GOOGLE_REMARKETING_PATH),
+            (GOOGLE_REMARKETING_HOST, GOOGLE_CCM_PATH),
+        }
+        browser_endpoint = self._known_browser_endpoint()
+        if browser_endpoint is not None:
+            classification, reason = 'EXPECTED NON-PUBLISHING', browser_endpoint[0]
+        elif self.http_method == 'POST' and (self.host, self.path) in telemetry_endpoints:
+            classification, reason = 'EXPECTED NON-PUBLISHING', 'Known telemetry endpoint'
+        elif (self.http_method == 'PUT'
+              and (self.host, self.path) == (WRITER_REFERRAL_HOST, WRITER_REFERRAL_PATH)):
+            classification, reason = 'EXPECTED NON-PUBLISHING', 'Known referral-code initialization'
+        elif re.search(r'(?:^|[/_-])(?:posts?|publish|send|schedule|commit)(?:[/_-]|$)',
+                       self.path, re.I):
+            classification, reason = 'PUBLICATION-LIKE', 'Publication or content mutation endpoint'
+        else:
+            classification, reason = 'UNKNOWN', 'Endpoint has no verified non-publishing classification'
+        if self.redirect_target is not None:
+            classification, reason = 'UNKNOWN', 'Redirected mutating request requires review'
+        return {
+            'method': self.http_method, 'origin': self.origin,
+            'path': _safe_endpoint_path(self.path), 'resource_type': self.resource_type,
+            'stage': REQUEST_REPORT_STAGES.get(self.timing_stage, self.timing_stage),
+            'stage_detail': self.timing_stage,
+            'relative_to_continue': 'BEFORE' if self.timing_stage in {
+                'PRE_DRAFT_NAVIGATION', 'AUTHENTICATION', 'DRAFT_EDITOR_LOAD',
+            } else 'DURING_OR_AFTER',
+            'classification': classification, 'reason': reason,
+            'disposition': 'BLOCKED', 'existing_suppression': suppression,
+        }
 
     def format(self) -> str:
         fields = [
             f'HTTP method: {self.http_method}', f'Host: {self.host}',
-            f'Path: {self.path}',
-            'Query parameter names: ' + (', '.join(self.query_parameter_names) or 'none'),
+            f'Path: {_safe_endpoint_path(self.path)}',
             f'Resource type: {self.resource_type}', f'Initiator type: {self.initiator_type}',
             f'Timing stage: {self.timing_stage}',
             f'Response status: {self.response_status if self.response_status is not None else "unavailable"}',
             f'Redirect target: {self.redirect_target or "none"}',
         ]
-        if self.operation_name:
-            fields.append(f'Safe operation name: {self.operation_name}')
+        fields.append(f'Classification: {self.safe_report()["classification"]}')
         return ' '.join(fields)
 
     def format_suppressed_telemetry(self) -> str:
         return '\n'.join([
-            'Suppressed telemetry:', f'{self.http_method} {self.host}{self.path}',
+            'Suppressed telemetry:', f'{self.http_method} {self.host}{_safe_endpoint_path(self.path)}',
             f'resource type: {self.resource_type}',
             f'stage: {self.timing_stage}',
             f'status: {self.response_status if self.response_status is not None else "unavailable"}',
@@ -462,11 +579,23 @@ class WriteLikeRequestDiagnostic:
 
     def format_suppressed_editor_mutation(self) -> str:
         return '\n'.join([
-            'Suppressed editor mutation:', f'{self.http_method} {self.host}{self.path}',
+            'Suppressed editor mutation:', f'{self.http_method} {self.host}{_safe_endpoint_path(self.path)}',
             f'stage: {self.timing_stage}',
             f'classification: {SUPPRESSED_DRY_RUN_EDITOR_MUTATION}',
             'reason: known referral-code initialization mutation',
         ])
+
+
+def _safe_endpoint_path(path: str) -> str:
+    """Keep endpoint names; redact credential/opaque/encoded path components."""
+    parts = path.split('/')
+    sensitive = {'token', 'access_token', 'refresh_token', 'secret', 'password', 'code'}
+    safe = []
+    for index, part in enumerate(parts):
+        credential = index > 0 and parts[index - 1].lower() in sensitive
+        recognizable = (not part or bool(re.fullmatch(r'[a-z][a-z_-]{0,31}|v[0-9]+|[0-9]{1,16}', part)))
+        safe.append(part if recognizable and not credential else '[redacted]')
+    return '/'.join(safe)
 
 
 def _request_host(publication_url: str) -> str:

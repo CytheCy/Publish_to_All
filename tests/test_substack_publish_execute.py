@@ -11,7 +11,7 @@ from publish_to_all.browser.publish_execute import (
 )
 from publish_to_all.browser.publish_inspect import (
     AttributeEvidence, FinalActionCandidate, FinalActionEvidence,
-    FinalScreenInspection, PublicationControl,
+    FinalScreenInspection, PublicationControl, WriteLikeNetworkObserver, install_mutation_guard,
 )
 from publish_to_all.state import BodyStatus, ImageStatus, PublicationRepository, PublicationStatus
 from publish_to_all.story import load_story
@@ -136,9 +136,12 @@ def make_executor(monkeypatch, tmp_path, *, screen=None, verifier=None):
     target = FinalActionTarget(initial.final_action_evidence,
                                initial.final_action_evidence.candidates[0], handle)
     monkeypatch.setattr(publish_execute, 'collect_final_action_target', lambda _page: target)
+    observer = WriteLikeNetworkObserver([], 'https://example.substack.com')
+    observer.set_stage('PRE_CLICK_REVALIDATION')
+    guard = install_mutation_guard(page, observer=observer)
     executor = GuardedFinalPublishExecutor(
         repository, page, 'https://example.substack.com', record, record.draft_url,
-        lambda: initial, verifier=verifier or (lambda *_: PublicationVerification(
+        lambda: initial, mutation_guard=guard, verifier=verifier or (lambda *_: PublicationVerification(
             VerificationStatus.PUBLISHED, 'https://example.substack.com/p/story',
             ('public_url=https://example.substack.com/p/story', 'explicit_status=Published'),
             None,
@@ -233,6 +236,45 @@ def test_dry_run_uses_same_pinned_candidate_path_without_click_or_state_change(
     handle.click.assert_not_called()
     assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == before[0]
     assert repository.path.read_bytes() == before[1]
+
+
+@pytest.mark.parametrize('unknown_post', [False, True])
+def test_browser_telemetry_never_authorizes_a_final_click_or_unknown_post(
+        monkeypatch, tmp_path, unknown_post):
+    from types import SimpleNamespace
+    from publish_to_all.browser.publish_inspect import MutationGuard, WriteLikeNetworkObserver
+    from publish_to_all.errors import BrowserSessionError
+
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    before = repository.path.read_bytes()
+    observer = WriteLikeNetworkObserver([], 'https://cyporter.substack.com')
+    guard = MutationGuard([], observer.diagnostics, observer=observer)
+    guard.set_stage('PRE_CLICK_REVALIDATION')
+    endpoints = [
+        ('https://cyporter.substack.com/cdn-cgi/challenge-platform/h/b', 'xhr'),
+        ('https://ad.doubleclick.net/ccm/s/collect', 'fetch'),
+    ]
+    if unknown_post:
+        endpoints.append(('https://cyporter.substack.com/api/v1/unknown', 'fetch'))
+    for url, resource_type in endpoints:
+        request = SimpleNamespace(method='POST', url=url, resource_type=resource_type,
+                                  redirected_from=None, initiator=None)
+        route = SimpleNamespace(request=request, abort=MagicMock(), continue_=MagicMock())
+        guard.handle(route)
+        route.abort.assert_called_once_with()
+        route.continue_.assert_not_called()
+    executor.pre_click_check = observer.require_clear
+    if unknown_post:
+        with pytest.raises(BrowserSessionError, match='UNKNOWN'):
+            executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+    else:
+        result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+        assert result.status is ExecutionStatus.DRY_RUN_VERIFIED
+        assert result.pre_click_revalidation_passed
+    assert not executor.final_click_attempted
+    handle.click.assert_not_called()
+    assert repository.path.read_bytes() == before
+    assert repository.get_publication(load_story(tmp_path / 'In').source_hash, 'substack') == record
 
 
 def test_retry_authorized_dry_run_is_eligible_without_consuming_authorization(
@@ -377,3 +419,42 @@ def test_uncertain_attempt_can_be_reconciled_only_to_positive_published_state(
     assert reconciled.status is PublicationStatus.PUBLISHED
     assert reconciled.final_click_attempted
     assert not reconciled.needs_reconciliation
+
+
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_preclick_sqlite_change_blocks_both_modes_without_reserving(monkeypatch, tmp_path, dry_run):
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    repository.mark_published(record.id, 'https://example.substack.com/p/already-published')
+    before = repository.path.read_bytes()
+    reserve = MagicMock(side_effect=AssertionError('must not reserve a click'))
+    monkeypatch.setattr(repository, 'mark_final_click_attempted', reserve)
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=dry_run)
+    assert result.status is ExecutionStatus.BLOCKED
+    assert repository.path.read_bytes() == before
+    reserve.assert_not_called()
+    handle.click.assert_not_called()
+
+
+def test_dry_run_read_only_repository_cannot_write_or_reserve(monkeypatch, tmp_path):
+    from publish_to_all.state import StateError
+    repository, record, page, handle, screen, executor = make_executor(monkeypatch, tmp_path)
+    readonly = PublicationRepository(repository.path, migrate=False, read_only=True)
+    executor.repository = readonly
+    before = repository.path.read_bytes()
+    result = executor.execute(PublishPreconditions(True, True, True), screen, dry_run=True)
+    assert result.status is ExecutionStatus.DRY_RUN_VERIFIED
+    with pytest.raises(StateError, match='read-only'):
+        readonly.mark_final_click_attempted(record)
+    assert repository.path.read_bytes() == before
+    handle.click.assert_not_called()
+
+
+def test_successful_dry_run_cli_returns_success(monkeypatch, capsys):
+    from publish_to_all import cli
+    from publish_to_all.browser.publish_execute import PublishExecutionResult
+    result = PublishExecutionResult(ExecutionStatus.DRY_RUN_VERIFIED, False, (), dry_run=True)
+    command = MagicMock(return_value=result)
+    monkeypatch.setattr(cli, 'publish_substack', command)
+    assert cli.main(['substack-publish', '--dry-run']) == 0
+    assert command.call_args.kwargs == {'dry_run': True}
+    assert 'FINAL ACTION VERIFIED' in capsys.readouterr().out

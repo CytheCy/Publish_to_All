@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from publish_to_all import application
-from publish_to_all.browser import image_observe, publish_inspect, publish_navigate, reconcile
+from publish_to_all.browser import image_observe, publish_inspect, publish_navigate, publish_preflight, reconcile
 from publish_to_all.browser.image_observe import SocialPreviewInspection, SocialPreviewState
 from publish_to_all.browser.reconcile import DraftInspection, SuppliedDraftEvidence
 from publish_to_all.browser.substack import AuthenticationState
@@ -66,7 +66,7 @@ def _prepared_project(root, monkeypatch):
 
     page = MagicMock()
     page.url = DRAFT_URL
-    context = SimpleNamespace(new_page=lambda: page)
+    context = SimpleNamespace(new_page=lambda: page, route=page.route, on=page.on)
 
     @contextmanager
     def browser(*_args, **_kwargs):
@@ -127,6 +127,7 @@ def test_dry_run_navigation_failure_after_authenticated_preflight_leaves_sqlite_
     monkeypatch.setattr(publish_inspect, 'install_mutation_guard', lambda *_args, **_kwargs: _MutationGuard())
     monkeypatch.setattr(publish_inspect, 'select_continue_control', lambda _page: object())
     monkeypatch.setattr(publish_navigate, 'close_preflight_dialogs', lambda *_args: None)
+    monkeypatch.setattr(publish_preflight, 'verify_prepared_content', lambda *_args: MagicMock())
 
     def navigation_failure(*_args, **_kwargs):
         raise BrowserSessionError('ambiguous Continue navigation')
@@ -143,3 +144,31 @@ def test_dry_run_navigation_failure_after_authenticated_preflight_leaves_sqlite_
     assert repository.get_publication(
         load_story(root / 'In').source_hash, 'substack',
     ) == record
+
+
+def test_authentication_failure_retains_immediate_safe_network_report(tmp_path, monkeypatch, capsys):
+    root = tmp_path / 'project'
+    _story, repository, record, page = _prepared_project(root, monkeypatch)
+    before = repository.path.read_bytes()
+
+    def authentication(*_args):
+        request = SimpleNamespace(
+            method='POST', url=PUBLICATION_URL + '/api/v1/session/ping?token=private-value',
+            resource_type='fetch', redirected_from=None, initiator=None,
+        )
+        route = SimpleNamespace(request=request, abort=MagicMock(), continue_=MagicMock())
+        page.route.call_args.args[1](route)
+        route.abort.assert_called_once()
+        route.continue_.assert_not_called()
+        return AuthenticationState.UNKNOWN
+
+    monkeypatch.setattr(application, 'verify_page', authentication)
+    with pytest.raises(BrowserSessionError, match='Authenticated Substack preflight'):
+        application.publish_substack(root, dry_run=True)
+    report = capsys.readouterr().out
+    assert '/api/v1/session/ping' in report
+    assert 'UNKNOWN' in report
+    assert 'BEFORE' in report
+    assert 'Authentication: unknown' in report
+    assert 'private-value' not in report
+    assert repository.path.read_bytes() == before

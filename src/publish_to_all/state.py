@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 import sqlite3
 from urllib.parse import urlsplit
@@ -314,8 +315,11 @@ class PublicationRepository:
     and attempt insertion across processes before any future remote side effect.
     """
 
-    def __init__(self, path: Path, *, migrate: bool = True):
+    def __init__(self, path: Path, *, migrate: bool = True, read_only: bool = False):
         self.path = path
+        self.read_only = read_only
+        if read_only and migrate:
+            raise StateError('A read-only repository cannot apply migrations.')
         if not migrate and not path.is_file():
             raise StateError('No publication database exists. Local state unchanged.')
         if not migrate:
@@ -372,7 +376,11 @@ class PublicationRepository:
     def _connection(self, *, write=False):
         connection = None
         try:
-            connection = sqlite3.connect(self.path, timeout=5)
+            if write and self.read_only:
+                raise StateError('This repository is read-only. SQLite unchanged.')
+            connection = (sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro',
+                                          uri=True, timeout=5) if self.read_only
+                          else sqlite3.connect(self.path, timeout=5))
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             if write:
@@ -762,47 +770,56 @@ class PublicationRepository:
                                 {PublicationStatus.DRAFT_CREATED, PublicationStatus.PUBLISHING, PublicationStatus.FAILED},
                                 published_url=published_url)
 
+    def _require_final_click_eligible(self, connection, expected):
+        current = self._record(connection.execute(
+            'SELECT * FROM publications WHERE id = ?', (expected.id,),
+        ).fetchone())
+        if current != expected:
+            raise StateError('Final-click preflight state is stale. The final action was not clicked.')
+        retry_click = (
+            current.status == PublicationStatus.DRAFT_CREATED
+            and current.final_click_attempt_count == 1
+            and current.final_click_attempted
+            and current.retry_authorized
+            and current.retry_authorization_count == 1
+        )
+        first_click = (
+            current.status == PublicationStatus.DRAFT_CREATED
+            and current.final_click_attempt_count == 0
+            and not current.final_click_attempted
+        )
+        if (not (first_click or retry_click) or current.published_url
+                or current.needs_reconciliation):
+            raise StateError(
+                'The publication is not eligible for a first final click. The final action was not clicked.'
+            )
+        if current.final_click_attempt_count >= 2:
+            raise StateError('The maximum guarded final-click attempts has been reached.')
+        if current.final_click_attempt_count == 1 and not retry_click:
+            raise StateError('An explicit retry authorization is required before another final click.')
+        owner = connection.execute(
+            '''SELECT s.source_hash, p.destination FROM publications p
+               JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
+            (current.id,),
+        ).fetchone()
+        duplicate = self._lookup(
+            connection, owner['source_hash'], owner['destination'], blocking=True,
+        )
+        if duplicate != current:
+            raise StateError(
+                'Duplicate protection changed before the final click. The final action was not clicked.'
+            )
+        return current
+
+    def require_final_click_eligible(self, expected: PublicationRecord) -> PublicationRecord:
+        """Run the durable click guard read-only, without reserving an attempt."""
+        with self._connection() as connection:
+            return self._require_final_click_eligible(connection, expected)
+
     def mark_final_click_attempted(self, expected: PublicationRecord) -> PublicationRecord:
         """Durably reserve the sole final click using compare-and-set semantics."""
         with self._connection(write=True) as connection:
-            current = self._record(connection.execute(
-                'SELECT * FROM publications WHERE id = ?', (expected.id,),
-            ).fetchone())
-            if current != expected:
-                raise StateError('Final-click preflight state is stale. The final action was not clicked.')
-            retry_click = (
-                current.status == PublicationStatus.DRAFT_CREATED
-                and current.final_click_attempt_count == 1
-                and current.final_click_attempted
-                and current.retry_authorized
-                and current.retry_authorization_count == 1
-            )
-            first_click = (
-                current.status == PublicationStatus.DRAFT_CREATED
-                and current.final_click_attempt_count == 0
-                and not current.final_click_attempted
-            )
-            if (not (first_click or retry_click) or current.published_url
-                    or current.needs_reconciliation):
-                raise StateError(
-                    'The publication is not eligible for a first final click. The final action was not clicked.'
-                )
-            if current.final_click_attempt_count >= 2:
-                raise StateError('The maximum guarded final-click attempts has been reached.')
-            if current.final_click_attempt_count == 1 and not retry_click:
-                raise StateError('An explicit retry authorization is required before another final click.')
-            owner = connection.execute(
-                '''SELECT s.source_hash, p.destination FROM publications p
-                   JOIN stories s ON s.id = p.story_id WHERE p.id = ?''',
-                (current.id,),
-            ).fetchone()
-            duplicate = self._lookup(
-                connection, owner['source_hash'], owner['destination'], blocking=True,
-            )
-            if duplicate != current:
-                raise StateError(
-                    'Duplicate protection changed before the final click. The final action was not clicked.'
-                )
+            current = self._require_final_click_eligible(connection, expected)
             now = _now()
             connection.execute(
                 '''UPDATE publications SET status = ?, final_click_attempted = 1,
@@ -893,10 +910,13 @@ class PublicationRepository:
 
     def reconcile_publication_verified(
         self, expected: PublicationRecord, published_url: str,
-        evidence: tuple[str, ...],
+        evidence: tuple[str, ...], *, expected_database_sha256: str | None = None,
     ) -> PublicationRecord:
         """Resolve an ambiguous final click after read-only remote verification."""
         with self._connection(write=True) as connection:
+            if (expected_database_sha256 is not None
+                    and sha256(self.path.read_bytes()).hexdigest() != expected_database_sha256):
+                raise StateError('SQLite changed before reconciliation; state unchanged.')
             current = self._record(connection.execute(
                 'SELECT * FROM publications WHERE id = ?', (expected.id,),
             ).fetchone())

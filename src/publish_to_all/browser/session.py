@@ -82,6 +82,7 @@ def allow_read_only_request(route) -> None:
 @contextmanager
 def persistent_browser(
     profile: Path, diagnostics: Path, *, headless: bool = False, read_only: bool = False,
+    guarded_publication: bool = False,
 ):
     """Use a dedicated profile; closing the persistent context closes Chromium."""
     context = None
@@ -90,7 +91,7 @@ def persistent_browser(
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(profile), headless=headless, accept_downloads=False,
-                **({'service_workers': 'block'} if read_only else {}),
+                **({'service_workers': 'block'} if read_only or guarded_publication else {}),
             )
             try:
                 context.set_default_timeout(5000)
@@ -99,7 +100,12 @@ def persistent_browser(
                     # Routing also disables the HTTP cache; fresh locators on a
                     # newly navigated page must read server-loaded editor data.
                     context.route('**/*', allow_read_only_request)
-                    context.route_web_socket('**/*', lambda socket: socket.close())
+                if read_only or guarded_publication:
+                    # Routed sockets never connect to the server unless
+                    # connect_to_server() is called. Leave them isolated: a
+                    # synchronous close() inside this callback can deadlock
+                    # Playwright's dispatcher before authentication completes.
+                    context.route_web_socket('**/*', lambda socket: None)
                 yield context
             except (PlaywrightError, OSError):
                 raise browser_failure(context, diagnostics) from None

@@ -573,11 +573,13 @@ def format_substack_publish_execution(result) -> str:
             else 'FINAL ACTION VERIFICATION FAILED',
             'NO CLICK PERFORMED',
             'NOTHING PUBLISHED', '',
-            f'Final screen reached: {"Yes" if result.status.value == "dry_run_verified" else "No"}',
+            f'Final screen reached: {"Yes" if result.final_screen is not None else "No"}',
             f'Candidate count: {result.candidate_count}',
             f'Uniquely pinned: {"Yes" if candidate is not None and result.candidate_count == 1 else "No"}',
-            f'All executor guards passed: {"Yes" if guard and guard.allowed else "No"}',
+            f'All executor guards passed: {"Yes" if result.status.value == "dry_run_verified" else "No"}',
             f'Pre-click revalidation passed: {"Yes" if result.pre_click_revalidation_passed else "No"}',
+            f'Irreversible boundary armed: {"Yes" if "FINAL_ACTION_ARMED" in result.boundary_events else "No"}',
+            f'Durable click attempts written: {int(result.final_click_attempted)}',
             'Playwright click calls: 0',
             f'Unexpected publish/send/schedule network mutation: '
             f'{"Yes" if result.write_like_network_methods else "No"}',
@@ -594,7 +596,33 @@ def format_substack_publish_execution(result) -> str:
             f'Runtime schema before: {result.schema_version_before}',
             f'Runtime schema after: {result.schema_version_after}',
         ]
-        if candidate is not None:
+        lines.extend(['', 'Remote draft verification:', *result.remote_preflight])
+        if result.final_screen is not None:
+            evidence = result.final_screen.final_action_evidence
+            lines.append('Observed final-action labels: ' +
+                         (', '.join(result.final_screen.final_actions) or 'None'))
+            if evidence is not None:
+                lines.extend([
+                    f'Discovered candidate count: {evidence.total_matches}',
+                    f'Visible candidate count: {evidence.visible_matches}',
+                    f'Enabled-visible candidate count: {evidence.enabled_visible_matches}',
+                ])
+            lines.extend(['', 'Current visible publication settings (read-only):'])
+            for control in result.final_screen.controls:
+                if control.final_action or control.safe_navigation:
+                    continue
+                lines.append(
+                    f'  {control.group}: {control.accessible_name}; '
+                    f'value={control.value!r}; selected={control.selected}; enabled={control.enabled}'
+                )
+            if result.validation is not None:
+                for setting in result.validation.required_controls:
+                    lines.append(f'  {setting.label}: {setting.observed}')
+        observed_candidates = ((candidate,) if candidate is not None else
+                               result.final_screen.final_action_evidence.candidates
+                               if result.final_screen is not None
+                               and result.final_screen.final_action_evidence is not None else ())
+        for candidate in observed_candidates:
             lines.extend([
                 '', 'Final action candidate:',
                 f'  tag: {candidate.tag_name}',

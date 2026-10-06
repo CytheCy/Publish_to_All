@@ -383,8 +383,10 @@ def validate_substack_publish_configuration(root: Path) -> FinalPublishDryRunRes
 
 def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionResult':
     """Publish the exact prepared draft through the guarded one-click executor."""
+    import json
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.publish_preflight import verify_prepared_content
     from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_execute import GuardedFinalPublishExecutor, PublishPreconditions
     from .browser.publish_inspect import (
@@ -403,8 +405,12 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
     if not paths.database.is_file():
         raise BrowserSessionError('No publication database exists for the exact current story.')
     database_before, schema_before = _database_fingerprint(paths.database)
-    repository = PublicationRepository(paths.database, migrate=not dry_run)
+    repository = PublicationRepository(paths.database, migrate=not dry_run, read_only=dry_run)
     record = repository.require_publish_inspection_candidate(story.source_hash, 'substack')
+    repository.require_final_click_eligible(record)
+    if (record.subtitle_error_message
+            or (story.metadata.description and record.subtitle_status != 'subtitle_inserted')):
+        raise BrowserSessionError('The exact source subtitle is not prepared locally.')
     draft_url = validate_supplied_draft_url(record.draft_url, publication_url)
     if draft_url != record.draft_url.rstrip('/'):
         raise BrowserSessionError('The linked draft URL is not canonical. Nothing was published.')
@@ -416,9 +422,23 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
 
     with persistent_browser(
         paths.substack_browser_profile, paths.diagnostics, headless=False,
+        guarded_publication=True,
     ) as context:
+        network = WriteLikeNetworkObserver([], publication_url)
+        network.diagnostic_sink = lambda item: print(
+            'Network request: ' + json.dumps(item, sort_keys=True), flush=True,
+        )
+        network.set_stage('AUTHENTICATION')
+        # Cover every page in the context, including popups. The same route and
+        # response observer stay installed until the browser context closes.
+        context.on('response', network.observe_response)
+        guard = install_mutation_guard(context, observer=network)
+        monitor = RateLimitMonitor(publication_url)
+        context.on('response', monitor.observe)
         page = context.new_page()
         authentication = verify_page(page, publication_url, 10, True)
+        if dry_run:
+            print(f'Authentication: {authentication.value}', flush=True)
         if authentication == AuthenticationState.RATE_LIMITED:
             raise SubstackRateLimitError(
                 'Substack rate limiting occurred during publish preflight. Nothing was published.'
@@ -427,6 +447,8 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise BrowserSessionError(
                 'Authenticated Substack preflight did not succeed. Nothing was published.'
             )
+        monitor.require_clear(page)
+        guard.require_clear()
 
         # Re-read the exact association after authentication and before browser
         # mutation. This is the duplicate/identity compare point for the attempt.
@@ -438,15 +460,7 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise BrowserSessionError(
                 'The exact story/draft association changed during preflight. Nothing was published.'
             )
-        network = WriteLikeNetworkObserver([], publication_url) if dry_run else None
-        guard = None
-        if network is not None:
-            network.set_stage('DRAFT_EDITOR_LOAD')
-            page.on('response', network.observe_response)
-            guard = install_mutation_guard(page, observer=network)
-            guard.set_stage('DRAFT_EDITOR_LOAD')
-        monitor = RateLimitMonitor(publication_url)
-        page.on('response', monitor.observe)
+        guard.set_stage('DRAFT_EDITOR_LOAD')
         try:
             evidence = verify_supplied_draft(
                 page, publication_url, draft_url, paths.diagnostics,
@@ -456,8 +470,7 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise
         except (BrowserSessionError, PlaywrightError):
             monitor.require_clear(page)
-            if network is not None:
-                network.require_clear()
+            guard.require_clear()
             raise BrowserSessionError(
                 'Could not safely verify the linked authenticated Substack editor. '
                 'Nothing was published.'
@@ -485,6 +498,9 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             raise BrowserSessionError('The live draft body is not substantial. Nothing was published.')
         if 'Saved' not in remote.editor_state or 'Saving' in remote.editor_state:
             raise BrowserSessionError('The live editor is not positively saved. Nothing was published.')
+        if remote.canonical_public_urls or not remote.definitely_draft_editor:
+            raise BrowserSessionError('The live page is not positively an unpublished editable draft.')
+        content_check = verify_prepared_content(page, story)
         social_preview = inspect_social_preview_image(page, monitor)
         monitor.require_clear(page)
         if social_preview.state.value != 'present':
@@ -493,35 +509,46 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             )
         close_preflight_dialogs(page, monitor)
         monitor.require_clear(page)
-        if network is not None:
-            network.require_clear()
+        guard.require_clear()
         if page.url.rstrip('/') != draft_url:
             raise BrowserSessionError(
                 'The exact draft editor was not preserved after preflight. Nothing was published.'
             )
 
+        if dry_run:
+            print('Remote draft preflight: PASS\n' + '\n'.join(content_check.evidence), flush=True)
+
         continue_control = select_continue_control(page)
-        if guard is None:
-            guard = install_mutation_guard(page, observer=network)
-        if network is not None:
-            network.set_stage('CONTINUE_NAVIGATION')
-            guard.set_stage('CONTINUE_NAVIGATION')
+        monitor.require_clear(page)
+        guard.require_clear()
+        guard.set_stage('CONTINUE_NAVIGATION')
         initial_screen = open_and_inspect_final_publication_screen(
             page, publication_url, draft_url, monitor, guard,
             continue_control=continue_control, leave_open=True,
         )
+        if dry_run:
+            print('Continue clicks: 1\nFinal Publish screen reached: Yes', flush=True)
         guard.require_clear()
-        if network is not None:
-            network.require_clear()
-            network.set_stage('PRE_CLICK_REVALIDATION')
-            guard.set_stage('PRE_CLICK_REVALIDATION')
-        if not dry_run:
-            # Continue has now been proven read-only. Remove the inspection transport
-            # guard so the single explicitly authorized final click can reach Substack.
-            page.unroute('**/*')
+        guard.set_stage('PRE_CLICK_REVALIDATION')
+
+        def pre_click_check():
+            if inspect_project(root) != inspection:
+                raise BrowserSessionError('The local source or configuration changed during preflight.')
+            content_check.require_unchanged()
+            monitor.require_clear(page)
+            guard.require_clear()
+
+        def inspect_screen():
+            monitor.require_clear(page)
+            guard.require_clear()
+            screen = inspect_open_final_publication_screen(page, publication_url)
+            guard.require_clear()
+            return screen
+
         executor = GuardedFinalPublishExecutor(
             repository, page, publication_url, record, draft_url,
-            lambda: inspect_open_final_publication_screen(page, publication_url),
+            inspect_screen, mutation_guard=guard, pre_click_check=pre_click_check,
+            post_click_check=lambda: monitor.require_clear(page),
         )
         result = executor.execute(
             PublishPreconditions(
@@ -530,19 +557,29 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
             ),
             initial_screen, dry_run=dry_run,
         )
-        if network is not None:
-            network.require_clear()
-        database_after, schema_after = _database_fingerprint(paths.database)
-        return result.__class__(
-            **{**result.__dict__,
-               'database_sha256_before': database_before,
-               'database_sha256_after': database_after,
-               'schema_version_before': schema_before,
-               'schema_version_after': schema_after,
-               'write_like_network_methods': tuple(network.methods) if network else (),
-               'suppressed_telemetry': tuple(network.suppressed_telemetry) if network else (),
-               'suppressed_editor_mutations': tuple(network.suppressed_editor_mutations) if network else ()}
-        )
+    # Include shutdown in dry-run checks; the guard remains attached throughout.
+    guard.require_clear()
+    database_after, schema_after = _database_fingerprint(paths.database)
+    if dry_run and (database_before, schema_before) != (database_after, schema_after):
+        raise BrowserSessionError('Dry run failed: SQLite changed during execution.')
+    return result.__class__(
+        **{**result.__dict__,
+           'remote_preflight': content_check.evidence + (
+               'Authenticated editable draft: Yes', f'Exact draft: {draft_url}',
+               'Body substantial: Yes', 'Social Preview image: Present',
+               'Editor Saved: Yes', 'Unpublished: Yes', 'Rate limited: No',
+           ),
+           'final_screen': initial_screen,
+           'database_sha256_before': database_before,
+           'database_sha256_after': database_after,
+           'schema_version_before': schema_before,
+           'schema_version_after': schema_after,
+           'write_like_network_methods': tuple(network.methods),
+           'suppressed_telemetry': tuple(network.suppressed_telemetry),
+           'suppressed_editor_mutations': tuple(network.suppressed_editor_mutations),
+           'post_boundary_network': tuple(network.post_boundary_diagnostics),
+           'boundary_events': tuple(executor.boundary_events)}
+    )
 
 
 def reassociate_substack_version(root: Path, from_hash: str) -> PublicationReassociation:

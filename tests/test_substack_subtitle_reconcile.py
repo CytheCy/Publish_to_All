@@ -277,7 +277,8 @@ def test_readonly_browser_blocks_workers_websockets_and_write_requests(tmp_path,
         context.route.assert_called_once_with('**/*', session.allow_read_only_request)
         socket = MagicMock()
         context.route_web_socket.call_args.args[1](socket)
-        socket.close.assert_called_once()
+        socket.close.assert_not_called()
+        socket.connect_to_server.assert_not_called()
 
 
 def test_command_reports_classification_checksums_and_stops(project, remote, monkeypatch, capsys):
