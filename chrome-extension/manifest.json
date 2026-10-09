@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Publish to All — Medium Import",
+  "version": "0.4.0",
+  "description": "Inspect Medium and fill one verified source URL; manual Import preparation remains disabled.",
+  "action": {
+    "default_title": "Inspect Medium page",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["storage"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://medium.com/*"],
+      "js": ["medium-fill.js", "inspector.js", "second-attempt.js", "medium-controls.js", "import-session.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

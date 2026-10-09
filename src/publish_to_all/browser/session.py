@@ -29,12 +29,12 @@ input, textarea, select, img, svg, canvas, video, iframe, object, embed {
 """
 
 
-def safe_screenshot(page, diagnostics: Path) -> Path | None:
+def safe_screenshot(page, diagnostics: Path, *, platform: str = "substack") -> Path | None:
     target = None
     try:
         private_directory(diagnostics)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        target = diagnostics / f"substack-{stamp}-{uuid4().hex}.png"
+        target = diagnostics / f"{platform.lower()}-{stamp}-{uuid4().hex}.png"
         with target.open("xb"):
             target.chmod(0o600)
         page.screenshot(path=str(target), timeout=5000, animations="disabled",
@@ -49,10 +49,10 @@ def safe_screenshot(page, diagnostics: Path) -> Path | None:
         return None
 
 
-def browser_failure(context: BrowserContext | None, diagnostics: Path) -> BrowserSessionError:
+def browser_failure(context: BrowserContext | None, diagnostics: Path, *, platform: str = "Substack") -> BrowserSessionError:
     # Never include Playwright's raw exception: URLs may contain login tokens.
     message = (
-        "Substack browser operation failed. Check your connection, close other browsers "
+        f"{platform} browser operation failed. Check your connection, close other browsers "
         "using this profile, and ensure Chromium is installed "
         "(python -m playwright install chromium) and a graphical desktop is available."
     )
@@ -61,7 +61,7 @@ def browser_failure(context: BrowserContext | None, diagnostics: Path) -> Browse
         try:
             pages = [page for page in context.pages if not page.is_closed()]
             if pages:
-                screenshot = safe_screenshot(pages[-1], diagnostics)
+                screenshot = safe_screenshot(pages[-1], diagnostics, platform=platform)
         except (PlaywrightError, OSError):
             pass
     if screenshot:
@@ -83,6 +83,7 @@ def allow_read_only_request(route) -> None:
 def persistent_browser(
     profile: Path, diagnostics: Path, *, headless: bool = False, read_only: bool = False,
     guarded_publication: bool = False,
+    platform: str = "Substack", request_guard=None,
 ):
     """Use a dedicated profile; closing the persistent context closes Chromium."""
     context = None
@@ -99,7 +100,7 @@ def persistent_browser(
                 if read_only:
                     # Routing also disables the HTTP cache; fresh locators on a
                     # newly navigated page must read server-loaded editor data.
-                    context.route('**/*', allow_read_only_request)
+                    context.route('**/*', request_guard or allow_read_only_request)
                 if read_only or guarded_publication:
                     # Routed sockets never connect to the server unless
                     # connect_to_server() is called. Leave them isolated: a
@@ -108,13 +109,13 @@ def persistent_browser(
                     context.route_web_socket('**/*', lambda socket: None)
                 yield context
             except (PlaywrightError, OSError):
-                raise browser_failure(context, diagnostics) from None
+                raise browser_failure(context, diagnostics, platform=platform) from None
             finally:
                 failing = sys.exc_info()[0] is not None
                 try:
                     context.close()
                 except PlaywrightError:
                     if not failing:
-                        raise browser_failure(context, diagnostics) from None
+                        raise browser_failure(context, diagnostics, platform=platform) from None
     except (PlaywrightError, OSError):
-        raise browser_failure(context, diagnostics) from None
+        raise browser_failure(context, diagnostics, platform=platform) from None

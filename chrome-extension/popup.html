@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Publish to All — Medium Inspector</title>
+  <style>
+    body { width: 480px; max-height: 580px; overflow-y: auto; margin: 0; padding: 16px; color: #17212b; font: 14px/1.5 system-ui, sans-serif; }
+    h1 { margin: 0 0 12px; font-size: 17px; }
+    button { border: 0; border-radius: 6px; padding: 9px 12px; background: #244b78; color: white; cursor: pointer; }
+    button:not(:disabled) { pointer-events: auto; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    pre { margin: 14px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+  </style>
+</head>
+<body>
+  <h1>Publish to All — Medium Inspector</h1>
+  <button id="inspect" type="button">Inspect Current Medium Page</button>
+  <pre id="report" role="status" aria-live="polite">Open a Medium page, then inspect it here.</pre>
+  <script src="popup.js"></script>
+</body>
+</html>

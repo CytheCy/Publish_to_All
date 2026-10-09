@@ -72,6 +72,10 @@ class RuntimePaths:
     def substack_browser_profile(self) -> Path:
         return self.browser_profile / "substack"
 
+    @property
+    def medium_browser_profile(self) -> Path:
+        return self.browser_profile / "medium"
+
 
 def runtime_paths(project_root: Path) -> RuntimePaths:
     def external_base(variable: str, fallback: str) -> Path:
