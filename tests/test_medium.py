@@ -595,7 +595,7 @@ def test_precursor_security_classification_allows_only_safe_metadata(tmp_path, p
     class Request:
         method = 'POST'
         url = (origin + f'/cdn-cgi/challenge-platform/h/{variant}/precursor/'
-               'abc/short-secret/opaque?token=query-private#fragment-private')
+                   'path-secret-abc/short-secret/opaque?token=query-private#fragment-private')
 
         def __getattr__(self, name):
             pytest.fail(f'Security verification must never read {name}, including body/headers/cookies/storage')
@@ -622,7 +622,8 @@ def test_precursor_security_classification_allows_only_safe_metadata(tmp_path, p
     result = medium.MediumResult(tmp_path, precursor=guard.precursor)
     target = medium.diagnostics(page, tmp_path, result, guard)
     raw = Path(target).read_text() + format_medium(result)
-    assert all(value not in raw for value in ('abc', 'short-secret', 'opaque', 'query-private', 'fragment-private'))
+    assert all(value not in raw for value in (
+        'path-secret-abc', 'short-secret', 'opaque', 'query-private', 'fragment-private'))
     assert f'/h/{variant}/' not in raw
     assert 'EXPECTED SECURITY VERIFICATION — ALLOWED' in format_medium(result)
     assert 'Unexpected requests blocked: 0' in format_medium(result)

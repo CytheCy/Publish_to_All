@@ -1,134 +1,62 @@
-# Publish to All Medium Chrome extension
+# Publish to All Medium inspector
 
-This Manifest V3 extension inspects Medium in the normal signed-in Chrome session.
-One real Import activation has already occurred for the verified Substack source.
-Its result remains `IMPORT_RESULT_AMBIGUOUS`; the known attempt count is **1** and retry
-is disabled. A live Drafts reconciliation separately reported `NO_DRAFT_FOUND`.
-That finding does not reset or reclassify the click history. Attempt 1 used
-`HTMLElement.click()` on Medium's native button. Chrome 154's local fixture
-reported `isTrusted: false` for that click. This may help explain the empty
-Drafts page, but no Medium-side cause has been established. Leave the old
-`/p/import` tab unchanged. Do not click Import or Publish.
+This Manifest V3 extension inspects Medium's normal story editor and offers separately guarded title and body fills. The body control is limited to verified draft `/p/fd6c1824c4de/edit`. For the source story `https://cyporter.substack.com/p/saturation-of-artificial-intelligence-f8d`, URL Import is terminally retired. The extension does not change settings or publish.
 
-## Fill-only manual check
+## Preserved URL Import history
 
-1. Reload the unpacked `chrome-extension/` in `chrome://extensions/`.
-2. Open a **new** Chrome tab and navigate to `https://medium.com/p/import`.
-3. Confirm Medium shows its normal `http://www.yoursite.org/your-post` sample URL.
-4. Click the extension-owned **Fill verified Substack URL** once.
-5. The **Prepare one manual Import attempt** control is disabled. Do not click
-   Medium's native **Import**.
-6. Run **Inspect Current Medium Page** in the extension popup and return its report.
-7. Stop there. The report should show `EXACT_SOURCE_URL_PRESENT`, exact fingerprint,
-   an application input signal, `VERIFIED` Fill synchronization, one known Import
-   attempt, no retry, and a disabled extension Import control.
+| Attempt | Activation | Reconciled result |
+| --- | --- | --- |
+| 1 | Programmatic `HTMLElement.click()` on Medium's native Import button; untrusted click | `NO_DRAFT_FOUND` |
+| 2 | User's physical click on Medium's native Import button; observed trusted click with valid button identity | `NO_DRAFT_FOUND` |
 
-The Fill report records bounded `beforeinput`, `input`, `change`, `focus`, and
-`blur` event metadata from the selected source editor. It reports event type,
-target identity, bubbles, cancelable, composed, trusted, input type, and data
-length. It never records event data or a full URL. Listeners are removed when
-Fill finishes.
+Attempt 2's legacy reservation storage still reads `ARMED`, zero observed clicks, and `PENDING`. That storage did not consume the physical click. The extension reports the stored reservation and the observed real-world result separately. A fresh, conclusively loaded Drafts list contained no visible entries or exact-title matches after attempt 2. There have been **two real attempts**; a third URL Import attempt is forbidden.
 
-The helper freshly resolves the editor, verifies the known Medium sample and
-its fingerprint, focuses and selects its contents, then uses Chrome's
-`execCommand("insertText")` editing operation. It requires exact normalized DOM
-text, the expected SHA-256 fingerprint, and a bubbling input event targeted at
-that editor for `VERIFIED`. If the DOM and fingerprint match but the browser
-provided no usable input event, it dispatches exactly one bubbling, composed
-`InputEvent("input")` with `inputType: "insertText"`. It never dispatches a
-synthetic `beforeinput` or `change`. `VERIFIED` does not authorize Import.
+The immutable `MEDIUM_URL_IMPORT_RETIRED` history lives in `medium-retirement.js`. Existing attempt records and preparation diagnostics remain readable. Inspection does not clear, reset, migrate, or rewrite them. The background worker rejects both legacy write messages. On-page Fill and Prepare controls are disabled and have no active click listeners in the retired workflow. The old diagnostic code remains available for historical analysis.
 
-The local Chrome fixture observed one trusted, bubbling `input` from
-`execCommand("insertText")`, with no `beforeinput` or `change`. Physical keyboard
-typing produced `beforeinput` and `input`, with no `change` after blur. This is
-browser evidence only; the new-tab Fill report will show what Medium receives.
+## Normal editor inspection
 
-## Read-only reconciliation
+The user opens a blank draft using Medium's **Write** control. The extension does not click it. **Inspect Current Medium Page** reports the editor URL shape and draft identity, visible editable candidates, title and body classification evidence, empty/nonempty state, Publish control, draft/save indicator, and visible story/settings controls. It does not click, fill, or modify any Medium control.
 
-The popup also inspects visible confirmation, draft/edit links, and validation or
-error text on `/p/import`. On Stories it waits boundedly for visible tab controls,
-reports each tab's safe attributes, ancestor state, computed style, and linked panels.
-It locates the post-tab branch within a bounded Stories container, then reports
-only visible content from that branch, including promo text, loading and error
-signals, and story card structures. A tab is classified as selected only with a
-unique structural signal; identical hrefs and visual style alone do not select it.
-It reads entries only when Drafts is positively selected and the corresponding
-content region is identified. One
-exact-title draft entry with a usable Medium href yields
-`VERIFIED_DRAFT_CANDIDATE`, which is evidence for a later manual editor check.
-It does not select a tab or open a candidate. A published story, duplicate
-exact-title drafts, unhydrated UI, or incomplete list remains `AMBIGUOUS`.
-`NO_DRAFT_FOUND` requires selected Drafts, a rendered post-tab content region,
-no loading or error signal, no story entries, and explicit no-drafts text or a
-dedicated promo block occupying that region. A lone promotional heading or a
-promo block outside the Drafts region cannot confirm an empty list.
-Reconciliation never changes the stored ambiguous Import attempt or enables a retry.
+`/new-story` is recognized as an editor route, but route alone never verifies a draft. The inspection reports structural evidence, candidate ancestry and DOM order, contenteditable attributes, focusability attributes, child structure, CSS pseudo-element prompts, and text provenance. It prints short text only when the DOM clearly marks it as editor scaffolding; other text is represented by a fingerprint and counts.
 
-## Attempt storage and safety
+`BLANK_DRAFT_EDITOR_VERIFIED` supports separate title/body editables and Medium's single composite contenteditable. A composite root must have the `/new-story` or exact `/p/<12-hex-id>/edit` route, an `article.postArticle` ancestor, textbox and contenteditable semantics, multiple editor markers, a section child, and one visible Publish control. Within that root, the inspector inventories story blocks and only treats spans with both `defaultValue` and `defaultValue--root` classes as Medium-owned prompt scaffolding. A unique title and body subregion, empty or scaffolding-only content throughout the root, and no conflicting editable are required for blank verification. Body-level empty contenteditables with `tabindex=-1` and no editor ancestry are reported as auxiliary. Unresolved editor text or title/body identity yields `EDITOR_STRUCTURE_AMBIGUOUS`. `NOT_MEDIUM_EDITOR` means structural evidence is absent. Existing confirmed content yields `NONEMPTY_DRAFT`.
 
-The previous version used page `sessionStorage`, and the real attempt's saved
-value remained `IMPORT_NOT_STARTED` with zero clicks while in-memory state was
-ambiguous with one click. This version uses `chrome.storage.session` for an
-extension-wide record. The manifest adds only the narrow `storage` permission.
-A small background worker owns the record because Chrome does not expose
-`storage.session` to content scripts by default. It rejects stale transitions
-from the known ambiguous state.
-The attempt 1 record stores the source SHA-256 fingerprint, source hostname, click attempts,
-lifecycle state, activation method, `NO_DRAFT_FOUND` reconciliation, click-intent
-timestamp, and starting/current Medium paths. It
-never stores cookies, tokens, source bodies, or authentication data. It uses no
-`storage.local` account record.
+After Medium assigns a draft edit route, the read-only inspector recognizes the authored title through its story block, exact packaged title, and fingerprint. `MEDIUM_TITLE_VERIFIED_BODY_BLANK` requires one composite root, one title and body block in order, the expected title fingerprint, the remaining body prompt or an empty body, no other story content, and one Publish control. It reports the draft ID and continuation safety without editing the draft. The extension stores successful title input evidence by draft ID for later inspection when the content script reloads; the DOM and route guards must still pass before that stored evidence is shown.
 
-Chrome may clear `storage.session` on extension reload. A missing or invalid
-record is therefore seeded as the **known real ambiguous attempt with one click**,
-not as a fresh attempt. This explicit safety migration stays in place until the
-real attempt has been reconciled. The old automatic native-button activation
-has been removed. The separate attempt 2 design requires the exact live source,
-verified Fill synchronization, one verified native Import button, no visible
-draft or validation error, and attempt 1's `NO_DRAFT_FOUND` reconciliation.
-Readiness never authorizes Import. The extension-owned preparation control and
-background authorization gate both remain disabled in this build.
+The extension places a title control in its own Shadow DOM panel on `/new-story`. It uses the same fresh title readiness result as the popup and fill handler. Inspection reports the control's disabled state, CSS, hit test, listener generation, and any separate UI blocking reason. Reinjection replaces stale panels and detaches old listeners. Clicking it reacquires and verifies the DOM, selects only the title block, and inserts the packaged story title with browser editing semantics. It checks the exact title and fingerprint, application input event, intact body markup and prompt, and story editor ancestry. A bounded read-only interval observes autosave. Any changed or ambiguous structure stops the workflow; no automatic repair runs. The button is disabled after an edit attempt. The packaged `story-title.js` is generated from the same `load_story(In/)` pipeline as publishing with `.venv/bin/python -B extension-dev/export-story-title.py`; validation fails if it is stale.
 
-When authorization is deliberately enabled in a later change, preparation will
-save an `ARMED` attempt 2 reservation to `chrome.storage.local` before any
-user action on Medium's button. The reservation records the fingerprint,
-hostname, Fill verification, reconciliation, timestamp, and a document token,
-with zero observed native clicks. It never activates Medium's button. A capture
-listener only classifies a later click on the same verified button and records
-safe trust and identity evidence. It never prevents, replays, or retries a click.
-The first authorized trusted click synchronously locks the document and records
-one observed click separately from the prior reservation. A reload gets a new
-document token and cannot reuse an armed reservation. An unknown result remains
-locked. Attempt 1's historical record remains separate and consumed.
+The body control uses the same Shadow DOM and fresh readiness pattern on the verified draft route. The Python `load_story(In/)` pipeline exports the canonical body and Markdown token analysis to `story-body.js` with `.venv/bin/python -B extension-dev/export-story-body.py`. The current source has 18 level-one numbered headings and 18 paragraphs; other structural features are absent. Unsupported Markdown disables the body control. The inspector resolves the live body paragraph once per inspection; readiness and the click guard use that same result, with separate diagnostics for route, draft, root, title, body, authored content, continuation safety, and Markdown support. The composite contenteditable root is reported separately from the body paragraph. On click, the extension rechecks draft identity, exact title, fingerprint, unique body block, prompt, and blank state. Browser editing commands insert each block, including heading structure and paragraph boundaries. It reacquires the live editor after each command, checks every inserted block, then verifies the complete body fingerprint, title, route, and input evidence. It observes the autosave indicator read-only. A failed check leaves an ambiguous result and disables repeat fill. No Save, settings, or Publish action is invoked.
 
-The local Chrome fixture uses an ordinary submit button. `HTMLElement.click()`
-and `dispatchEvent(new MouseEvent(...))` each produced an untrusted `click` and
-a trusted `submit`; Playwright browser input produced trusted pointer, mouse,
-click, and submit events. The trusted `submit` after a script click means this
-fixture supports click trust as a plausible difference, not a proved explanation
-of Medium's behavior.
+**Resume verified Medium body** is a separate recovery operation. Readiness requires the exact persisted `/p/fd6c1824c4de/edit` checkpoint: verified title and fingerprint, unique composite editor and body region, exactly one paragraph with canonical text `01` and fingerprint `fnv1a32:20ed70ba`, an exact canonical-prefix reconciliation through block 1, no other body content, and no observed Publish action. The normal fill stays blocked. On activation, recovery checks the checkpoint again, changes block 1 to an actual heading with the editing command, and verifies its unchanged text and heading format before inserting block 2. Each subsequent edit occurs once, followed by at most eight read-only DOM reacquisitions. Every completed block is verified by kind, normalized length, and fingerprint; a failed check stops immediately and records the last verified block. A successful result requires all 36 blocks, the exact full-body fingerprint `fnv1a32:342d11eb`, 18 headings, 18 paragraphs, unchanged title and draft, and no Publish action. Recovery progress is stored locally and a second invocation is blocked. The operation does not open Settings or Publish.
 
-The historical activation path was: user pressed the extension's shadow DOM
-**Import verified story** button; its listener re-inspected the page and the
-source/button identity; it persisted `IMPORT_CLICK_INTENT` with one click attempt;
-it rechecked the native targets; it called `targets.action.click()` on Medium's
-native button; then it persisted `IMPORT_CLICKED` and watched for draft evidence.
-No physical user gesture reached Medium's native button in that path. The path
-used `HTMLElement.click()`, not `dispatchEvent()`. The current build has no
-automatic native-button click call.
+Recovery inspection reports each prerequisite as PASS or FAIL, including route, draft ID, title text and fingerprint, packaged source and full-body fingerprint, canonical blocks, partial reconciliation and fingerprint, body block count and formatting, Publish state, editor structure, unique body subregion, and unexpected content. A blocked result includes the first failed guard and its specific reason. Recovery uses the same packaged title and body values, normalization, and source validation as normal body readiness; it also pins the exact recovery checkpoint. The local `01` paragraph fixture passes all guards without editing the page. A live inspection report is needed to identify any remaining DOM-specific failure.
 
-The popup and reconciliation inspect only. They make no Medium API calls and
-have no Publish capability.
+The future canonical-link target is `https://cyporter.substack.com/p/saturation-of-artificial-intelligence-f8d`. Settings controls are inventoried only.
 
-## Local tests
+## Manual discovery
+
+1. Reload the unpacked `chrome-extension/` in `chrome://extensions/`, then refresh the existing draft `/p/fd6c1824c4de/edit` without editing it.
+2. Run **Inspect Current Medium Page** only and return the complete report. It should show `MEDIUM_TITLE_VERIFIED`, `MEDIUM_BODY_PARTIAL`, `Partial body recovery classification: EXACT_CANONICAL_PREFIX`, current body safe text `01`, fingerprint `fnv1a32:20ed70ba`, `Body recovery eligibility: READY`, `Body recovery reason: None`, `Recovery start block: 1`, `Recovery next canonical block: 2`, `Block 1 requires formatting repair: Yes`, `Body recovery control interactability: ENABLED`, `Body fill eligibility: NOT_READY`, and `Publish capability: No`.
+3. Stop. Do not click **Resume verified Medium body**, **Fill verified Medium body**, **Publish**, or **Settings**.
+
+The first packaged body block is the heading text `01` (two characters, fingerprint `fnv1a32:20ed70ba`); the source Markdown marker `# ` is not sent to Medium. The prior `BLOCK_POSTCHECK_FAILED` occurred after prompt deletion and the first `insertText`, before heading formatting. Its three possible immediate causes are missing/reordered block, text other than `01`, or a transient title mismatch. The prior report did not capture the text or block order at that instant, so the next read-only inspection can identify the remaining content but cannot prove a past transient. A `font` wrapper alone does not make the local Chrome postcheck fail. The local fixture also models a transient block reflow that fails the postcheck yet leaves only `<font>01</font>` afterward, as well as a two-character noncanonical artifact.
+
+The persisted-state fixture covers direct paragraph text, `<font>` and `<span>` wrappers, whitespace, separate sections, and a wrapped title with no fill telemetry. Inspection reads the resolved paragraph text as the first canonical block while reporting its paragraph formatting discrepancy separately. If body reconciliation is unavailable, the popup says `Partial body detected: Not observed` instead of displaying a false negative.
+
+## Local validation
 
 ```sh
 node --test chrome-extension/test/*.test.js
-.venv/bin/python chrome-extension/test/chrome_contenteditable_fixture.py
-.venv/bin/python chrome-extension/test/chrome_click_trust_fixture.py
+.venv/bin/python -B extension-dev/fixtures/chrome_medium_body_fixture.py
+.venv/bin/python -B extension-dev/fixtures/chrome_medium_partial_fixture.py
+.venv/bin/python -B extension-dev/fixtures/chrome_medium_recovery_fixture.py
 .venv/bin/python -m pytest
 .venv/bin/python -m compileall -q src tests
 git diff --check
+.venv/bin/python -B extension-dev/extension_tree.py check
 ```
 
 The extension tests use local DOM fixtures and do not contact Medium.
+Python exporters and Chrome fixtures live under `extension-dev/`, outside the load-unpacked directory. Pytest disables bytecode writes during collection for any future Python fixture it imports. The `compileall` command targets only `src` and `tests`; it does not enter `chrome-extension/`.
+
+The final `check` command fails on `__pycache__`, `.pyc`, `.pyo`, or any other underscore-prefixed entry in `chrome-extension/`. It never removes files. For explicit cleanup of generated Python artifacts only, run `.venv/bin/python -B extension-dev/extension_tree.py clean`, then run `check` again. Cleanup preserves all other files, including source files inside a cache directory, so any remaining forbidden entry is reported.

@@ -1373,6 +1373,9 @@
   }
 
   function fillVerifiedSourceUrl(doc, location, session) {
+    if (session?.urlImportRetired) return { status: "MEDIUM_URL_IMPORT_RETIRED",
+      urlFillAttempted: false, fillSucceeded: false, importClicked: false,
+      formSubmitted: false, navigationOccurred: false };
     const report = inspectDocument(doc, location);
     const status = report.importInterface.sourceStatus;
     const replacingDefaultExample = report.importInterface.sourceUrlInput?.editorState ===

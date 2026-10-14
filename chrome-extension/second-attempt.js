@@ -4,15 +4,24 @@
   const KEY = "publish-to-all:medium-second-attempt:v1";
   const FINGERPRINT = "2a5f676c8743eda141101e793cc4ce988ba6f029d0805c0498271bd072937349";
   const HOSTNAME = "cyporter.substack.com";
+  const SOURCE_URL = "https://cyporter.substack.com/p/saturation-of-artificial-intelligence-f8d";
   const IMPORT_URL = "https://medium.com/p/import";
   const empty = () => ({ state: "SECOND_ATTEMPT_NOT_AUTHORIZED",
-    authorizedAttemptNumber: null, observedNativeImportClicks: 0,
+    attemptNumber: null, authorizedAttemptNumber: null, observedNativeImportClicks: 0,
     sourceFingerprint: null, sourceHostname: null, fillSynchronization: null,
     attempt1Reconciliation: "NO_DRAFT_FOUND", authorizationTimestamp: null,
-    documentToken: null, nativeClickObserved: false, clickEvidence: null });
+    nativeImportIdentity: null, result: null, documentToken: null,
+    nativeClickObserved: false, clickEvidence: null });
 
   function valid(record) {
+    const safeKeys = ["state", "attemptNumber", "authorizedAttemptNumber",
+      "observedNativeImportClicks", "sourceFingerprint", "sourceHostname",
+      "fillSynchronization", "attempt1Reconciliation", "authorizationTimestamp",
+      "nativeImportIdentity", "result", "documentToken", "nativeClickObserved",
+      "clickEvidence"];
     if (!record || typeof record !== "object" ||
+        Object.keys(record).length !== safeKeys.length ||
+        safeKeys.some(key => !Object.prototype.hasOwnProperty.call(record, key)) ||
         !["SECOND_ATTEMPT_NOT_AUTHORIZED", "SECOND_ATTEMPT_ARMED",
           "SECOND_ATTEMPT_USER_CLICK_OBSERVED", "SECOND_ATTEMPT_RESULT_VERIFIED",
           "SECOND_ATTEMPT_RESULT_AMBIGUOUS"].includes(record.state) ||
@@ -20,20 +29,33 @@
         !Number.isSafeInteger(record.observedNativeImportClicks) ||
         record.observedNativeImportClicks < 0 || record.observedNativeImportClicks > 1) return false;
     if (record.state === "SECOND_ATTEMPT_NOT_AUTHORIZED")
-      return record.authorizedAttemptNumber === null &&
-        record.observedNativeImportClicks === 0 && !record.nativeClickObserved;
-    return record.authorizedAttemptNumber === 2 &&
+      return record.attemptNumber === null &&
+        record.authorizedAttemptNumber === null &&
+        record.observedNativeImportClicks === 0 && record.nativeClickObserved === false &&
+        record.sourceFingerprint === null && record.sourceHostname === null &&
+        record.fillSynchronization === null && record.authorizationTimestamp === null &&
+        record.nativeImportIdentity === null && record.result === null &&
+        record.documentToken === null && record.clickEvidence === null;
+    return record.attemptNumber === 2 && record.authorizedAttemptNumber === 2 &&
       record.sourceFingerprint === FINGERPRINT && record.sourceHostname === HOSTNAME &&
       record.fillSynchronization === "VERIFIED" &&
+      record.nativeImportIdentity === "verified" &&
+      record.result === (record.state === "SECOND_ATTEMPT_RESULT_VERIFIED" ?
+        "VERIFIED" : record.state === "SECOND_ATTEMPT_RESULT_AMBIGUOUS" ?
+          "AMBIGUOUS" : "PENDING") &&
       Number.isSafeInteger(record.authorizationTimestamp) &&
       record.authorizationTimestamp > 0 && typeof record.documentToken === "string" &&
-      record.documentToken.length >= 16 &&
+      record.documentToken.length >= 16 && record.documentToken.length <= 96 &&
+      /^[a-z0-9.-]+$/i.test(record.documentToken) &&
       (record.state === "SECOND_ATTEMPT_ARMED" ?
-        record.observedNativeImportClicks === 0 && !record.nativeClickObserved :
+        record.observedNativeImportClicks === 0 && record.nativeClickObserved === false &&
+          record.clickEvidence === null :
         record.observedNativeImportClicks === 1 && record.nativeClickObserved &&
+          record.clickEvidence?.nativeImportClickObserved === true &&
           record.clickEvidence?.isTrusted === true &&
           record.clickEvidence?.buttonIdentityValid === true &&
-          record.clickEvidence?.authorizationPresent === true);
+          record.clickEvidence?.authorizationPresent === true &&
+          Object.keys(record.clickEvidence).length === 4);
   }
 
   function eligibility({ report, raw, reconciliation, fill, attempt1, location,
@@ -49,6 +71,7 @@
       return fail("IMPORT_PAGE_MISMATCH");
     if (report.importInterface?.headingVerified !== true ||
         report.importInterface?.matchingHeadingCount !== 1 ||
+        report.importInterface?.heading !== "See your story on Medium" ||
         report.importInterface?.matchingSourceEditorCount !== 1)
       return fail("IMPORT_PAGE_IDENTITY_MISMATCH");
     if (fill?.fillSynchronizationStatus !== "VERIFIED" ||
@@ -56,18 +79,28 @@
       return fail("FILL_SYNCHRONIZATION_NOT_VERIFIED");
     if (report.importInterface?.sourceUrlInput?.editorState !==
         "EXACT_SOURCE_URL_PRESENT" ||
+        report.importInterface?.sourceUrlInput?.entireContentOneUrl !== true ||
         report.importInterface?.sourceUrlInput?.existingUrl?.matchesIntendedSourceExactly !== true ||
         report.importInterface?.sourceUrlInput?.existingUrl?.safeUrlFingerprint !== FINGERPRINT ||
         raw?.sourceGuard !== true || raw?.source?.exactMatch !== true ||
         raw?.source?.fingerprintMatch !== true || !raw?.targets?.editor)
       return fail("SOURCE_IDENTITY_MISMATCH");
+    if (raw.source?.normalizedLength !== SOURCE_URL.length ||
+        report.importInterface.sourceUrlInput.existingUrl?.normalizedUrlLength !==
+          SOURCE_URL.length)
+      return fail("SOURCE_IDENTITY_MISMATCH");
     if (report.importInterface?.matchingImportActionCount !== 1 ||
         raw?.action?.candidateCount !== 1 || raw?.actionGuard !== true ||
-        raw?.action?.identityMatchesInspection !== true || !raw?.targets?.action)
+        raw?.action?.identityMatchesInspection !== true ||
+        raw?.action?.visible !== true || raw?.action?.enabled !== true ||
+        raw?.action?.connected !== true ||
+        report.importInterface?.importAction?.visible !== true ||
+        report.importInterface?.importAction?.enabled !== true ||
+        !raw?.targets?.action)
       return fail("NATIVE_IMPORT_IDENTITY_MISMATCH");
-    if (reconciliation?.validation?.detected ||
-        reconciliation?.importPage?.draftEditLink ||
-        reconciliation?.importPage?.seeYourStory ||
+    if (reconciliation?.validation?.detected !== false ||
+        reconciliation?.importPage?.draftEditLink !== false ||
+        reconciliation?.importPage?.seeYourStory !== false ||
         reconciliation?.importPage?.confirmation !== "Not observed" ||
         reconciliation?.importPage?.error !== "Not observed")
       return fail("EXISTING_RESULT_OR_VALIDATION");
@@ -84,10 +117,12 @@
     if (!valid(record) || readiness?.state !== "SECOND_ATTEMPT_READY" ||
         record.state !== "SECOND_ATTEMPT_NOT_AUTHORIZED" ||
         !Number.isSafeInteger(now) || now <= 0) return null;
-    const next = { state: "SECOND_ATTEMPT_ARMED", authorizedAttemptNumber: 2,
+    const next = { state: "SECOND_ATTEMPT_ARMED", attemptNumber: 2,
+      authorizedAttemptNumber: 2,
       observedNativeImportClicks: 0, sourceFingerprint: FINGERPRINT,
       sourceHostname: HOSTNAME, fillSynchronization: "VERIFIED",
       attempt1Reconciliation: "NO_DRAFT_FOUND", authorizationTimestamp: now,
+      nativeImportIdentity: "verified", result: "PENDING",
       documentToken, nativeClickObserved: false, clickEvidence: null };
     if (!valid(next)) return null;
     await storage.set({ [KEY]: next });
@@ -128,7 +163,8 @@
     if (!valid(record) || record.state !== "SECOND_ATTEMPT_USER_CLICK_OBSERVED" ||
         typeof verified !== "boolean") return null;
     const next = { ...record, state: verified ?
-      "SECOND_ATTEMPT_RESULT_VERIFIED" : "SECOND_ATTEMPT_RESULT_AMBIGUOUS" };
+      "SECOND_ATTEMPT_RESULT_VERIFIED" : "SECOND_ATTEMPT_RESULT_AMBIGUOUS",
+      result: verified ? "VERIFIED" : "AMBIGUOUS" };
     await storage.set({ [KEY]: next });
     return next;
   }

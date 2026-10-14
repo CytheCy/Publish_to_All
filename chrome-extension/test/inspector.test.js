@@ -460,7 +460,7 @@ test("no extension code automatically activates native Import or Publish", () =>
   assert.doesNotMatch(source, /location\.(?:href|assign|replace)\s*(?:=|\()/);
 });
 
-test("content script only responds to inspection messages and hides errors", () => {
+test("content script only responds to inspection messages and hides errors", async () => {
   const source = fs.readFileSync(path.join(__dirname, "../content.js"), "utf8");
   let listener;
   const context = {
@@ -475,6 +475,7 @@ test("content script only responds to inspection messages and hides errors", () 
   listener({ type: "UNRELATED" }, null, value => { response = value; });
   assert.equal(response, undefined);
   listener({ type: "INSPECT_MEDIUM_PAGE" }, null, value => { response = value; });
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(response.ok, false);
   assert.equal(JSON.stringify(response).includes("private"), false);
 });
@@ -483,7 +484,10 @@ test("manifest is limited to Medium and has no broad permissions", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual(manifest.content_scripts[0].matches, ["https://medium.com/*"]);
-  assert.deepEqual(manifest.content_scripts[0].js, ["medium-fill.js", "inspector.js", "second-attempt.js", "medium-controls.js",
+  assert.deepEqual(manifest.content_scripts[0].js, ["story-title.js", "story-body.js",
+    "medium-retirement.js", "medium-editor-inspector.js", "medium-title-fill.js",
+    "medium-body-fill.js", "medium-body-recovery.js", "medium-title-controls.js", "medium-fill.js",
+    "inspector.js", "second-attempt.js", "medium-controls.js",
     "import-session.js", "content.js"]);
   assert.deepEqual(manifest.permissions, ["storage"]);
   assert.equal(manifest.host_permissions, undefined);
@@ -1318,14 +1322,11 @@ test("content script inspection preserves the known attempt and rejects fill mes
     MediumInspector: inspector, document: page.doc, location: page.location
   });
   await Promise.resolve();
-  const send = type => {
-    let response;
-    listener({ type }, null, value => { response = value; });
-    return response;
-  };
-  assert.equal(send("INSPECT_MEDIUM_PAGE").fillAttemptAvailable, false);
-  assert.equal(send("INSPECT_MEDIUM_PAGE").importState, "IMPORT_RESULT_AMBIGUOUS");
-  assert.equal(send("FILL_VERIFIED_SUBSTACK_URL"), undefined);
+  const inspect = () => new Promise(resolve =>
+    listener({ type: "INSPECT_MEDIUM_PAGE" }, null, resolve));
+  assert.equal((await inspect()).fillAttemptAvailable, false);
+  assert.equal((await inspect()).importState, "IMPORT_RESULT_AMBIGUOUS");
+  assert.equal(listener({ type: "FILL_VERIFIED_SUBSTACK_URL" }, null, () => {}), undefined);
   assert.equal(page.session.fills, 0);
 });
 
@@ -1417,6 +1418,9 @@ class PanelNode {
     return this.shadowRoot;
   }
   addEventListener(type, fn) { this.listeners[type] = fn; }
+  removeEventListener(type, fn) {
+    if (this.listeners[type] === fn) delete this.listeners[type];
+  }
   remove() {
     this.removed = true;
     if (this.parentElement) this.parentElement.children =
@@ -1465,6 +1469,38 @@ function onPageFixture(page, pageInspector = inspector) {
   return { host, panel, button, importButton, lines, observer, before, doc, page,
     windowListeners };
 }
+
+test("retired Import controls cannot fill, prepare, click Import, or submit", () => {
+  const page = mediumParagraphFixture(VERIFIED_URL);
+  page.session.urlImportRetired = true;
+  page.session.importClicks = 1;
+  page.session.importState = "IMPORT_RESULT_AMBIGUOUS";
+  page.session.lastFillResult = { fillSynchronizationStatus: "VERIFIED",
+    exactUrlPresentAfterward: true, fingerprintMatch: true };
+  let writes = 0;
+  let nativeClicks = 0;
+  page.session.secondAttemptStore = { async set() { writes += 1; } };
+  page.buttons[0].click = () => { nativeClicks += 1; };
+  const original = page.editor.textContent;
+  const ui = onPageFixture(page);
+  assert.equal(ui.button.disabled, true);
+  assert.equal(ui.importButton.disabled, true);
+  assert.equal(ui.button.click(), false);
+  assert.equal(ui.importButton.click(), false);
+  assert.equal(mediumControls.eligibility(inspector.inspectDocument(page.doc, page.location),
+    page.session, page.location).reason, "MEDIUM_URL_IMPORT_RETIRED");
+  assert.equal(mediumControls.importEligibility(inspector.inspectDocument(page.doc, page.location),
+    page.session, page.location).reason, "MEDIUM_URL_IMPORT_RETIRED");
+  assert.equal(inspector.fillVerifiedSourceUrl(page.doc, page.location, page.session).status,
+    "MEDIUM_URL_IMPORT_RETIRED");
+  assert.equal(ui.host.getImportDiagnostics().secondAttemptReason,
+    "MEDIUM_URL_IMPORT_RETIRED");
+  assert.equal(ui.host.getImportDiagnostics().attemptAvailable, false);
+  assert.equal(page.editor.textContent, original);
+  assert.equal(writes, 0);
+  assert.equal(nativeClicks, 0);
+  assert.equal(page.doc.submitListener, undefined);
+});
 
 test("on-page panel is unique, shadowed, and leaves Medium DOM unchanged", () => {
   const page = mediumParagraphFixture(MEDIUM_DEFAULT_URL);
@@ -1941,7 +1977,7 @@ test("attempt 1 history remains consumed after reconciliation", async () => {
   assert.equal(page.session.importClicks, 1);
 });
 
-test("known ambiguous Import attempt allows new-tab Fill while keeping Import locked", () => {
+test("known ambiguous Import attempt allows new-tab Fill and guarded preparation", () => {
   const page = mediumParagraphFixture(MEDIUM_DEFAULT_URL);
   page.session.importClicks = 1;
   page.session.importState = "IMPORT_RESULT_AMBIGUOUS";
@@ -1953,14 +1989,14 @@ test("known ambiguous Import attempt allows new-tab Fill while keeping Import lo
   assert.equal(ui.button.click(), true);
   assert.equal(page.calls.insertText, 1);
   assert.match(ui.lines(), /Fill synchronization status: VERIFIED/);
-  assert.equal(ui.importButton.disabled, true);
-  assert.equal(ui.importButton.click(), false);
+  assert.equal(ui.importButton.disabled, false);
+  assert.equal(ui.host.getImportDiagnostics().secondAttemptPreparationControl, "ENABLED");
   assert.equal(page.session.importClicks, 1);
   assert.equal(page.session.importState, "IMPORT_RESULT_AMBIGUOUS");
   assert.equal(importClicks, 0);
 });
 
-test("verified second-attempt prerequisites report READY without enabling preparation", () => {
+test("verified second-attempt prerequisites enable preparation", () => {
   const page = mediumParagraphFixture(VERIFIED_URL);
   page.session.importClicks = 1;
   page.session.importState = "IMPORT_RESULT_AMBIGUOUS";
@@ -1972,9 +2008,137 @@ test("verified second-attempt prerequisites report READY without enabling prepar
   assert.equal(diagnostics.secondAttemptAuthorization, "NOT_AUTHORIZED");
   assert.equal(diagnostics.observedNativeImportClicks, 0);
   assert.equal(diagnostics.automaticNativeImportActivation, "DISABLED");
-  assert.equal(ui.importButton.disabled, true);
-  assert.equal(ui.importButton.click(), false);
+  assert.equal(ui.importButton.disabled, false);
+  assert.equal(diagnostics.secondAttemptPreparationControl, "ENABLED");
+  assert.equal(diagnostics.secondAttemptReason, "None");
+  assert.match(ui.panel.children[1].textContent, /Prepare one manual Import attempt/);
   assert.equal(page.session.importClicks, 1);
+});
+
+function readySecondAttemptPage() {
+  const page = mediumParagraphFixture(VERIFIED_URL);
+  page.session.importClicks = 1;
+  page.session.importState = "IMPORT_RESULT_AMBIGUOUS";
+  page.session.lastFillResult = { fillSynchronizationStatus: "VERIFIED",
+    exactUrlPresentAfterward: true, fingerprintMatch: true };
+  return page;
+}
+
+test("preparation rechecks the changed page before requesting storage", async () => {
+  const page = readySecondAttemptPage();
+  let writes = 0;
+  page.session.secondAttemptStore = { async set() { writes += 1; } };
+  const ui = onPageFixture(page);
+  assert.equal(ui.importButton.disabled, false);
+  page.editor.textContent = "https://example.com/other";
+  page.editor.innerText = page.editor.textContent;
+  assert.equal(ui.importButton.click(), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes, 0);
+  assert.equal(ui.host.getImportDiagnostics().secondAttemptEligibility, "NOT_READY");
+  assert.equal(ui.importButton.disabled, true);
+  assert.equal(page.session.secondAttempt.state, "SECOND_ATTEMPT_NOT_AUTHORIZED");
+});
+
+test("preparation shows ARMED only after the storage write resolves", async () => {
+  const page = readySecondAttemptPage();
+  let nativeClicks = 0;
+  page.buttons[0].click = () => { nativeClicks += 1; throw Error("native click forbidden"); };
+  let release;
+  let writeCount = 0;
+  let written;
+  page.session.secondAttemptStore = { async set(values) {
+    writeCount += 1;
+    written = values[secondAttempt.KEY];
+    await new Promise(resolve => { release = resolve; });
+  } };
+  const beforeUrl = page.location.href;
+  const beforeSource = page.editor.textContent;
+  const ui = onPageFixture(page);
+  assert.equal(ui.importButton.disabled, false);
+  assert.equal(ui.importButton.click(), true);
+  assert.equal(ui.importButton.disabled, true);
+  assert.equal(ui.host.getImportDiagnostics().secondAttemptAuthorization, "NOT_AUTHORIZED");
+  assert.equal(writeCount, 1);
+  assert.equal(written.attemptNumber, 2);
+  assert.equal(written.observedNativeImportClicks, 0);
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  const diagnostics = ui.host.getImportDiagnostics();
+  assert.equal(diagnostics.secondAttemptEligibility, "READY");
+  assert.equal(diagnostics.secondAttemptAuthorization, "ARMED");
+  assert.equal(diagnostics.secondAttemptPreparationControl, "DISABLED");
+  assert.equal(diagnostics.authorizedAttemptNumber, 2);
+  assert.equal(diagnostics.observedNativeImportClicks, 0);
+  assert.equal(ui.importButton.click(), false);
+  assert.match(ui.panel.children[1].textContent,
+    /Attempt 2 is armed\. Do not click Prepare again\. Medium's native Import has not been clicked\./);
+  assert.equal(writeCount, 1);
+  assert.equal(nativeClicks, 0);
+  assert.equal(page.location.href, beforeUrl);
+  assert.equal(page.editor.textContent, beforeSource);
+  assert.equal(page.doc.submitListener, undefined);
+  assert.equal(page.session.importClicks, 1);
+  assert.equal(page.session.importState, "IMPORT_RESULT_AMBIGUOUS");
+});
+
+test("failed reservation leaves preparation unarmed and the native button untouched", async () => {
+  const page = readySecondAttemptPage();
+  let nativeClicks = 0;
+  page.buttons[0].click = () => { nativeClicks += 1; };
+  page.session.secondAttemptStore = { async set() { throw Error("storage failed"); } };
+  const ui = onPageFixture(page);
+  assert.equal(ui.importButton.click(), true);
+  await new Promise(resolve => setImmediate(resolve));
+  const diagnostics = ui.host.getImportDiagnostics();
+  assert.equal(diagnostics.secondAttemptAuthorization, "NOT_AUTHORIZED");
+  assert.equal(diagnostics.authorizedAttemptNumber, null);
+  assert.equal(diagnostics.observedNativeImportClicks, 0);
+  assert.equal(nativeClicks, 0);
+});
+
+test("Prepare handler records one invocation and an authoritative ARMED record after a lost response", async () => {
+  const page = readySecondAttemptPage();
+  const ui = onPageFixture(page);
+  let saved = null;
+  let requests = 0;
+  page.session.secondAttemptStore = {
+    async get() { return { ok: true, exists: Boolean(saved),
+      record: saved || secondAttempt.empty(), source: "chrome.storage.session" }; },
+    async set(values) {
+      requests += 1;
+      saved = values[secondAttempt.KEY];
+      throw Error("WORKER_RESPONSE_NOT_RECEIVED");
+    }
+  };
+  assert.equal(ui.importButton.click(), true);
+  await new Promise(resolve => setImmediate(resolve));
+  const diagnostic = ui.host.getImportDiagnostics();
+  assert.equal(diagnostic.prepareHandlerInvocationCount, 1);
+  assert.equal(diagnostic.prepareTransaction.clickReceived, true);
+  assert.equal(diagnostic.prepareTransaction.freshReadinessCheck, "PASS");
+  assert.equal(diagnostic.prepareTransaction.rejectionReason, "WORKER_RESPONSE_NOT_RECEIVED");
+  assert.equal(requests, 1);
+  assert.equal(diagnostic.secondAttemptAuthorization, "ARMED");
+  assert.equal(diagnostic.prepareUiArmedTransitionCompleted, false);
+  assert.equal(diagnostic.secondAttemptPreparationControl, "DISABLED");
+  assert.equal(ui.importButton.click(), false);
+});
+
+test("replaced Shadow DOM Prepare handler is detached and a duplicate mount attaches none", () => {
+  const page = readySecondAttemptPage();
+  const ui = onPageFixture(page);
+  const originalHandler = ui.importButton.listeners.click;
+  const same = mediumControls.mount(page.doc, page.location, inspector, page.session);
+  assert.equal(same, ui.host);
+  assert.equal(ui.importButton.listeners.click, originalHandler);
+  const nextSession = { ...page.session };
+  const replacement = mediumControls.mount(page.doc, page.location, inspector, nextSession);
+  assert.notEqual(replacement, ui.host);
+  assert.equal(ui.importButton.listeners.click, undefined);
+  assert.equal(replacement.getImportDiagnostics().prepareClickListenerAttached, true);
+  assert.equal(replacement.getImportDiagnostics().prepareClickListenerGeneration,
+    ui.host.getImportDiagnostics().prepareClickListenerGeneration + 1);
 });
 
 test("known ambiguous result cannot trigger a second Import", () => {
@@ -2624,7 +2788,7 @@ test("background storage bridge keeps known attempt terminal and rejects a reset
   const context = { MediumImportSession: importSession,
     MediumSecondAttempt: secondAttempt, URL,
     importScripts(...files) { assert.deepEqual(files,
-      ["import-session.js", "second-attempt.js"]); },
+      ["import-session.js", "second-attempt.js", "medium-retirement.js"]); },
     chrome: { storage: { session: storage }, runtime: { onMessage: {
       addListener(fn) { listener = fn; }
     } } } };

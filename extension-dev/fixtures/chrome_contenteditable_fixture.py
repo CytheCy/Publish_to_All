@@ -59,7 +59,8 @@ def main() -> None:
         typed = page.evaluate("window.editEvents")
         assert typed == ["beforeinput", "input"], typed
         page.set_content('<div id="editor" contenteditable="true">sample</div>')
-        page.add_script_tag(path=str(Path(__file__).resolve().parents[1] / "medium-fill.js"))
+        page.add_script_tag(path=str(Path(__file__).resolve().parents[2] /
+                                     "chrome-extension/medium-fill.js"))
         helper = page.evaluate("""() => {
           const source = 'replacement';
           return MediumFill.editSource(document, {

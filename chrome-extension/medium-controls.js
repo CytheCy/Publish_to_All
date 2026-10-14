@@ -7,7 +7,6 @@
   const SOURCE_FINGERPRINT =
     "2a5f676c8743eda141101e793cc4ce988ba6f029d0805c0498271bd072937349";
   const RESULT_WAIT_MS = 30000;
-  const ENABLE_PREPARE_SECOND_ATTEMPT = false;
   const secondAttempt = root.MediumSecondAttempt ||
     (typeof require === "function" ? require("./second-attempt.js") : null);
 
@@ -21,6 +20,7 @@
   }
 
   function eligibility(report, session, location) {
+    if (session?.urlImportRetired) return { ready: false, reason: "MEDIUM_URL_IMPORT_RETIRED" };
     const view = report?.importInterface;
     if (!onImportPage(location) || report?.page !== IMPORT_URL) {
       return { ready: false, reason: "Wrong page" };
@@ -43,6 +43,7 @@
   }
 
   function importEligibility(report, session, location, navigatingAway) {
+    if (session?.urlImportRetired) return { ready: false, reason: "MEDIUM_URL_IMPORT_RETIRED" };
     const view = report?.importInterface;
     const input = view?.sourceUrlInput;
     const url = input?.existingUrl;
@@ -127,9 +128,15 @@
   }
 
   function secondAttemptReadiness(report, session, location, inspector, doc,
-      record, documentToken) {
+      record, documentToken, navigatingAway = false) {
+    if (session?.urlImportRetired) return {
+      state: "SECOND_ATTEMPT_NOT_READY", reason: "MEDIUM_URL_IMPORT_RETIRED" };
+    if (navigatingAway) return {
+      state: "SECOND_ATTEMPT_NOT_READY", reason: "IMPORT_PAGE_NAVIGATING_AWAY" };
     if (session.secondAttemptStorageAvailable === false) return {
       state: "SECOND_ATTEMPT_NOT_READY", reason: "SECOND_ATTEMPT_STORAGE_UNAVAILABLE" };
+    if (session.prepareBlocked) return {
+      state: "SECOND_ATTEMPT_NOT_READY", reason: "PREVIOUS_PREPARATION_UNRESOLVED" };
     if (!inspector || !doc || !report) return {
       state: "SECOND_ATTEMPT_NOT_READY", reason: "PAGE_INSPECTION_UNAVAILABLE" };
     const raw = inspector.inspectImportRaw(doc, location, report);
@@ -215,7 +222,10 @@
         session.importState !== "IMPORT_RESULT_AMBIGUOUS" &&
         session.importState !== "IMPORT_RESULT_VERIFIED") || !doc.body || !doc.createElement) return null;
     const existing = doc.getElementById(HOST_ID);
-    if (existing?.importPanelSession === session) return existing;
+    if (existing?.importPanelSession === session &&
+        (existing.shadowRoot?.contains?.(existing.prepareControl) ??
+          existing.prepareControl?.parentElement?.parentElement === existing.shadowRoot))
+      return existing;
     existing?.disposeImportPanel?.();
     existing?.remove?.();
 
@@ -261,6 +271,9 @@
     shadow.append(style, panel);
     doc.body.append(host);
     host.importPanelSession = session;
+    host.prepareControl = importButton;
+    const prepareGeneration = (root.__publishToAllPrepareGeneration || 0) + 1;
+    root.__publishToAllPrepareGeneration = prepareGeneration;
 
     let lastAction = "NONE";
     let actionReason = "None";
@@ -280,6 +293,15 @@
     let nativeClickEvidence = null;
     let nativeClickClassification = null;
     let armedNativeTarget = null;
+    let prepareHandlerInvocations = 0;
+    let preparePointerReceived = false;
+    let prepareListenerAttached = false;
+    let prepareTransitionCompleted = false;
+    session.prepareTransaction ||= { transactionId: "Not observed",
+      clickReceived: false, freshReadinessCheck: "NOT_RUN",
+      freshReadinessFailure: "Not observed", reservationRequestSent: false,
+      contentResponseReceived: false, backgroundResponse: "NOT_RECEIVED",
+      rejectionReason: "None" };
 
     function setImportState(state) {
       session.importState = state;
@@ -339,10 +361,13 @@
           importGuard = canOfferVerifiedImport(report, session, location,
             inspector, doc, navigatingAway);
           secondReadiness = secondAttemptReadiness(report, session, location,
-            inspector, doc, session.secondAttempt, documentToken);
+            inspector, doc, session.secondAttempt.state === "SECOND_ATTEMPT_ARMED" ?
+              secondAttempt.empty() : session.secondAttempt, documentToken, navigatingAway);
         } else {
           guard = { ready: false, reason: "Import page has changed" };
           importGuard = { allowed: false, reason: guard.reason };
+          secondReadiness = { state: "SECOND_ATTEMPT_NOT_READY",
+            reason: "IMPORT_PAGE_MISMATCH" };
         }
         if (["IMPORT_CLICK_INTENT", "IMPORT_CLICKED"].includes(session.importState)) {
           const result = inspector.inspectImportResult(doc, location);
@@ -361,18 +386,27 @@
       } catch {
         guard = { ready: false, reason: "Page inspection failed" };
         importGuard = { allowed: false, reason: "Page inspection failed" };
+        secondReadiness = { state: "SECOND_ATTEMPT_NOT_READY",
+          reason: "PAGE_INSPECTION_FAILED" };
       }
       lastImportReport = report;
       button.disabled = busy || !guard.ready || lastAction === "FILLED";
-      // Authorization is intentionally unavailable in this development build.
-      importButton.disabled = !ENABLE_PREPARE_SECOND_ATTEMPT || busy ||
-        secondReadiness.state !== "SECOND_ATTEMPT_READY";
+      importButton.disabled = busy ||
+        secondReadiness.state !== "SECOND_ATTEMPT_READY" ||
+        session.secondAttempt.state !== "SECOND_ATTEMPT_NOT_AUTHORIZED" ||
+        session.prepareBlocked === true;
       if (importButton.disabled) importButton.setAttribute("aria-disabled", "true");
       else importButton.removeAttribute("aria-disabled");
       button.hidden = !guard.ready;
       importButton.hidden = !importGuard.allowed && session.importState === "IMPORT_NOT_STARTED" &&
         report?.importInterface?.sourceUrlInput?.editorState !== "EXACT_SOURCE_URL_PRESENT";
-      message.textContent = session.importState === "IMPORT_RESULT_VERIFIED" ?
+      message.textContent = session.urlImportRetired ?
+        "URL Import retired for this story. Two real attempts reconciled with no draft." :
+        session.secondAttempt.state === "SECOND_ATTEMPT_ARMED" ?
+        "Attempt 2 is armed. Do not click Prepare again. Medium's native Import has not been clicked." :
+        secondReadiness.state === "SECOND_ATTEMPT_READY" && !importButton.disabled ?
+          "Verified source ready. Prepare one manual Import attempt; Medium's native Import has not been clicked." :
+        session.importState === "IMPORT_RESULT_VERIFIED" ?
         "Medium draft identified. Stopped." :
         session.importState === "IMPORT_RESULT_AMBIGUOUS" ?
           "Import result is ambiguous. Stopped; no retry." :
@@ -433,13 +467,14 @@
       }
       keepMediumImportVisible();
       const dom = importButtonDomState(doc, shadow, host, importButton);
-      const attemptAvailable = (session.importClicks || 0) === 0 &&
+      const attemptAvailable = !session.urlImportRetired && (session.importClicks || 0) === 0 &&
         session.canPersistImport !== false && !session.restorationBlocked &&
         !["IMPORT_CLICK_INTENT", "IMPORT_CLICKED", "IMPORT_RESULT_VERIFIED",
           "IMPORT_RESULT_AMBIGUOUS"].includes(session.importState);
       const disabledReason = importGuard.allowed ?
         busy ? "Import action is in progress" : dom.blockingReason : importGuard.reason;
       lastImportDiagnostics = {
+        urlImportRetired: session.urlImportRetired === true,
         lifecycleState: session.importState,
         attemptAvailable, clickAttempts: session.importClicks || 0,
         guardAllowed: importGuard.allowed,
@@ -452,6 +487,9 @@
         restored: session.restoredImportSession || null
       };
       line("Import lifecycle state", lastImportDiagnostics.lifecycleState);
+      line("URL Import retired", session.urlImportRetired ? "Yes" : "No");
+      line("Known real Import attempts", session.urlImportRetired ? 2 : 1);
+      line("URL Import retry allowed", "No");
       line("Import attempt available", attemptAvailable ? "Yes" : "No");
       line("Import click attempts", lastImportDiagnostics.clickAttempts);
       line("Import guard allowed", importGuard.allowed ? "Yes" : "No");
@@ -526,22 +564,50 @@
         secondAttemptEligibility: secondReadiness.state === "SECOND_ATTEMPT_READY" ?
           "READY" : "NOT_READY",
         secondAttemptReason: secondReadiness.reason,
+        secondAttemptPreparationControl: importButton.disabled ? "DISABLED" : "ENABLED",
         secondAttemptAuthorization: second.state === "SECOND_ATTEMPT_ARMED" ?
-          "ARMED" : "NOT_AUTHORIZED",
+          "ARMED" : second.state === "SECOND_ATTEMPT_NOT_AUTHORIZED" ?
+            "NOT_AUTHORIZED" : "CONSUMED",
         authorizedAttemptNumber: second.authorizedAttemptNumber,
         observedNativeImportClicks: second.observedNativeImportClicks,
         nativeClickEvidence, nativeClickClassification,
-        automaticNativeImportActivation: "DISABLED"
+        automaticNativeImportActivation: "DISABLED",
+        prepareTransaction: { ...session.prepareTransaction,
+          background: session.backgroundPrepareDiagnostic ||
+            session.prepareTransaction.background || null },
+        prepareControlActualDisabled: Boolean(importButton.disabled),
+        prepareControlHitTest: importButtonDomState(doc, shadow, host, importButton).hitTest,
+        prepareControlInCurrentShadow: shadow.contains?.(importButton) ?? true,
+        prepareClickListenerGeneration: prepareGeneration,
+        prepareClickListenerAttached: prepareListenerAttached,
+        prepareHandlerInvocationCount: prepareHandlerInvocations,
+        preparePointerReceived,
+        prepareUiArmedTransitionCompleted: prepareTransitionCompleted,
+        attempt2PersistedRecordPresent: session.secondAttemptPersisted === true,
+        attempt2StorageSource: session.secondAttemptStorageSource || "Not observed"
       });
       line("Attempt 1 activation mechanism", lastImportDiagnostics.attempt1ActivationMechanism);
       line("Attempt 1 reconciliation", "NO_DRAFT_FOUND");
       line("Current Fill synchronization", lastImportDiagnostics.currentFillSynchronization);
       line("Programmatic Import click trusted in Chrome fixture", "No");
       line("Second attempt eligibility", lastImportDiagnostics.secondAttemptEligibility);
-      line("Second attempt eligibility reason", secondReadiness.reason);
+      line("Second attempt readiness failure", secondReadiness.reason);
+      line("Second attempt preparation control",
+        lastImportDiagnostics.secondAttemptPreparationControl);
       line("Second attempt authorization", lastImportDiagnostics.secondAttemptAuthorization);
       line("Authorized attempt number", second.authorizedAttemptNumber ?? "None");
       line("Observed native Import clicks", second.observedNativeImportClicks);
+      line("Prepare click received", session.prepareTransaction.clickReceived ? "Yes" : "No");
+      line("Prepare transaction ID", session.prepareTransaction.transactionId);
+      line("Fresh readiness check", session.prepareTransaction.freshReadinessCheck);
+      line("Fresh readiness failure", session.prepareTransaction.freshReadinessFailure);
+      line("Reservation request sent",
+        session.prepareTransaction.reservationRequestSent ? "Yes" : "No");
+      line("Prepare control actual disabled", importButton.disabled ? "true" : "false");
+      line("Prepare control hit test", lastImportDiagnostics.prepareControlHitTest);
+      line("Prepare click listener generation", prepareGeneration);
+      line("Prepare handler invocation count", prepareHandlerInvocations);
+      line("UI armed transition completed", prepareTransitionCompleted ? "Yes" : "No");
       line("Native Import click observed", nativeClickEvidence ? "Yes" : "No");
       line("Native Import click isTrusted", nativeClickEvidence ?
         nativeClickEvidence.isTrusted ? "Yes" : "No" : "Not observed");
@@ -558,7 +624,7 @@
       queueMicrotask(refresh);
     }
 
-    button.addEventListener("click", event => {
+    if (!session.urlImportRetired) button.addEventListener("click", event => {
       event.preventDefault();
       event.stopPropagation();
       if (busy || button.disabled || session.fills !== 0) return;
@@ -597,26 +663,88 @@
       }
     });
 
-    importButton.addEventListener("click", async event => {
+    const onPreparePointer = () => { preparePointerReceived = true; };
+    if (!session.urlImportRetired) importButton.addEventListener("pointerdown", onPreparePointer);
+    const onPrepareClick = async event => {
+      prepareHandlerInvocations += 1;
+      session.prepareTransaction = { transactionId:
+        `p-${Date.now().toString(36)}-${prepareHandlerInvocations}`,
+      clickReceived: true, freshReadinessCheck: "NOT_RUN",
+      freshReadinessFailure: "Not observed", reservationRequestSent: false,
+      contentResponseReceived: false, backgroundResponse: "NOT_RECEIVED",
+      rejectionReason: "None", background: null };
       event.preventDefault();
       event.stopPropagation();
-      if (!ENABLE_PREPARE_SECOND_ATTEMPT || importButton.disabled || busy) return;
+      if (root.__publishToAllPrepareGeneration !== prepareGeneration ||
+          host.prepareControl !== importButton || importButton.disabled || busy) {
+        session.prepareTransaction.freshReadinessFailure = "STALE_OR_DISABLED_PREPARE_CONTROL";
+        refresh();
+        return;
+      }
       busy = true;
       importButton.disabled = true;
       try {
+        if (session.secondAttemptStore?.get) {
+          const authoritative = await session.secondAttemptStore.get();
+          session.secondAttemptPersisted = authoritative.exists;
+          session.secondAttemptStorageSource = authoritative.source;
+          session.backgroundPrepareDiagnostic = authoritative.diagnostic;
+          session.secondAttempt = authoritative.record;
+          if (authoritative.exists) {
+            session.prepareTransaction.freshReadinessFailure =
+              "SECOND_ATTEMPT_ALREADY_RESERVED_OR_CONSUMED";
+            return;
+          }
+        }
         const report = inspector.inspectDocument(doc, location);
         const ready = secondAttemptReadiness(report, session, location,
-          inspector, doc, session.secondAttempt, documentToken);
+          inspector, doc, session.secondAttempt, documentToken, navigatingAway);
+        session.prepareTransaction.freshReadinessCheck =
+          ready.state === "SECOND_ATTEMPT_READY" ? "PASS" : "FAIL";
+        session.prepareTransaction.freshReadinessFailure = ready.reason;
         if (ready.state !== "SECOND_ATTEMPT_READY") return;
         const reserved = await secondAttempt.reserve({ storage: session.secondAttemptStore,
           record: session.secondAttempt, readiness: ready, documentToken });
         if (reserved) {
-          session.secondAttempt = reserved;
+          if (session.secondAttemptStore?.get) {
+            const authoritative = await session.secondAttemptStore.get();
+            session.secondAttemptPersisted = authoritative.exists;
+            session.secondAttemptStorageSource = authoritative.source;
+            session.backgroundPrepareDiagnostic = authoritative.diagnostic;
+            if (!authoritative.exists ||
+                JSON.stringify(authoritative.record) !== JSON.stringify(reserved))
+              throw Error("RESERVATION_READ_BACK_MISMATCH");
+            session.secondAttempt = authoritative.record;
+          } else session.secondAttempt = reserved;
           armedNativeTarget = ready.targets.action;
+          prepareTransitionCompleted = true;
         }
-      } catch { /* A failed reservation never authorizes a click. */ }
+      } catch (error) {
+        session.prepareBlocked = true;
+        session.prepareTransaction.rejectionReason = [
+          "RUNTIME_LAST_ERROR", "WORKER_RESPONSE_NOT_RECEIVED",
+          "WORKER_MESSAGE_ERROR", "WORKER_OR_STORAGE_ERROR",
+          "RESERVATION_REJECTED", "RESERVATION_READ_BACK_MISMATCH",
+          "WORKER_RESPONSE_RECORD_MISMATCH", "EXISTING_ATTEMPT_2_RECORD",
+          "ATTEMPT_1_PERSISTED_HISTORY_MISMATCH",
+          "SECOND_ATTEMPT_READ_BACK_MISMATCH"
+        ].includes(error.message) ? error.message : "PREPARE_TRANSACTION_ERROR";
+        if (session.secondAttemptStore?.get) {
+          try {
+            const authoritative = await session.secondAttemptStore.get();
+            session.secondAttempt = authoritative.record;
+            session.secondAttemptPersisted = authoritative.exists;
+            session.secondAttemptStorageSource = authoritative.source;
+            session.backgroundPrepareDiagnostic = authoritative.diagnostic;
+          } catch { /* Keep the gate closed until authoritative inspection succeeds. */ }
+        }
+      }
       finally { busy = false; refresh(); }
-    });
+    };
+    if (!session.urlImportRetired) {
+      importButton.addEventListener("click", onPrepareClick);
+      prepareListenerAttached = true;
+    }
 
     // Capture only. Never prevent, dispatch, replay, or initiate a Medium click.
     const observeNativeClick = event => {
@@ -655,7 +783,7 @@
       }
       setTimeout(refresh, 0);
     };
-    doc.addEventListener?.("click", observeNativeClick, true);
+    if (!session.urlImportRetired) doc.addEventListener?.("click", observeNativeClick, true);
 
     refresh();
     host.getImportDiagnostics = () => { refresh(); return lastImportDiagnostics; };
@@ -664,6 +792,9 @@
       return { report: lastImportReport, diagnostics: lastImportDiagnostics };
     };
     host.disposeImportPanel = () => {
+      importButton.removeEventListener?.("click", onPrepareClick);
+      importButton.removeEventListener?.("pointerdown", onPreparePointer);
+      prepareListenerAttached = false;
       doc.removeEventListener?.("click", observeNativeClick, true);
       observer?.disconnect();
       if (resultTimer) clearTimeout(resultTimer);

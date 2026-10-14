@@ -1,6 +1,11 @@
 """Never access the user's runtime state during tests."""
 
+import sys
+
 import pytest
+
+# Apply during collection too: imported exporter modules may otherwise write .pyc.
+sys.dont_write_bytecode = True
 
 
 @pytest.fixture(autouse=True)
