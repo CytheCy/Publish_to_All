@@ -307,6 +307,11 @@
       failedGuard: "workflowState",
       workflow: "MEDIUM_BODY_RECOVERY_AMBIGUOUS" };
     try {
+      const present = inspector.inspect(doc, location, story);
+      if (inspector.reconcileBody(doc, present, source,
+        { publishObserved })?.currentBodyExactCanonicalMatch)
+        return { ready: false, reason: "BODY_ALREADY_VERIFIED",
+          failedGuard: "workflowState", workflow: "MEDIUM_BODY_RECOVERY_VERIFIED" };
       const check = checkpoint(inspect(doc, inspector, location, story, source,
         publishObserved));
       return { ready: check.reason === "None", reason: check.reason,
@@ -390,8 +395,16 @@
       publishActionOccurred: false };
     let current;
     try {
+      if (used) {
+        result.bodyRecoveryFailure = "RECOVERY_ALREADY_ATTEMPTED";
+        return result;
+      }
       current = inspect(doc, inspector, location, story, source, publishObserved());
-      const reason = used ? "RECOVERY_ALREADY_ATTEMPTED" : checkpoint(current).reason;
+      if (current.reconciliation?.currentBodyExactCanonicalMatch) {
+        result.bodyRecoveryFailure = "BODY_ALREADY_VERIFIED";
+        return result;
+      }
+      const reason = checkpoint(current).reason;
       if (reason !== "None") { result.bodyRecoveryFailure = reason; return result; }
       // Focus and selection can cause editor reflow. Recheck the exact checkpoint
       // immediately before the first mutation.

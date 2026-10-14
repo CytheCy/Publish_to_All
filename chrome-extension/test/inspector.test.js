@@ -485,7 +485,7 @@ test("manifest is limited to Medium and has no broad permissions", () => {
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual(manifest.content_scripts[0].matches, ["https://medium.com/*"]);
   assert.deepEqual(manifest.content_scripts[0].js, ["story-title.js", "story-body.js",
-    "medium-retirement.js", "medium-editor-inspector.js", "medium-title-fill.js",
+    "medium-retirement.js", "medium-editor-inspector.js", "medium-save-state.js", "medium-title-fill.js",
     "medium-body-fill.js", "medium-body-recovery.js", "medium-title-controls.js", "medium-fill.js",
     "inspector.js", "second-attempt.js", "medium-controls.js",
     "import-session.js", "content.js"]);

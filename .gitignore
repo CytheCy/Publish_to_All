@@ -17,3 +17,4 @@ browser-profile/
 *.sqlite*
 *.log
 storage-state*.json
+.medium-draft-discovery/

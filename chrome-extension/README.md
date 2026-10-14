@@ -33,11 +33,23 @@ Recovery inspection reports each prerequisite as PASS or FAIL, including route, 
 
 The future canonical-link target is `https://cyporter.substack.com/p/saturation-of-artificial-intelligence-f8d`. Settings controls are inventoried only.
 
-## Manual discovery
+## Current draft protection and save state
 
-1. Reload the unpacked `chrome-extension/` in `chrome://extensions/`, then refresh the existing draft `/p/fd6c1824c4de/edit` without editing it.
-2. Run **Inspect Current Medium Page** only and return the complete report. It should show `MEDIUM_TITLE_VERIFIED`, `MEDIUM_BODY_PARTIAL`, `Partial body recovery classification: EXACT_CANONICAL_PREFIX`, current body safe text `01`, fingerprint `fnv1a32:20ed70ba`, `Body recovery eligibility: READY`, `Body recovery reason: None`, `Recovery start block: 1`, `Recovery next canonical block: 2`, `Block 1 requires formatting repair: Yes`, `Body recovery control interactability: ENABLED`, `Body fill eligibility: NOT_READY`, and `Publish capability: No`.
-3. Stop. Do not click **Resume verified Medium body**, **Fill verified Medium body**, **Publish**, or **Settings**.
+The current `/p/fd6c1824c4de/edit` tab contains all 36 canonical body blocks in
+its editor DOM, but Medium displayed a cannot-save warning. The body workflow
+labels describe DOM verification only. `Inspect Current Medium Page` now reports
+save-warning candidates, UI save indicators, bounded passive event telemetry,
+and an independent persistence field. `MEDIUM_SAVE_INDICATED` means only that
+Medium's UI appears to say "Saved"; it does not prove server persistence.
+`MEDIUM_PERSISTENCE_VERIFIED` is reserved for a future independent read of the
+server-stored body and is never assigned by this extension today. A disappearing
+warning also leaves persistence unverified.
+
+**CURRENT TAB CONTAINS DOM-VERIFIED BODY WITH UNVERIFIED SAVE STATE. DO NOT
+REFRESH, CLOSE, NAVIGATE, OR RETRY BODY RECOVERY.** Do not reload the extension
+into this tab yet. The current tab must be preserved until an independent,
+read-only verification strategy is proven safe. The local audit is in
+[`extension-dev/MEDIUM_SAVE_AUDIT.md`](../extension-dev/MEDIUM_SAVE_AUDIT.md).
 
 The first packaged body block is the heading text `01` (two characters, fingerprint `fnv1a32:20ed70ba`); the source Markdown marker `# ` is not sent to Medium. The prior `BLOCK_POSTCHECK_FAILED` occurred after prompt deletion and the first `insertText`, before heading formatting. Its three possible immediate causes are missing/reordered block, text other than `01`, or a transient title mismatch. The prior report did not capture the text or block order at that instant, so the next read-only inspection can identify the remaining content but cannot prove a past transient. A `font` wrapper alone does not make the local Chrome postcheck fail. The local fixture also models a transient block reflow that fails the postcheck yet leaves only `<font>01</font>` afterward, as well as a two-character noncanonical artifact.
 
@@ -50,6 +62,7 @@ node --test chrome-extension/test/*.test.js
 .venv/bin/python -B extension-dev/fixtures/chrome_medium_body_fixture.py
 .venv/bin/python -B extension-dev/fixtures/chrome_medium_partial_fixture.py
 .venv/bin/python -B extension-dev/fixtures/chrome_medium_recovery_fixture.py
+.venv/bin/python -B extension-dev/fixtures/chrome_medium_save_fixture.py
 .venv/bin/python -m pytest
 .venv/bin/python -m compileall -q src tests
 git diff --check

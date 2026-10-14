@@ -37,6 +37,10 @@
     let url;
     try { url = new URL(location.href); } catch { /* Route guard fails below. */ }
     const inspection = inspector.inspect(doc, location, story);
+    if (!used && body?.blocks?.length &&
+        inspector.reconcileBody?.(doc, inspection, body)?.currentBodyExactCanonicalMatch)
+      return { ready: false, reason: "BODY_ALREADY_VERIFIED", inspection,
+        diagnostics: { finalResult: "NOT_READY" } };
     const resolved = inspector.resolveBodySubregion(inspection);
     const editor = resolved?.root, title = resolved?.title, bodyNode = resolved?.body;
     const routeGuard = Boolean(url?.origin === "https://medium.com" &&

@@ -183,11 +183,22 @@ def test_local_chrome_exact_checkpoint_recovery_fixture():
     assert finished["titleFingerprintMatch"] and finished["draftIdentityUnchanged"]
     assert not finished["publishActionOccurred"]
     assert len(finished["completedBlocks"]) == 36
+    assert direct["saveState"]["domBodyVerified"]
+    assert not direct["saveState"]["persistenceVerified"]
+    assert direct["saveState"]["mediumSaveState"] == "MEDIUM_SAVE_INDICATED"
+    assert direct["afterWarning"]["mediumSaveState"] == "MEDIUM_SAVE_ERROR_VISIBLE"
+    assert direct["afterWarning"]["domBodyVerified"]
+    assert not direct["afterWarning"]["persistenceVerified"]
+    assert direct["afterWarning"]["safeToLeaveReloadPage"] == "No"
+    assert direct["again"]["normalFill"] == {"ready": False,
+        "reason": "BODY_ALREADY_VERIFIED"}
     assert finished["completedBlocks"][0] == {"number": 1, "kind": "heading",
         "normalizedLength": 2, "fingerprint": "fnv1a32:20ed70ba"}
     assert finished["completedBlocks"][1] == {"number": 2, "kind": "paragraph",
         "normalizedLength": 905, "fingerprint": "fnv1a32:ad559899"}
     assert direct["textCount"] == 35  # Existing 01 was never retyped.
+
+
     assert direct["formatCount"] == 36
     assert direct["finalBlocks"] == 36
     assert direct["again"]["reason"] == "BODY_ALREADY_VERIFIED"
@@ -321,3 +332,55 @@ def test_local_chrome_exact_checkpoint_recovery_fixture():
     assert changed["formatCount"] == changed["textCount"] == 0
     for case in report.values():
         assert case["publish"] == case["settings"] == 0
+
+def test_local_chrome_save_warning_and_event_semantics():
+    completed = subprocess.run(
+        [sys.executable, "-B", str(EXTENSION_DEV / "fixtures/chrome_medium_save_fixture.py")],
+        cwd=ROOT, capture_output=True, text=True, check=True, timeout=60)
+    report = json.loads(completed.stdout)
+    warning = report["withWarning"]
+    assert warning["mediumSaveState"] == "MEDIUM_SAVE_ERROR_VISIBLE"
+    assert warning["mediumSaveErrorVisible"]
+    assert warning["mediumSaveWarningCandidateCount"] == 1
+    assert warning["mediumSaveWarningCandidates"][0]["role"] == "alert"
+    assert warning["mediumSaveWarningCandidates"][0]["safeText"].startswith(
+        "Something is wrong and we cannot save your story.")
+    for state in ("withoutWarning", "withWarning", "warningGone", "indicated"):
+        assert report[state]["domBodyVerified"]
+        assert not report[state]["persistenceVerified"]
+        assert report[state]["safeToLeaveReloadPage"] == "No"
+    assert report["warningGone"]["mediumSaveState"] == "MEDIUM_SAVE_UNKNOWN"
+    assert report["pending"]["mediumSaveState"] == "MEDIUM_SAVE_PENDING"
+    assert report["indicated"]["mediumSaveState"] == "MEDIUM_SAVE_INDICATED"
+    assert report["bounded"]["mediumSaveWarningCandidateCount"] == 12
+    assert len(report["bounded"]["mediumSaveWarningCandidates"]) == 5
+    assert len(report["telemetryEvents"]) <= 80
+    assert any(item["type"] == "beforeinput" for item in report["earlyTelemetry"])
+    assert any(item["type"] == "editor-dom-mutation"
+               for item in report["earlyTelemetry"])
+    assert any(item["type"] == "save-warning-appeared"
+               for item in report["warningTelemetry"])
+    assert any(item["type"] == "save-warning-disappeared"
+               for item in report["goneTelemetry"])
+    assert any(item["type"] == "input" for item in report["telemetryEvents"])
+    assert report["eventAllowed"] and not report["defaultPrevented"]
+    assert report["noEditorMutationOnInspection"]
+    operations = {item["operation"]: item for item in report["operations"]}
+    for name in ("title insertText", "recovery formatBlock h1",
+                 "recovery insertParagraph", "recovery insertText"):
+        assert operations[name]["commandSucceeded"]
+        assert operations[name]["inputObserved"]
+        assert operations[name]["domChanged"]
+        assert all(operations[name]["isTrusted"])
+    assert not any(item["beforeinputObserved"] or item["changeObserved"]
+                   for item in operations.values())
+
+
+def test_save_inspection_has_no_retry_or_editor_mutation_path():
+    source = (EXTENSION / "medium-save-state.js").read_text(encoding="utf-8")
+    for forbidden in ("execCommand", "dispatchEvent", "preventDefault",
+                      "stopPropagation", "click(", "fetch(", "location.assign",
+                      "location.replace", "innerHTML =", "textContent ="):
+        assert forbidden not in source
+    assert "MutationObserver" in source
+    assert "records.length > limit" in source

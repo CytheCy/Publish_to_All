@@ -12,7 +12,7 @@
   "content_scripts": [
     {
       "matches": ["https://medium.com/*"],
-      "js": ["story-title.js", "story-body.js", "medium-retirement.js", "medium-editor-inspector.js", "medium-title-fill.js", "medium-body-fill.js", "medium-body-recovery.js", "medium-title-controls.js", "medium-fill.js", "inspector.js", "second-attempt.js", "medium-controls.js", "import-session.js", "content.js"],
+      "js": ["story-title.js", "story-body.js", "medium-retirement.js", "medium-editor-inspector.js", "medium-save-state.js", "medium-title-fill.js", "medium-body-fill.js", "medium-body-recovery.js", "medium-title-controls.js", "medium-fill.js", "inspector.js", "second-attempt.js", "medium-controls.js", "import-session.js", "content.js"],
       "run_at": "document_idle",
       "all_frames": false
     }

@@ -126,6 +126,7 @@ SCRIPT = r"""async mode => {
   const control = host?.getRecoveryDiagnostics();
   const noMutationOnInspection = beforeHTML === editor.innerHTML;
   let result = null, again = null;
+  let saveState = null, afterWarning = null;
   if (mode === 'changedBeforeClick') {
     first.textContent = 'XY';
     result = await MediumBodyRecovery.resume(document, MediumEditorInspector,
@@ -144,10 +145,21 @@ SCRIPT = r"""async mode => {
       location, story, source, { used: result.bodyRecoveryAttempted,
         verified: result.workflow === 'MEDIUM_BODY_RECOVERY_VERIFIED' });
     if (mode === 'direct') {
+      const reconciliation = MediumEditorInspector.reconcileBody(document,
+        MediumEditorInspector.inspect(document, location, story), source);
+      saveState = MediumSaveState.inspect(document, reconciliation);
+      const warning = document.createElement('div');
+      warning.setAttribute('role', 'alert'); warning.className = 'save-error';
+      warning.textContent = 'Something is wrong and we cannot save your story.';
+      document.body.append(warning);
+      afterWarning = MediumSaveState.inspect(document, reconciliation);
       const second = await MediumBodyRecovery.resume(document, MediumEditorInspector,
         location, story, source, { used: true });
       again.secondInvocation = { attempted: second.bodyRecoveryAttempted,
         reason: second.bodyRecoveryFailure };
+      const normalAfter = MediumBodyFill.eligibility(document, MediumEditorInspector,
+        location, story, source);
+      again.normalFill = { ready: normalAfter.ready, reason: normalAfter.reason };
     }
   }
   return { before, normal: { ready: normal.ready, reason: normal.reason },
@@ -158,7 +170,7 @@ SCRIPT = r"""async mode => {
     control: { present: control?.present, interactability: control?.interactability,
       disabledProperty: control?.disabledProperty,
       listenerAttached: control?.listenerAttached }, noMutationOnInspection,
-    result, again, publish, settings, formatCount, paragraphCount,
+    result, again, saveState, afterWarning, publish, settings, formatCount, paragraphCount,
     textCount, reflowCount,
     firstBlock: document.querySelector('#editor_7 section')?.children[1]?.outerHTML.slice(0, 120),
     finalBlocks: document.querySelector('#editor_7 section')?.children.length - 1,
@@ -196,7 +208,7 @@ def main():
             page.goto(URL if mode != "wrongDraft" else
                       "https://medium.com/p/aaaaaaaaaaaa/edit")
             for name in ("story-title.js", "story-body.js", "medium-editor-inspector.js",
-                         "medium-body-fill.js", "medium-body-recovery.js",
+                         "medium-save-state.js", "medium-body-fill.js", "medium-body-recovery.js",
                          "medium-title-controls.js"):
                 page.add_script_tag(path=str(EXTENSION / name))
             report[mode] = page.evaluate(SCRIPT, mode)

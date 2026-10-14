@@ -104,6 +104,36 @@ test("popup exposes only the exact recovery path after inspection", async () => 
   assert.deepEqual(fixture.sent, ["INSPECT_MEDIUM_PAGE"]);
 });
 
+test("complete DOM with save error disables both body actions and warns against leaving", async () => {
+  const fixture = popupFixture({ ok: true, report: report(),
+    saveInspection: { mediumSaveState: "MEDIUM_SAVE_ERROR_VISIBLE",
+      mediumSaveErrorVisible: true,
+      mediumSaveErrorText: "Something is wrong and we cannot save your story.",
+      mediumSaveWarningCandidateCount: 1,
+      mediumSaveWarningCandidates: [{ tag: "div", role: "alert", visible: true,
+        normalizedTextLength: 52, safeText: "Something is wrong and we cannot save your story." }],
+      mediumSaveIndicatorVisible: false, mediumSaveIndicatorText: "Not observed",
+      domBodyVerified: true, persistenceVerified: false,
+      persistenceVerificationBasis: "No independent read of server-stored draft body",
+      safeToLeaveReloadPage: "No",
+      overallMediumDraftState: "BODY_DOM_VERIFIED_SAVE_UNVERIFIED",
+      currentTabProtection: "CURRENT TAB CONTAINS DOM-VERIFIED BODY WITH UNVERIFIED SAVE STATE\nDO NOT REFRESH\nDO NOT CLOSE\nDO NOT NAVIGATE\nDO NOT RETRY BODY RECOVERY" },
+    bodyEligibility: { ready: true, reason: "None" },
+    recoveryEligibility: { ready: true, reason: "None" },
+    bodyReconciliation: { currentBodyExactCanonicalMatch: true,
+      currentBodyFingerprint: "fnv1a32:342d11eb" } });
+  await fixture.inspect.action();
+  assert.equal(fixture.bodyControl.disabled, true);
+  assert.equal(fixture.recoveryControl.disabled, true);
+  assert.match(fixture.output.textContent, /Medium save state: SAVE_ERROR_VISIBLE/);
+  assert.match(fixture.output.textContent, /Medium save state code: MEDIUM_SAVE_ERROR_VISIBLE/);
+  assert.match(fixture.output.textContent, /DOM body verified: Yes/);
+  assert.match(fixture.output.textContent, /Persistence verified: No/);
+  assert.match(fixture.output.textContent, /Safe to leave\/reload page: No/);
+  assert.match(fixture.output.textContent, /DO NOT REFRESH/);
+  assert.deepEqual(fixture.sent, ["INSPECT_MEDIUM_PAGE"]);
+});
+
 test("popup names bounded unexpected authored content", async () => {
   const fixture = popupFixture({ ok: true, report: report(),
     recoveryEligibility: { ready: false, reason: "UNEXPECTED_BODY_CONTENT",

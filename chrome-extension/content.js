@@ -20,6 +20,8 @@ let recoveryUsed = false;
 let recoveryBusy = false;
 let recoveryVerified = false;
 let recoveryStorageLoaded = false;
+const saveTelemetry = typeof MediumSaveState !== "undefined" ?
+  MediumSaveState.observe(document) : null;
 let publishActionsObserved = 0;
 const PUBLISH_OBSERVED_KEY = "publishToAllMediumPublishObserved_fd6c1824c4de";
 if (location.pathname === "/p/fd6c1824c4de/edit") {
@@ -326,6 +328,8 @@ const inspectMessage = (message, _sender, sendResponse) => {
       typeof MediumEditorInspector.reconcileBody === "function" ?
       MediumEditorInspector.reconcileBody(document, editorInspection, storyBody,
         { publishObserved: publishActionsObserved > 0 }) : null;
+    const saveInspection = typeof MediumSaveState !== "undefined" ?
+      MediumSaveState.inspect(document, bodyReconciliation) : null;
     if (bodyReconciliation?.partialBodyDetected)
       editorInspection.workflowState = "MEDIUM_BODY_PARTIAL";
     else if (bodyReconciliation?.currentBodyExactCanonicalMatch)
@@ -340,6 +344,7 @@ const inspectMessage = (message, _sender, sendResponse) => {
     const recoveryControlDiagnostics =
       recoveryControlsHost?.getRecoveryDiagnostics?.() || null;
     sendResponse({ ok: true, report, reconciliation, editorInspection,
+      saveInspection, saveTelemetry: saveTelemetry?.read() || [],
       bodyReconciliation, bodyAttemptRecorded: bodyFillUsed,
       titleEligibility, titleControlDiagnostics, bodyEligibility,
       bodyControlDiagnostics, bodyFillResult, recoveryEligibility,
@@ -376,6 +381,7 @@ chrome.runtime.onMessage.addListener(inspectMessage);
 globalThis.__publishToAllMediumContent = {
   dispose() {
     disposed = true;
+    saveTelemetry?.dispose();
     mediumControlsHost?.disposeImportPanel?.();
     titleControlsHost?.disposeTitlePanel?.();
     titleControlsHost?.remove?.();

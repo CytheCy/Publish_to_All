@@ -562,6 +562,31 @@ function formatBodyDiagnostics(status) {
   ].join("\n");
 }
 
+function formatSaveDiagnostics(status) {
+  const save = status.saveInspection || {};
+  const telemetry = (status.saveTelemetry || []).slice(-80);
+  return [
+    ...(save.currentTabProtection ? [save.currentTabProtection, ""] : []),
+    `Overall Medium draft state: ${printable(save.overallMediumDraftState ||
+      "BODY_DOM_UNVERIFIED_SAVE_UNVERIFIED")}`,
+    `Medium save state: ${printable((save.mediumSaveState ||
+      "MEDIUM_SAVE_UNKNOWN").replace(/^MEDIUM_/, ""))}`,
+    `Medium save state code: ${printable(save.mediumSaveState || "MEDIUM_SAVE_UNKNOWN")}`,
+    `Medium save error visible: ${yesNo(save.mediumSaveErrorVisible)}`,
+    `Medium save error text: ${printable(save.mediumSaveErrorText)}`,
+    `Medium save warning candidate count: ${save.mediumSaveWarningCandidateCount ?? 0}`,
+    ...(save.mediumSaveWarningCandidates || []).slice(0, 5).map((candidate, index) =>
+      `Save-warning candidate ${index + 1}: ${JSON.stringify(candidate)}`),
+    `Medium save indicator visible: ${yesNo(save.mediumSaveIndicatorVisible)}`,
+    `Medium save indicator text: ${printable(save.mediumSaveIndicatorText)}`,
+    `DOM body verified: ${yesNo(save.domBodyVerified)}`,
+    `Persistence verified: ${yesNo(save.persistenceVerified)}`,
+    `Persistence verification basis: ${printable(save.persistenceVerificationBasis)}`,
+    `Safe to leave/reload page: ${printable(save.safeToLeaveReloadPage || "UNKNOWN")}`,
+    `Passive event telemetry: ${JSON.stringify(telemetry)}`
+  ].join("\n");
+}
+
 function formatRetirement(status) {
   const history = status.retirement || {};
   const reservation = status.reservation || {};
@@ -976,9 +1001,12 @@ async function inspectCurrentPage() {
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const sameTab = activeTab?.id === tab.id;
       setTitleEnabled(Boolean(response.titleEligibility?.ready && sameTab));
-      setBodyEnabled(Boolean(response.bodyEligibility?.ready && sameTab));
-      setRecoveryEnabled(Boolean(response.recoveryEligibility?.ready && sameTab));
-      output.textContent = formatTitleDiagnostics(response) + "\n\n" +
+      setBodyEnabled(Boolean(response.bodyEligibility?.ready && sameTab &&
+        !response.saveInspection?.domBodyVerified));
+      setRecoveryEnabled(Boolean(response.recoveryEligibility?.ready && sameTab &&
+        !response.saveInspection?.domBodyVerified));
+      output.textContent = formatSaveDiagnostics(response) + "\n\n" +
+        formatTitleDiagnostics(response) + "\n\n" +
         formatBodyDiagnostics(response) + "\n\n" +
         (response.editorInspection &&
           !["IMPORT", "STORIES"].includes(response.reconciliation?.pageKind) ?
