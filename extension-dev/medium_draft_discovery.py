@@ -1,26 +1,30 @@
-"""Passive, isolated Medium draft network discovery. Never sends a request itself."""
+"""Offline analysis of manually exported Chrome HAR files. No browser or network APIs."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import re
-import shutil
 import sys
-import threading
-from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-
 PRODUCTION_DRAFT_FORBIDDEN = "fd6c1824c4de"
-ROOT = Path(__file__).resolve().parent / ".medium-draft-discovery"
+MAX_HAR_BYTES = 50_000_000
 MAX_BODY_BYTES = 2_000_000
-MAX_PATH = 512
-SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
-GRAPHQL_OPERATION = re.compile(r"\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{0,79})?")
+PHASES = ("a1", "a2", "b")
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+GRAPHQL = re.compile(r"^\s*(?:#.*\n\s*)*(query|mutation|subscription)\b(?:\s+([A-Za-z_][A-Za-z0-9_]{0,63}))?", re.I)
+SECRET_WORD = re.compile(r"token|secret|password|auth|session|csrf|cookie|credential|nonce|code", re.I)
+STATIC_TYPES = {"script", "stylesheet", "font", "image", "media", "manifest"}
+SAFE_ROUTE_SEGMENTS = {"_", "graphql", "p", "edit", "draft", "drafts", "story", "stories",
+                       "write", "api", "v1", "v2", "me", "analytics", "collect",
+                       "tracking", "metrics", "beacon", "account", "signin", "login",
+                       "session", "viewer"}
+HTML_TAGS = {"title", "script", "p", "h1", "h2", "h3", "div", "article", "section"}
 
 
 class ForbiddenProductionDraft(ValueError):
@@ -28,404 +32,409 @@ class ForbiddenProductionDraft(ValueError):
 
 
 def reject_production(value: object) -> None:
-    if PRODUCTION_DRAFT_FORBIDDEN in unquote(str(value)).lower():
-        raise ForbiddenProductionDraft("PRODUCTION_DRAFT_FORBIDDEN")
+    candidate = str(value)
+    for _ in range(3):
+        if PRODUCTION_DRAFT_FORBIDDEN in candidate.lower():
+            raise ForbiddenProductionDraft("PRODUCTION_DRAFT_FORBIDDEN")
+        candidate = unquote(candidate)
 
 
-def profile_path(name: str, root: Path = ROOT) -> Path:
-    reject_production(name)
-    if not SAFE_NAME.fullmatch(name):
-        raise ValueError("Profile name must use letters, digits, underscore, or hyphen")
-    if root.is_symlink() or (root.exists() and not root.is_dir()):
-        raise ValueError("Discovery root is unsafe")
-    path = root / "profiles" / name
-    if path.parent.is_symlink() or path.is_symlink():
-        raise ValueError("Symlinked discovery profile is forbidden")
-    return path
-
-
-def prepare_profile(name: str, root: Path = ROOT) -> Path:
-    path = profile_path(name, root)
-    marker = path / ".isolated-medium-discovery"
-    if path.exists():
-        if not marker.is_file() or marker.is_symlink() or marker.read_text() != "isolated-v1\n":
-            raise ValueError("Existing unmarked browser profile is forbidden")
-    else:
-        path.mkdir(parents=True, mode=0o700)
-        marker.write_text("isolated-v1\n")
-    data = path / "chrome-data"
-    if data.is_symlink():
-        raise ValueError("Symlinked browser data is forbidden")
-    data.mkdir(exist_ok=True, mode=0o700)
-    return data
-
-
-def _safe_path(url: str) -> dict:
-    reject_production(url)
-    parts = urlsplit(url)
-    path = parts.path[:MAX_PATH]
-    def safe_segment(segment: str) -> str:
-        if len(segment) > 80:
-            return "[long-segment]"
-        if len(segment) >= 24 and re.fullmatch(r"[A-Za-z0-9_.-]+", segment):
-            return "[opaque-segment]"
-        return segment
-    path = "/".join(safe_segment(segment) for segment in path.split("/"))
-    names = sorted({key for key, _ in parse_qsl(parts.query, keep_blank_values=True)
-                    if SAFE_KEY.fullmatch(key)})[:32]
-    return {"host": (parts.hostname or "")[:128], "path": path,
-            "query_parameter_names": names}
-
-
-def _digest(data: bytes) -> str:
+def digest(value: str | bytes) -> str:
+    data = value.encode() if isinstance(value, str) else value
     return "sha256:" + hashlib.sha256(data).hexdigest()[:16]
 
 
-def _operation(body: str) -> tuple[str | None, str | None]:
+def safe_path(url: str, draft_id: str) -> tuple[str, str]:
+    """Discard URL credentials, query values, fragments, and opaque path segments."""
+    parts = urlsplit(url)
+    original_host = (parts.hostname or "").lower()
+    if original_host != "medium.com" and not original_host.endswith(".medium.com"):
+        return original_host, ""
+    host = original_host if original_host in {"medium.com", "www.medium.com"} else "{medium-subdomain}.medium.com"
+    segments = []
+    for raw in parts.path.split("/"):
+        segment = unquote(raw)
+        if draft_id and segment.lower() == draft_id.lower():
+            segments.append("{draft_id}")
+        elif segment.lower() in SAFE_ROUTE_SEGMENTS:
+            segments.append(segment.lower())
+        elif not segment:
+            segments.append("")
+        else:
+            segments.append("{opaque}")
+    return host, "/".join(segments)[:256]
+
+
+def content_type(headers: object, fallback: object = "") -> str:
+    value = fallback if isinstance(fallback, str) else ""
+    if isinstance(headers, list):
+        for item in headers:
+            if isinstance(item, dict) and str(item.get("name", "")).lower() == "content-type":
+                value = item.get("value", "")
+                break
+    mime = str(value).split(";", 1)[0].strip().lower()
+    return mime[:80] if re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", mime) else ""
+
+
+def body_text(container: object, key: str) -> str | None:
+    if not isinstance(container, dict):
+        return None
+    body = container.get(key)
+    if not isinstance(body, dict) or not isinstance(body.get("text"), str) or body.get("encoding") == "base64":
+        return None
+    value = body["text"]
+    return value if len(value.encode()) <= MAX_BODY_BYTES else None
+
+
+def graphql_operation(body: str | None) -> tuple[str | None, str | None]:
     try:
-        payload = json.loads(body)
-    except (ValueError, TypeError):
-        payload = None
-    if isinstance(payload, dict):
-        name = payload.get("operationName")
-        if not isinstance(name, str) or not SAFE_KEY.fullmatch(name):
-            name = None
-        query = payload.get("query", "")
-        match = GRAPHQL_OPERATION.search(query) if isinstance(query, str) else None
-        return (match.group(1).upper() if match else None,
-                name or (match.group(2) if match else None))
-    match = GRAPHQL_OPERATION.search(body)
-    return (match.group(1).upper(), match.group(2)) if match else (None, None)
-
-
-def _matches(value: str, marker: str) -> bool:
-    return bool(marker and marker in value)
-
-
-def summarize_response(body: bytes, content_type: str, draft_id: str,
-                       title_marker: str, body_marker: str) -> dict:
-    """Return field paths and marker booleans, never source values."""
-    reject_production(body)
-    result = {"response_format": "other", "top_level_response_keys": [],
-              "draft_identifier_path": None, "title_field_path": None,
-              "body_content_field_path": None, "body_representation": "Unknown",
-              "formatting_representation": "Unknown",
-              "observed_throwaway_draft_id_match": False,
-              "observed_throwaway_title_match": False,
-              "observed_throwaway_body_marker_match": False}
-    lowered = content_type.lower()
-    if "html" in lowered:
-        result["response_format"] = "HTML"
-    elif "json" in lowered:
-        result["response_format"] = "GraphQL" if "graphql" in lowered else "JSON"
-    try:
-        value = json.loads(body) if "json" in lowered else None
+        payload = json.loads(body) if body else None
     except ValueError:
-        value = None
-    if value is None:
-        decoded = body.decode("utf-8", "replace")
-        for marker, flag in ((draft_id, "observed_throwaway_draft_id_match"),
-                             (title_marker, "observed_throwaway_title_match"),
-                             (body_marker, "observed_throwaway_body_marker_match")):
-            result[flag] = _matches(decoded, marker)
-        # HTML can include unrelated matches; document-level evidence is not a field schema.
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(payload.get("query"), str):
+        return None, None
+    match = GRAPHQL.match(payload["query"])
+    if not match:
+        return None, None
+    name = payload.get("operationName") or match.group(2)
+    if (not isinstance(name, str) or not IDENT.fullmatch(name) or SECRET_WORD.search(name)
+            or match.group(2) and name != match.group(2)):
+        name = None
+    return match.group(1).upper(), name
+
+
+def html_marker_paths(body: str, draft_id: str, title: str,
+                      markers: tuple[str, ...]) -> dict[str, str]:
+    """Record actual element types containing markers, never HTML or attributes."""
+    class MarkerParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+            self.paths = {}
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                           "link", "meta", "param", "source", "track", "wbr"}:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if tag in self.stack:
+                self.stack = self.stack[:len(self.stack) - 1 - self.stack[::-1].index(tag)]
+
+        def handle_data(self, data):
+            tag = next((tag for tag in reversed(self.stack) if tag in HTML_TAGS), None)
+            if not tag:
+                return
+            for marker in (draft_id, title, *markers):
+                if marker in data:
+                    current = self.paths.get(marker)
+                    # Visible title/paragraph elements take precedence over bootstrap scripts.
+                    priority = {"title": 0, "h1": 0, "h2": 0, "h3": 0, "p": 0,
+                                "article": 1, "section": 1, "div": 1, "script": 2}
+                    if current is None or priority.get(tag, 3) < priority.get(current, 3):
+                        self.paths[marker] = tag
+
+    parser = MarkerParser()
+    parser.feed(body)
+    return {marker: f"HTML:<{tag}>" for marker, tag in parser.paths.items()}
+
+
+def response_evidence(body: str | None, mime: str, draft_id: str,
+                      title: str, markers: tuple[str, ...], graphql_type: str | None) -> dict:
+    result = {"response_format": "GraphQL" if graphql_type and "json" in mime else
+              "JSON" if "json" in mime else "HTML" if "html" in mime else "other",
+              "body_present_in_har": body is not None,
+              "draft_identifier_field_path": None, "title_field_path": None,
+              "body_field_paths": {}, "body_representation": "Unknown",
+              "draft_id_present": False, "title_present": False,
+              "body_markers_present": {digest(marker): False for marker in markers}}
+    if body is None:
         return result
-    if isinstance(value, dict):
-        result["top_level_response_keys"] = sorted(
-            key for key in value if SAFE_KEY.fullmatch(key))[:40]
-        if "data" in value and ("errors" in value or "extensions" in value):
-            result["response_format"] = "GraphQL"
-    stack = [(value, "$", ())]
+    try:
+        parsed = json.loads(body) if "json" in mime else None
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        result["draft_id_present"] = draft_id in body
+        result["title_present"] = title in body
+        result["body_markers_present"] = {digest(marker): marker in body for marker in markers}
+        if "html" in mime:
+            paths = html_marker_paths(body, draft_id, title, markers)
+            result["draft_identifier_field_path"] = paths.get(draft_id)
+            result["title_field_path"] = paths.get(title)
+            result["body_field_paths"] = {digest(marker): paths[marker]
+                                          for marker in markers if marker in paths}
+            if result["body_field_paths"]:
+                result["body_representation"] = "HTML"
+        return result
+    stack = [(parsed, "$", ())]
     visited = 0
     while stack and visited < 30_000:
         node, path, ancestors = stack.pop()
         visited += 1
         if isinstance(node, dict):
-            keys = tuple(key for key in node if isinstance(key, str) and SAFE_KEY.fullmatch(key))
-            for key in reversed(keys[:100]):
-                stack.append((node[key], f"{path}.{key}", ancestors + (keys,)))
+            for key, value in list(node.items())[:200]:
+                if isinstance(key, str) and IDENT.fullmatch(key) and not SECRET_WORD.search(key):
+                    stack.append((value, path + "." + key, ancestors + (key,)))
         elif isinstance(node, list):
-            for index in reversed(range(min(len(node), 1000))):
-                stack.append((node[index], f"{path}[{index}]", ancestors))
-        elif isinstance(node, (str, int)):
-            text = str(node)
-            for marker, flag, field in (
-                (draft_id, "observed_throwaway_draft_id_match", "draft_identifier_path"),
-                (title_marker, "observed_throwaway_title_match", "title_field_path"),
-                (body_marker, "observed_throwaway_body_marker_match", "body_content_field_path"),
-            ):
-                if _matches(text, marker):
-                    result[flag] = True
-                    if result[field] is None:
-                        result[field] = path
-                        if field == "body_content_field_path":
-                            if re.search(r"<\w+[^>]*>", text):
-                                result["body_representation"] = "HTML"
-                            elif re.search(r"(?m)^#{1,6} |\*\*[^*]+\*\*", text):
-                                result["body_representation"] = "Markdown"
-                            elif "[" in path and ancestors:
-                                result["body_representation"] = "block JSON"
-                            else:
-                                result["body_representation"] = "other"
-                            formatting = {key for group in ancestors for key in group
-                                          if key.lower() in {"type", "markups", "format",
-                                                             "formatting", "style", "paragraphs", "blocks"}}
-                            if formatting:
-                                result["formatting_representation"] = sorted(formatting)
+            for index, value in enumerate(node[:1000]):
+                stack.append((value, f"{path}[{index}]", ancestors))
+        elif isinstance(node, (str, int)) and not isinstance(node, bool):
+            value = str(node)
+            if draft_id in value:
+                result["draft_id_present"] = True
+                result["draft_identifier_field_path"] = result["draft_identifier_field_path"] or path
+            if title in value:
+                result["title_present"] = True
+                result["title_field_path"] = result["title_field_path"] or path
+            for marker in markers:
+                if marker in value:
+                    result["body_markers_present"][digest(marker)] = True
+                    result["body_field_paths"][digest(marker)] = path
+                    if result["body_representation"] == "Unknown":
+                        result["body_representation"] = (
+                            "HTML" if re.search(r"<\w+[^>]*>", value) else
+                            "Markdown" if re.search(r"(?m)^#{1,6} |\*\*[^*]+\*\*", value) else
+                            "block JSON" if "[" in path or "blocks" in ancestors else "string")
     return result
 
 
-def classify(record: dict) -> tuple[str, str]:
-    path = record["path"].lower()
-    content_type = record["response_content_type"].lower()
-    resource = record["resource_type"].lower()
-    marker = record["response_evidence"]
-    has_draft = marker["observed_throwaway_draft_id_match"]
-    has_content = marker["observed_throwaway_title_match"] or marker["observed_throwaway_body_marker_match"]
-    operation = record["graphql_operation_type"]
-    if operation == "MUTATION" or record["request_contains_modified_story_data"]:
-        return "MUTATION_CANDIDATE", "WRITE / AUTOSAVE"
-    if (has_draft and has_content and record["method"] == "GET"
-            and not record["request_body_length"]):
-        return "DRAFT_READ_CANDIDATE", "READ"
-    if has_draft and has_content and record["method"] == "POST" and operation == "QUERY":
-        return "DRAFT_READ_CANDIDATE", "READ"
-    if resource in {"stylesheet", "font", "image", "media", "script"}:
+def classify(method: str, path: str, resource: str, operation: str | None,
+             name: str | None, request_body: str | None, evidence: dict) -> tuple[str, str]:
+    if resource in STATIC_TYPES:
         return "STATIC_ASSET", "UNKNOWN"
-    if any(word in path for word in ("analytics", "tracking", "collect", "metrics")):
+    has_marker = (evidence["draft_id_present"] or evidence["title_present"]
+                  or any(evidence["body_markers_present"].values()))
+    if (resource in {"fetch", "xhr", "ping", "beacon"} and not has_marker
+            and re.search(r"(?:^|/)(?:analytics|collect|tracking|metrics|beacon)(?:/|$)", path)):
         return "ANALYTICS", "UNKNOWN"
-    if "json" in content_type and not has_draft and any(
-            word in path for word in ("account", "user", "viewer", "session")):
+    if operation == "MUTATION":
+        return ("AUTOSAVE_WRITE" if name and re.search(r"autosave|save|update", name, re.I)
+                else "MUTATION"), "WRITE"
+    if method in {"POST", "PUT", "PATCH"} and request_body and operation != "QUERY":
+        try:
+            payload = json.loads(request_body)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            values = payload.get("variables", payload)
+            if isinstance(values, dict) and any(
+                    key.lower() in {"body", "content", "title", "text", "paragraphs", "blocks"}
+                    for key in values):
+                return "AUTOSAVE_WRITE", "WRITE"
+    has_content = evidence["title_present"] and all(evidence["body_markers_present"].values())
+    if evidence["draft_id_present"] and has_content and (
+            operation == "QUERY" or method == "GET" and not request_body):
+        return "DRAFT_READ_CANDIDATE", "READ"
+    if (not has_marker and evidence["response_format"] in {"JSON", "GraphQL"}
+            and re.search(r"(?:^|/)(?:account|signin|login|session|me|viewer)(?:/|$)", path)):
         return "ACCOUNT_STATE", "UNKNOWN"
     return "UNKNOWN", "UNKNOWN"
 
 
-def capture(request: dict, response: dict, *, phase: str, draft_id: str = "",
-            title_marker: str = "", body_marker: str = "") -> dict:
-    """Pure adapter for one browser-observed exchange; no transport APIs."""
-    for value in (request, response, phase, draft_id, title_marker, body_marker):
+def analyze_entry(entry: dict, draft_id: str, title: str, markers: tuple[str, ...]) -> dict | None:
+    request, response = entry.get("request"), entry.get("response")
+    if not isinstance(request, dict) or not isinstance(response, dict) or not isinstance(request.get("url"), str):
+        return None
+    host, path = safe_path(request["url"], draft_id)
+    if not path:
+        return None
+    query_names = sorted({key for key, _ in parse_qsl(urlsplit(request["url"]).query,
+                                                 keep_blank_values=True, max_num_fields=100)
+                          if IDENT.fullmatch(key) and not SECRET_WORD.search(key)})[:32]
+    method = request.get("method", "")
+    method = method.upper() if isinstance(method, str) else ""
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+        method = "UNKNOWN"
+    request_body, response_body = body_text(request, "postData"), body_text(response, "content")
+    request_has_draft = draft_id in request["url"] or bool(request_body and draft_id in request_body)
+    request_has_title = bool(request_body and title in request_body)
+    request_has_body = bool(request_body and any(marker in request_body for marker in markers))
+    operation, name = graphql_operation(request_body)
+    content = response.get("content")
+    mime = content_type(response.get("headers"), content.get("mimeType", "") if isinstance(content, dict) else "")
+    resource = entry.get("_resourceType", "")
+    resource = resource.lower() if isinstance(resource, str) and IDENT.fullmatch(resource) else "unknown"
+    evidence = response_evidence(response_body, mime, draft_id, title, markers, operation)
+    classification, semantic = classify(method, path, resource, operation, name, request_body, evidence)
+    status = response.get("status")
+    return {"method": method, "host": host, "path": path, "query_parameter_names": query_names,
+            "status": status if isinstance(status, int) and not isinstance(status, bool) and 0 <= status <= 599 else None,
+            "content_type": mime, "resource_type": resource,
+            "request_body_length": len(request_body.encode()) if request_body is not None else None,
+            "request_body_fingerprint": digest(request_body) if request_body is not None else None,
+            "response_body_length": len(response_body.encode()) if response_body is not None else None,
+            "response_body_fingerprint": digest(response_body) if response_body is not None else None,
+            "graphql_operation_type": operation, "graphql_operation_name": name,
+            "request_has_draft_id": request_has_draft,
+            "request_has_title_marker": request_has_title,
+            "request_has_body_marker": request_has_body,
+            "classification": classification, "semantic_operation": semantic,
+            "response_evidence": evidence}
+
+
+def analyze_har(path: Path, *, phase: str, draft_id: str, title: str,
+                markers: tuple[str, ...]) -> dict:
+    if phase not in PHASES or len(draft_id) < 8 or not title or len(markers) < 2:
+        raise ValueError("A reopen phase, throwaway ID, title, and at least two body markers are required")
+    if len(set(markers)) != len(markers) or any(len(marker) < 8 for marker in markers):
+        raise ValueError("Body markers must be distinct and at least eight characters")
+    for value in (path, draft_id, title, markers):
         reject_production(value)
-    method = request["method"].upper()
-    url = _safe_path(request["url"])
-    body = request.get("body") or b""
-    if isinstance(body, str):
-        body = body.encode()
-    response_body = response.get("body") or b""
-    if isinstance(response_body, str):
-        response_body = response_body.encode()
-    if len(response_body) > MAX_BODY_BYTES:
-        response_body = b""
-    request_text = body.decode("utf-8", "replace")
-    operation_type, operation_name = _operation(request_text)
-    request_has_story = bool((title_marker and title_marker in request_text)
-                             or (body_marker and body_marker in request_text))
-    content_type = str(response.get("content_type") or "")[:100].split(";", 1)[0]
-    evidence = summarize_response(response_body, content_type, draft_id,
-                                  title_marker, body_marker)
-    if operation_type in {"QUERY", "MUTATION"} and evidence["response_format"] == "JSON":
-        evidence["response_format"] = "GraphQL"
-    redirect = response.get("redirect_url") or ""
-    result = {"timestamp": datetime.now(timezone.utc).isoformat(), "phase": phase,
-              "method": method, **url,
-              "path_template": url["path"].replace(draft_id, "{draft_id}") if draft_id else url["path"],
-              "draft_id_fingerprint": _digest(draft_id.encode()) if draft_id else None,
-              "request_content_type": str(request.get("content_type") or "")[:100].split(";", 1)[0],
-              "request_body_length": len(body),
-              "request_body_fingerprint": _digest(body) if body else None,
-              "response_status": response.get("status"),
-              "response_content_type": content_type,
-              "response_length": response.get("length", len(response_body)),
-              "redirect_target": _safe_path(redirect) if redirect else None,
-              "resource_type": str(request.get("resource_type") or "")[:40],
-              "initiator_type": str(request.get("initiator_type") or "")[:40],
-              "graphql_operation_type": operation_type,
-              "graphql_operation_name": operation_name,
-              "request_contains_modified_story_data": request_has_story,
-              "response_evidence": evidence}
-    result["classification"], result["semantic_operation"] = classify(result)
-    return result
-
-
-def _validate_markers(args) -> None:
-    for item in (args.draft_id, args.title_marker, args.body_marker):
-        reject_production(item)
-    if args.phase != "write" and not all((args.draft_id, args.title_marker, args.body_marker)):
-        raise ValueError("Reopen phases require throwaway draft ID, title marker, and body marker")
-    if args.phase != "write" and any(len(item) < 8 for item in (args.title_marker, args.body_marker)):
-        raise ValueError("Markers must be at least eight characters")
-
-
-def record(args) -> Path:
-    _validate_markers(args)
-    data_dir = prepare_profile(args.profile)
-    profile = data_dir.parent
-    output = profile / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{args.phase}.jsonl"
-    chrome = shutil.which("google-chrome") or shutil.which("chromium")
-    if not chrome:
-        raise RuntimeError("Chrome or Chromium is required")
-    from playwright.sync_api import sync_playwright
-
-    fatal = []
-    with output.open("x", encoding="utf-8") as stream, sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            str(data_dir), executable_path=chrome, headless=False,
-            args=["--disable-extensions", "--no-first-run", "--no-default-browser-check"])
-
-        # The only interception is a fail-closed production-ID guard. Continuing
-        # other browser-originated requests does not create or replay a request.
-        def guard_request(route):
-            try:
-                reject_production(route.request.url)
-                reject_production(route.request.post_data_buffer or b"")
-            except ForbiddenProductionDraft as exc:
-                fatal.append(exc)
-                route.abort()
-                return
-            route.continue_()
-
-        context.route("**/*", guard_request)
-
-        def on_response(response):
-            if fatal:
-                return
-            try:
-                request = response.request
-                reject_production(request.url)
-                req_body = request.post_data_buffer or b""
-                reject_production(req_body)
-                mime = response.header_value("content-type") or ""
-                length_header = response.header_value("content-length") or ""
-                expected_length = int(length_header) if length_header.isdigit() else None
-                host = urlsplit(response.url).hostname or ""
-                if host != "medium.com" and not host.endswith(".medium.com"):
-                    return
-                inspect_body = ("json" in mime.lower() or "html" in mime.lower()) and (
-                    expected_length is None or expected_length <= MAX_BODY_BYTES)
-                body = response.body() if inspect_body else b""
-                reject_production(body)
-                row = capture(
-                    {"url": request.url, "method": request.method,
-                     "content_type": request.header_value("content-type"), "body": req_body,
-                     "resource_type": request.resource_type},
-                    {"status": response.status, "content_type": mime,
-                     "length": (len(body) if inspect_body else None)
-                     if expected_length is None else expected_length,
-                     "body": body, "redirect_url": response.header_value("location")},
-                    phase=args.phase, draft_id=args.draft_id,
-                    title_marker=args.title_marker, body_marker=args.body_marker)
-                stream.write(json.dumps(row, sort_keys=True) + "\n")
-                stream.flush()
-            except Exception as exc:  # close the browser after the event callback returns
-                fatal.append(exc)
-
-        context.on("response", on_response)
-        print("Isolated discovery Chrome opened on a blank page. Drive it manually.")
-        print("Press Enter after this observation phase is complete.")
-        done = threading.Event()
-        threading.Thread(target=lambda: (input(), done.set()), daemon=True).start()
-        try:
-            while not done.is_set() and not fatal:
-                # Pump Playwright events while the user drives the browser.
-                context.pages[0].wait_for_timeout(250)
-        finally:
-            context.close()
-    if fatal:
-        output.unlink(missing_ok=True)
-        raise fatal[0]
-    return output
-
-
-def report(paths: list[Path]) -> dict:
-    observations = []
-    for path in paths:
-        reject_production(path)
-        for line in path.read_text().splitlines():
-            reject_production(line)
-            observations.append(json.loads(line))
-    reads = [row for row in observations if row["classification"] == "DRAFT_READ_CANDIDATE"]
-    by_phase = {phase: [row for row in reads if row["phase"] == phase]
-                for phase in ("a1", "a2", "b")}
-    signature = lambda row: (row["method"], row["host"], row["path_template"],
-                             tuple(row["query_parameter_names"]),
-                             row["request_content_type"],
-                             row["graphql_operation_name"],
-                             row["response_evidence"]["response_format"],
-                             tuple(row["response_evidence"]["top_level_response_keys"]),
-                             row["response_evidence"]["draft_identifier_path"],
-                             row["response_evidence"]["title_field_path"],
-                             row["response_evidence"]["body_content_field_path"],
-                             row["response_evidence"]["body_representation"],
-                             str(row["response_evidence"]["formatting_representation"]))
-    common = set(map(signature, by_phase["a1"])) & set(map(signature, by_phase["a2"])) & set(map(signature, by_phase["b"]))
-    keys = ("observed_throwaway_draft_id_match", "observed_throwaway_title_match",
-            "observed_throwaway_body_marker_match")
-    a_ids = {row["draft_id_fingerprint"] for phase in ("a1", "a2") for row in by_phase[phase]}
-    b_ids = {row["draft_id_fingerprint"] for row in by_phase["b"]}
-    distinct = bool(a_ids and b_ids and len(a_ids) == 1 and len(b_ids) == 1
-                    and a_ids.isdisjoint(b_ids) and None not in a_ids | b_ids)
-    complete = bool(distinct and common and all(any(signature(row) in common and
-        all(row["response_evidence"][key] for key in keys) and
-        all(row["response_evidence"][key] for key in (
-            "draft_identifier_path", "title_field_path", "body_content_field_path"))
-        for row in by_phase[phase]) for phase in by_phase))
-    # Browser observation alone does not establish replay safety.
-    decision = "READ_CONTRACT_FOUND_REPLAY_SAFETY_UNKNOWN" if complete else "READ_CONTRACT_NOT_FOUND"
-    writes = [row for row in observations if row["semantic_operation"] == "WRITE / AUTOSAVE"]
-    return {"decision": decision, "observation_count": len(reads),
-            "distinct_throwaway_drafts_tested": 2 if distinct else 0,
-            "draft_a_first_read": bool(by_phase["a1"]),
-            "draft_a_second_read": bool(by_phase["a2"]),
-            "draft_b_read": bool(by_phase["b"]),
-            "same_contract_across_reopens_and_drafts": bool(common and distinct),
-            "same_semantic_read_request_observed": bool(common and distinct),
-            "same_path_or_operation": bool(common and distinct),
-            "same_response_schema": bool(common and distinct),
-            "same_draft_identifier_field": bool(common and distinct),
-            "same_title_field": bool(common and distinct),
-            "same_body_representation": bool(common and distinct),
-            "draft_a_correctly_identified": bool(by_phase["a1"] and by_phase["a2"] and distinct),
-            "draft_b_correctly_identified": bool(by_phase["b"] and distinct),
-            "candidate_signatures": [list(item) for item in sorted(common, key=str)],
-            "write_candidate_count": len(writes),
-            "write_candidates": [{"method": row["method"], "host": row["host"],
-                                  "path": row["path_template"], "trigger_phase": row["phase"],
-                                  "trigger": "manual create/edit during write phase" if row["phase"] == "write"
-                                  else "observed during reopen phase",
-                                  "response_status": row["response_status"],
-                                  "request_contains_modified_story_data": row[
-                                      "request_contains_modified_story_data"]}
-                                 for row in writes[:100]],
-            "replay_safety": {
-                "would_instantiate_editor": "Unknown",
-                "could_modify_draft": "Unknown",
-                "request_contains_mutation_data": "Unknown",
-                "response_alone_contains_stored_draft_body": "Unknown",
-                "read_causes_autosave": "Unknown",
-                "requires_write_capable_graphql_operation": "No" if complete else "Unknown"},
-            "endpoint_provenance": "Observed from Medium's own editor while reopening an existing saved throwaway draft" if complete else "Not established",
-            "production_verifier_implemented": False,
+    if path.stat().st_size > MAX_HAR_BYTES:
+        raise ValueError("Capture exceeds 50 MB limit")
+    raw = path.read_bytes()
+    reject_production(raw.decode("utf-8", "replace"))
+    try:
+        har = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError("Malformed HAR JSON") from exc
+    reject_production(har)  # Also catches JSON-escaped occurrences.
+    if not isinstance(har, dict) or not isinstance(har.get("log"), dict) or not isinstance(har["log"].get("entries"), list):
+        raise ValueError("Malformed HAR: log.entries must be a list")
+    entries = har["log"]["entries"]
+    if len(entries) > 10000:
+        raise ValueError("Capture has too many entries")
+    rows = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Malformed HAR entry")
+        row = analyze_entry(entry, draft_id, title, markers)
+        if row and (row["request_has_draft_id"] or row["request_has_title_marker"]
+                    or row["request_has_body_marker"] or row["response_evidence"]["draft_id_present"]
+                    or row["response_evidence"]["title_present"]
+                    or any(row["response_evidence"]["body_markers_present"].values())):
+            rows.append(row)
+    return {"format": "medium-manual-har-evidence-v1", "phase": phase,
+            "capture_fingerprint": digest(raw),
+            "draft_id_fingerprint": digest(draft_id), "title_marker_fingerprint": digest(title),
+            "body_marker_fingerprints": [digest(marker) for marker in markers],
+            "source_entry_count": len(entries), "retained_entry_count": len(rows),
+            "entries": rows, "raw_headers_retained": False, "raw_bodies_retained": False,
             "replay_performed": False}
 
 
-def main() -> int:
+def save_sanitized(data: dict, path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("Symlinked output is forbidden")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def signature(row: dict) -> tuple:
+    evidence = row["response_evidence"]
+    return (row["method"], row["host"], row["path"], tuple(row["query_parameter_names"]),
+            row["graphql_operation_type"],
+            row["graphql_operation_name"], evidence["response_format"],
+            evidence["draft_identifier_field_path"], evidence["title_field_path"],
+            tuple(sorted(set(evidence["body_field_paths"].values()))), evidence["body_representation"])
+
+
+def report(paths: dict[str, Path], replay_evidence: Path | None = None) -> dict:
+    if set(paths) != set(PHASES):
+        raise ValueError("Exactly a1, a2, and b sanitized observations are required")
+    captures = {}
+    for phase, path in paths.items():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("format") != "medium-manual-har-evidence-v1" or data.get("phase") != phase:
+            raise ValueError("Expected sanitized observation for phase " + phase)
+        captures[phase] = data
+    a1, a2, b = (captures[phase] for phase in PHASES)
+    distinct = (len({data["capture_fingerprint"] for data in captures.values()}) == 3
+                and a1["draft_id_fingerprint"] == a2["draft_id_fingerprint"]
+                and a1["title_marker_fingerprint"] == a2["title_marker_fingerprint"]
+                and a1["body_marker_fingerprints"] == a2["body_marker_fingerprints"]
+                and a1["draft_id_fingerprint"] != b["draft_id_fingerprint"]
+                and a1["title_marker_fingerprint"] != b["title_marker_fingerprint"]
+                and set(a1["body_marker_fingerprints"]).isdisjoint(b["body_marker_fingerprints"]))
+    candidates = {}
+    for phase, data in captures.items():
+        candidates[phase] = [row for row in data["entries"] if row["classification"] == "DRAFT_READ_CANDIDATE"
+                             and row["status"] == 200 and row["response_evidence"]["draft_identifier_field_path"]
+                             and row["response_evidence"]["title_field_path"]
+                             and len(row["response_evidence"]["body_field_paths"]) == len(data["body_marker_fingerprints"])]
+    common = {signature(row) for row in candidates["a1"]}
+    for phase in ("a2", "b"):
+        common &= {signature(row) for row in candidates[phase]}
+    found = bool(distinct and common)
+    replay_safe = False
+    if replay_evidence is not None:
+        replay = json.loads(replay_evidence.read_text(encoding="utf-8"))
+        if (replay.get("format") != "medium-manual-replay-safety-v1"
+                or replay.get("source") != "user_reported_2026-10-13"
+                or replay.get("contract") != {"method": "GET", "host": "medium.com",
+                                               "path": "/p/{draft_id}/edit", "response_format": "HTML"}):
+            raise ValueError("Invalid replay safety evidence")
+        drafts = replay.get("drafts")
+        if not isinstance(drafts, dict) or set(drafts) != {"A", "B"}:
+            raise ValueError("Invalid replay safety evidence")
+        required = {"get_count": 1, "write_method_count": 0, "http_status": 200,
+                    "complete_html": True, "correct_id_title_body_markers": True,
+                    "manual_followup_unchanged": True}
+        for letter, capture in (("A", a1), ("B", b)):
+            draft = drafts[letter]
+            if (not isinstance(draft, dict)
+                    or draft.get("draft_id_fingerprint") != capture["draft_id_fingerprint"]
+                    or any(type(draft.get(key)) is not type(value) or draft.get(key) != value
+                           for key, value in required.items())):
+                raise ValueError("Invalid replay safety evidence")
+        replay_safe = found
+    decision = ("READ_CONTRACT_FOUND_CANDIDATE_SAFE" if replay_safe else
+                "READ_CONTRACT_FOUND_REPLAY_SAFETY_UNKNOWN" if found else
+                "READ_CONTRACT_NOT_FOUND")
+    return {"decision": decision,
+            "distinct_throwaway_drafts": distinct, "same_contract_in_three_reopens": found,
+            "read_candidates_per_reopen": {phase: len(candidates[phase]) for phase in PHASES},
+            "write_or_mutation_count_per_reopen": {phase: sum(row["classification"] in {"AUTOSAVE_WRITE", "MUTATION"}
+                                                        for row in captures[phase]["entries"]) for phase in PHASES},
+            "matching_contracts": [list(item) for item in sorted(common, key=str)] if distinct else [],
+            "replay_safety": "User-reported candidate safe" if replay_safe else "Unknown",
+            "replay_performed": replay_safe,
+            "production_persistence_verifier_implemented": (
+                Path(__file__).with_name("medium-persistence-verifier").joinpath("manifest.json").is_file())}
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    recorder = sub.add_parser("record", help="Observe one manually driven phase")
-    recorder.add_argument("--profile", required=True)
-    recorder.add_argument("--phase", choices=("write", "a1", "a2", "b"), required=True)
-    recorder.add_argument("--draft-id", default="")
-    recorder.add_argument("--title-marker", default="")
-    recorder.add_argument("--body-marker", default="")
-    summary = sub.add_parser("report", help="Summarize saved observation files offline")
-    summary.add_argument("files", nargs="+", type=Path)
-    args = parser.parse_args()
+    ingest = sub.add_parser("analyze", help="Sanitize and analyze one manual Chrome HAR locally")
+    ingest.add_argument("capture", type=Path)
+    ingest.add_argument("--phase", choices=PHASES, required=True)
+    ingest.add_argument("--draft-id", required=True)
+    ingest.add_argument("--title-marker", required=True)
+    ingest.add_argument("--body-marker", action="append", required=True)
+    ingest.add_argument("--output", type=Path, required=True)
+    summary = sub.add_parser("report", help="Compare three sanitized manual reopen observations")
+    for phase in PHASES:
+        summary.add_argument("--" + phase, type=Path, required=True)
+    summary.add_argument("--replay-evidence", type=Path,
+                         help="Optional local user-reported throwaway replay observations")
+    args = parser.parse_args(argv)
     try:
-        if args.command == "record":
-            print(record(args))
+        if args.command == "analyze":
+            data = analyze_har(args.capture, phase=args.phase, draft_id=args.draft_id,
+                               title=args.title_marker, markers=tuple(args.body_marker))
+            save_sanitized(data, args.output)
+            print(json.dumps({"sanitized_file": str(args.output), "retained_entry_count": data["retained_entry_count"],
+                              "entries": data["entries"]}, indent=2))
         else:
-            print(json.dumps(report(args.files), indent=2))
-    except (ValueError, RuntimeError, ForbiddenProductionDraft) as exc:
-        print(str(exc), file=sys.stderr)
+            print(json.dumps(report({phase: getattr(args, phase) for phase in PHASES},
+                                    args.replay_evidence), indent=2))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if isinstance(exc, ForbiddenProductionDraft):
+            message = "PRODUCTION_DRAFT_FORBIDDEN"
+        elif isinstance(exc, OSError):
+            message = "Cannot read capture or write sanitized output"
+        else:
+            message = (str(exc) if str(exc).startswith((
+                "Malformed HAR", "Capture exceeds", "Capture has too many",
+                "A reopen", "Body markers", "Exactly a1", "Expected sanitized",
+                "Symlinked output", "Invalid replay safety"))
+                else "Invalid capture or observation")
+        print(message, file=sys.stderr)
         return 2
     return 0
 

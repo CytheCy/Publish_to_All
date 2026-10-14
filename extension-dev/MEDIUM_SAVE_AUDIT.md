@@ -74,6 +74,10 @@ second-page inspection has been implemented or run.
 
 ## Server persistence read-path decision (offline, 2026-10-13)
 
+This section records the decision before the later manual throwaway captures.
+The current read and authentication findings are recorded below; the production
+draft's server persistence remains unknown.
+
 The repository and local fixtures do **not** establish a safe Medium draft-data
 read endpoint. `src/publish_to_all/browser/medium.py` lists `/_/graphql` and
 `/_/api/posts` for sanitized request diagnostics, not as draft readers. Its
@@ -171,24 +175,60 @@ The proposed local response and network-safety fixtures cannot be meaningful
 until the actual read contract and response schema are known, so none have
 been fabricated.
 
-Current DOM: VERIFIED
+## Current throwaway read finding (manual, 2026-10-13)
 
-Medium server: UNKNOWN (`MEDIUM_PERSISTENCE_UNKNOWN`)
+Three sanitized HAR summaries show that `GET medium.com/p/{draft_id}/edit`
+returned `200` HTML containing the matching throwaway draft ID, title, and all
+body markers before either later POST. The two POST patterns remain **UNKNOWN**;
+their order does not establish whether they write. No request was replayed.
 
-Safest server-read mechanism: Authenticated GET-only draft data request, if a
-specific read endpoint can be proven later.
+In the logged-in throwaway Chrome profile, a later manually reopened Draft A
+`GET` returned `200 OK` with the correct title and all body markers. DevTools
+showed a Request Cookies section and a `Cookie` request header, with these names
+only: `_cfuvid`, `_ga`, `_ga_7JY7T788PK`, `cf_clearance`, `g_state`, `pr`,
+`sid`, `sz`, `tz`, `uid`, `xsrf`. There was no `Authorization` request header.
+The request and final URL had no query parameters; Medium did not add `source`.
+Thus `source` is not required for this observed read, although it appeared in
+the three earlier captures.
 
-Why it cannot modify Medium: Not established for any known endpoint.
+The same throwaway Draft A URL in a fresh, logged-out Incognito window redirected
+to sign-in and exposed no draft title, body markers, or editor. Authentication
+was required for the observed read. **Cookie** is supported as the mechanism by
+the actual request-cookie evidence, without proving which cookie matters or
+whether cookies alone suffice. The next design choice is
+`BROWSER_COOKIE_AUTHENTICATED_GET_REQUIRED`; a raw unauthenticated GET is not
+supported by the observation. The unimplemented design uses a dedicated
+throwaway Chrome profile and a request-only browser transport that lets Chrome
+attach its ephemeral cookies to one allowlisted GET, rejects redirects, and
+never executes returned editor HTML or JavaScript. Its feasibility under
+Medium's cookie rules is unverified. Cookie values must never enter code,
+configuration, shell history, chat, or logs. No such mechanism or replay
+harness exists yet.
 
-HTTP method: GET proposed; no request made.
+Current DOM: VERIFIED. Medium server persistence: UNKNOWN
+(`MEDIUM_PERSISTENCE_UNKNOWN`). Current draft-read classification:
+`READ_CONTRACT_FOUND_REPLAY_SAFETY_UNKNOWN` at the time of this finding. The
+production draft and tab were untouched.
 
-Endpoint provenance: No verified draft-read endpoint in repository or fixtures.
+## Replay-safety update and production verifier (local, 2026-10-13)
 
-Authentication mechanism: Unknown.
+The user reports two successful throwaway tests of the fixed authenticated GET,
+one each for Draft A and Draft B. Each made exactly one GET, zero writes,
+returned HTTP 200 and complete HTML with the expected ID/title/body markers,
+and left the draft unchanged on manual follow-up. The resulting read-contract
+classification is `READ_CONTRACT_FOUND_CANDIDATE_SAFE`.
 
-Could it interfere with the current editor: Unknown.
+`extension-dev/medium-persistence-verifier/` packages the validated canonical
+title and body. Its service worker permits one attempt per worker lifetime and
+makes a single fixed `GET https://medium.com/p/fd6c1824c4de/edit` with
+`credentials: "include"`, `redirect: "manual"`, and no body or custom headers.
+It never opens an editor page or touches a tab. The response is read as inert
+text, with scripts excluded from body extraction. It verifies exact title,
+36 ordered heading/paragraph blocks, normalized length 58,757, and both
+canonical fingerprints. Its bounded report gives the last complete matching
+block and next expected block when persistence is partial. The previously
+observed DOM state and independently read server state are separate fields.
 
-Could it cause a second editor session: No for a true data request; unknown for
-any existing named Medium path.
-
-Live use currently recommended: No.
+Local tests use mocked responses and do not contact Medium. The production
+GET has not been run. Current DOM evidence: previously VERIFIED. Current server
+persistence: UNKNOWN (`MEDIUM_PERSISTENCE_UNKNOWN`).

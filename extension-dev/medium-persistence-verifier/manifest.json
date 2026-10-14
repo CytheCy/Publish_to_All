@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Medium Production Persistence Verifier",
+  "version": "0.1.0",
+  "description": "One inert authenticated GET to compare a fixed draft with packaged canonical text.",
+  "host_permissions": ["https://medium.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html" }
+}
