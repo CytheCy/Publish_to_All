@@ -1,7 +1,10 @@
 """Human-readable reports, without terminal or filesystem side effects."""
 
+from __future__ import annotations
+
 import json
 import re
+from typing import TYPE_CHECKING
 
 from .application import (
     DeletedDraftCleanupResult, FinalPublishDryRunResult, ImageObservationResult,
@@ -10,13 +13,16 @@ from .application import (
     PublishContinueDiagnosticResult, PublishInspectionResult, SocialPreviewReadOnlyResult,
     StoryStatus,
 )
-from .browser.publish_validate import ValidationStatus
-from .browser.publish_inspect import AttributeEvidence
 from .state import BodyStatus, ImageStatus, PublicationReassociation, PublicationState, PublicationStatus, SubtitleStatus
-from .browser.substack import AuthenticationState, SessionResult
+
+if TYPE_CHECKING:
+    from .browser.publish_inspect import AttributeEvidence
+    from .browser.substack import SessionResult
 
 
 def format_substack_session(result: SessionResult) -> str:
+    from .browser.substack import AuthenticationState
+
     labels = {
         AuthenticationState.AUTHENTICATED: "Authenticated",
         AuthenticationState.NOT_AUTHENTICATED: "Not authenticated",
@@ -433,6 +439,8 @@ def format_substack_publish_inspection(
 
 
 def format_final_publish_validation(result: FinalPublishDryRunResult) -> str:
+    from .browser.publish_validate import ValidationStatus
+
     validation = result.validation
     screen = result.inspection.final_screen
     status_labels = {

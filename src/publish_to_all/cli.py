@@ -16,7 +16,6 @@ from .application import (
     diagnose_substack_final_action, publish_substack, authorize_substack_retry,
     inspect_substack_history, retire_substack_test_publication, start_new_substack_cycle,
 )
-from .browser.substack import AuthenticationState, inspect_substack_session
 from .errors import PublishToAllError
 from .medium_assist import complete_medium, prepare_medium, serve_medium_assist
 from .presentation import (
@@ -345,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             print(format_substack_title(repair_substack_title(Path("."))))
             return 0
         if args.command in ("substack-login", "substack-session"):
+            from .browser.substack import AuthenticationState, inspect_substack_session
+
             result = inspect_substack_session(
                 Path("."), debug=getattr(args, "debug", False), complete_login=_complete_manual_login if args.command == "substack-login" else None,
             )

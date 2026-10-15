@@ -283,7 +283,7 @@ def test_command_requires_verified_authenticated_editor_before_write(
     fake_browser(monkeypatch)
     monkeypatch.setattr(reconcile, 'verify_supplied_draft', lambda *_: evidence)
     add = MagicMock()
-    monkeypatch.setattr(application.SubstackBodyPublisher, 'add_body', add)
+    monkeypatch.setattr(SubstackBodyPublisher, 'add_body', add)
     assert main(['substack-body']) == 1
     add.assert_not_called()
     assert repository.require_body_candidate(story.source_hash, 'substack') == record
@@ -301,7 +301,7 @@ def test_command_opens_only_recorded_draft_and_formats_success(tmp_path, monkeyp
         active = repository.mark_body_inserting(current)
         return repository.mark_body_inserted(active.id)
 
-    monkeypatch.setattr(application.SubstackBodyPublisher, 'add_body', succeed)
+    monkeypatch.setattr(SubstackBodyPublisher, 'add_body', succeed)
     assert main(['substack-body']) == 0
     check.assert_called_once_with(page, URL, DRAFT, runtime_paths(tmp_path / 'project').diagnostics)
     page.goto.assert_not_called()

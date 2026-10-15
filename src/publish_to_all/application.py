@@ -12,22 +12,29 @@ from .state import (
     DeletedDraftRemoval, PublicationReassociation, PublicationRecord,
     PublicationRepository, StoryVersion,
 )
-from .browser.session import persistent_browser
 from .browser.public_post import (
     PublicPostVerification, validate_test_public_url,
     verify_test_public_post,
 )
-from .browser.substack import AuthenticationState, collect_diagnostics, verify_page
 from .errors import BrowserSessionError, SubstackRateLimitError
-from .publishers.substack import (
-    SubstackBodyPublisher, SubstackImagePublisher, SubstackPublisher,
-    SubstackSubtitlePublisher, SubstackTitleRepairPublisher,
-)
 
 if TYPE_CHECKING:
     from .browser.subtitle_reconcile import SubtitleEvidence
     from .browser.publish_execute import PublishExecutionResult
     from .browser.publish_validate import FinalPublishValidation
+
+
+def persistent_browser(*args, **kwargs):
+    """Keep the browser boundary patchable without importing Playwright eagerly."""
+    from .browser.session import persistent_browser as open_browser
+
+    return open_browser(*args, **kwargs)
+
+
+def verify_page(*args, **kwargs):
+    from .browser.substack import verify_page as check_page
+
+    return check_page(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -233,7 +240,6 @@ def inspect_substack_publish(
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.image_observe import inspect_social_preview_image
-    from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_inspect import (
         inspect_continue_candidates, install_mutation_guard, select_continue_control,
     )
@@ -386,6 +392,7 @@ def publish_substack(root: Path, *, dry_run: bool = False) -> 'PublishExecutionR
     import json
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.substack import AuthenticationState
     from .browser.publish_preflight import verify_prepared_content
     from .browser.image_observe import inspect_social_preview_image
     from .browser.publish_execute import GuardedFinalPublishExecutor, PublishPreconditions
@@ -673,6 +680,9 @@ def forget_deleted_substack_draft(
 
 
 def prepare_substack_draft(root: Path) -> StoryStatus:
+    from .browser.substack import AuthenticationState, collect_diagnostics
+    from .publishers.substack import SubstackPublisher
+
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
     story = inspection.story
@@ -721,6 +731,7 @@ def add_substack_body(root: Path) -> StoryStatus:
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+    from .publishers.substack import SubstackBodyPublisher, SubstackSubtitlePublisher
 
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
@@ -782,6 +793,7 @@ def add_substack_subtitle(root: Path) -> StoryStatus:
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+    from .publishers.substack import SubstackSubtitlePublisher
 
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
@@ -945,6 +957,7 @@ def add_substack_image(root: Path) -> StoryStatus:
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.image import validate_upload_image
+    from .publishers.substack import SubstackImagePublisher
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
 
     inspection = inspect_project(root)
@@ -1227,6 +1240,7 @@ def repair_substack_title(root: Path) -> StoryStatus:
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
     from .browser.reconcile import validate_supplied_draft_url, verify_supplied_draft
+    from .publishers.substack import SubstackTitleRepairPublisher
 
     inspection = inspect_project(root)
     publication_url = inspection.config.require_substack()
@@ -1509,6 +1523,7 @@ def reconcile_substack(
     """Read-only remotely; optionally link locally with corroborating attempt URL."""
     from playwright.sync_api import Error as PlaywrightError
     from .browser.body import RateLimitMonitor
+    from .browser.substack import AuthenticationState
     from .browser.reconcile import (
         inspect_drafts, DraftEvidence, SuppliedDraftEvidence, supplied_draft_diagnostics,
         validate_supplied_draft_url, verify_supplied_draft, verified_not_published_evidence,

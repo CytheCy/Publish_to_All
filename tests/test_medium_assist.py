@@ -4,8 +4,12 @@ from contextlib import contextmanager
 from html.parser import HTMLParser
 from http.client import HTTPConnection
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from threading import Thread
+import tomllib
 
 import pytest
 
@@ -241,3 +245,79 @@ def test_cli_surface_and_no_browser_open_on_completion(project, monkeypatch, cap
     with pytest.raises(SystemExit) as stopped:
         main(["medium-login"])
     assert stopped.value.code == 2
+
+
+def test_cli_starts_without_playwright_or_browser_automation(project):
+    """A fresh interpreter must start local commands with Playwright unavailable."""
+    script = """
+from http.client import HTTPConnection
+import importlib.abc
+import sys
+from threading import Event, Thread
+
+class NoPlaywright(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'playwright' or fullname.startswith('playwright.'):
+            raise ModuleNotFoundError("No module named 'playwright'", name='playwright')
+
+sys.meta_path.insert(0, NoPlaywright())
+from publish_to_all import cli
+from publish_to_all import medium_assist
+
+def assert_no_browser_automation():
+    blocked = ('publish_to_all.browser.session', 'publish_to_all.browser.substack',
+               'publish_to_all.publishers.substack', 'publish_to_all.browser.publish_inspect')
+    assert not any(name in sys.modules for name in blocked), blocked
+    assert 'playwright' not in sys.modules
+
+assert_no_browser_automation()
+ready = Event()
+servers = []
+original_make_server = medium_assist.make_server
+def capture_server(prepared):
+    server = original_make_server(prepared)
+    servers.append(server)
+    ready.set()
+    return server
+medium_assist.make_server = capture_server
+medium_assist.webbrowser.open = lambda url: None
+results = []
+thread = Thread(target=lambda: results.append(cli.main(['medium-assist', 'In/story.md'])), daemon=True)
+thread.start()
+assert ready.wait(5), 'Medium Assist did not start its local server'
+server = servers[0]
+try:
+    connection = HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+    connection.request('GET', '/')
+    response = connection.getresponse()
+    assert response.status == 200
+    assert b'Copy Title' in response.read()
+    connection.close()
+finally:
+    server.shutdown()
+thread.join(timeout=5)
+assert not thread.is_alive() and results == [0]
+assert_no_browser_automation()
+assert cli.main(['medium-complete', 'https://medium.com/@writer/story-123']) == 0
+assert_no_browser_automation()
+for command in ('check', 'preview', 'status'):
+    assert cli.main([command]) == 0
+    assert_no_browser_automation()
+"""
+    env = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(source_root), env.get("PYTHONPATH"))))
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=project, env=env,
+        capture_output=True, text=True, check=False, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Medium Assist: http://127.0.0.1:" in result.stdout
+    assert "Medium publication recorded" in result.stdout
+
+
+def test_playwright_is_only_a_substack_install_extra():
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    metadata = tomllib.loads(project_file.read_text(encoding="utf-8"))["project"]
+    assert all(not item.startswith("playwright") for item in metadata["dependencies"])
+    assert any(item.startswith("playwright") for item in metadata["optional-dependencies"]["substack"])

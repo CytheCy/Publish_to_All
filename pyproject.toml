@@ -7,13 +7,14 @@ name = "publish-to-all"
 version = "0.1.0"
 description = "Local story preparation for publishing destinations"
 requires-python = ">=3.11"
-dependencies = ["markdown-it-py>=3,<5", "PyYAML>=6,<7", "Pillow>=11,<13", "playwright>=1.51,<2"]
+dependencies = ["markdown-it-py>=3,<5", "PyYAML>=6,<7", "Pillow>=11,<13"]
 
 [project.scripts]
 publish-to-all = "publish_to_all.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+substack = ["playwright>=1.51,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

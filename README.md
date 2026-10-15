@@ -63,13 +63,15 @@ Use Python 3.11 or newer, from the project directory:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,substack]'
 python -m pytest
 ```
 
-Runtime dependencies are PyYAML for safe YAML parsing, markdown-it-py for
-CommonMark parsing and HTML rendering, Pillow to validate cover image contents,
-and Playwright for Chromium sessions. pytest is a development dependency.
+Core runtime dependencies are PyYAML for safe YAML parsing, markdown-it-py for
+CommonMark parsing and HTML rendering, and Pillow to validate cover image contents.
+Playwright is required only for Substack browser commands and is included in the
+`substack` extra. For Medium Assist without Playwright, install with
+`python -m pip install -e .`. pytest is a development dependency.
 
 ## Configuration
 
@@ -314,11 +316,11 @@ From the project directory, use the same virtual environment as the CLI:
 
 ```bash
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[substack]'
 python -m playwright install chromium
 ```
 
-The dependency installation includes the Python Playwright package; the second
+The Substack extra includes the Python Playwright package; the second
 command downloads its matching Chromium runtime. Repeat the browser installation
 when upgrading Playwright. Substack browser commands require a graphical desktop
 because they launch a visible browser. On supported Linux systems, missing system

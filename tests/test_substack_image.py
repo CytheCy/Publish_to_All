@@ -1000,7 +1000,7 @@ def test_image_command_opens_only_linked_draft_and_formats_success(tmp_path, mon
         active = repository.mark_image_uploading(current)
         return repository.mark_image_uploaded(active)
 
-    monkeypatch.setattr(application.SubstackImagePublisher, 'upload_image', succeed)
+    monkeypatch.setattr(SubstackImagePublisher, 'upload_image', succeed)
     assert main(['substack-image']) == 0
     assert launched == [{'headless': False}]
     assert verify.call_args.args[:3] == (page, URL, DRAFT)
@@ -1044,7 +1044,7 @@ def reconciliation_command_setup(tmp_path, monkeypatch, cover_state, *, uncertai
     )
     upload = MagicMock(side_effect=AssertionError('reconciliation attempted an upload'))
     monkeypatch.setattr(image, 'upload_cover', upload)
-    monkeypatch.setattr(application.SubstackImagePublisher, 'upload_image', upload)
+    monkeypatch.setattr(SubstackImagePublisher, 'upload_image', upload)
     return story, repository, failed, page, verify, upload
 
 

@@ -11,6 +11,7 @@ from publish_to_all.browser import body, editor, reconcile, session, subtitle
 from publish_to_all.browser import subtitle_reconcile as recovery
 from publish_to_all.cli import main
 from publish_to_all.config import runtime_paths
+from publish_to_all.publishers.substack import SubstackBodyPublisher, SubstackSubtitlePublisher
 from publish_to_all.state import PublicationRepository, StateError, SubtitleStatus
 from publish_to_all.story import load_story
 
@@ -177,8 +178,8 @@ def test_empty_reconciliation_never_automatically_retries_and_allows_only_one_cl
     _, story, repo, _ = project
     remote[3].input_value.return_value = ''
     retry = MagicMock(side_effect=AssertionError('No automatic insertion'))
-    monkeypatch.setattr(application.SubstackSubtitlePublisher, 'add_subtitle', retry)
-    monkeypatch.setattr(application.SubstackBodyPublisher, 'add_body', retry)
+    monkeypatch.setattr(SubstackSubtitlePublisher, 'add_subtitle', retry)
+    monkeypatch.setattr(SubstackBodyPublisher, 'add_body', retry)
     monkeypatch.setattr(subtitle, 'insert_exact_subtitle', retry)
     result = run(project)
     retry.assert_not_called()

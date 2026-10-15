@@ -214,7 +214,7 @@ def test_command_opens_only_stored_draft_and_formats_success(tmp_path, monkeypat
         active = repository.mark_title_repairing(current)
         return repository.mark_title_repaired(active)
 
-    monkeypatch.setattr(application.SubstackTitleRepairPublisher, 'repair_title', succeed)
+    monkeypatch.setattr(SubstackTitleRepairPublisher, 'repair_title', succeed)
     assert main(['substack-title']) == 0
     verify.assert_called_once_with(
         page, URL, DRAFT, runtime_paths(root).diagnostics, rate_limit_monitor=ANY,
