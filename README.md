@@ -1049,112 +1049,48 @@ choice/title field. There is insufficient evidence to distinguish these cases.
 The local failed attempt has no recorded draft URL, so automatic association
 with a remote draft is intentionally unavailable for that attempt.
 
-## Medium Chrome extension
+## Medium Assist
 
-The Chrome extension is in [chrome-extension/](chrome-extension/README.md).
-Its popup inspects the Medium page opened in the normal signed-in Chrome profile.
-On the verified Import page, an extension-owned panel offers a guarded one-time
-source URL insertion. Once the exact source is verified, a separate on-page
-button permits one freshly guarded Medium Import activation on explicit request.
-The extension then observes the result, stops at a verified draft edit link or editor, or an
-ambiguous result, and never publishes.
+**Publish_to_All prepares the Medium post; the user pastes, reviews, and publishes it manually.**
 
-## Earlier Medium Playwright flow
-
-The CLI commands below remain implemented from the earlier approach. They are
-separate from the Chrome extension proof of concept.
+From the project directory, run:
 
 ```bash
-.venv/bin/publish-to-all medium-login
-.venv/bin/publish-to-all medium-session
-.venv/bin/publish-to-all medium-import-inspect
+publish-to-all medium-assist In/01_01_2040.md
 ```
 
-`medium-login` establishes a persistent Medium browser session manually. Chromium
-opens Medium in `~/.local/state/publish-to-all/browser-profile/medium/` (or
-`$XDG_STATE_HOME/publish-to-all/browser-profile/medium/`). It never uses the
-Substack profile. Complete Medium's supported flow yourself, including any email
-link/code or third-party sign-in. Keep credentials in the browser, do not save
-passwords in this profile, and press Enter in the terminal when finished. Enter
-starts a guarded authentication check and closes Chromium; it is not evidence of
-successful login. Ctrl+C/EOF closes the browser. Run only one command using this
-profile at a time. This private directory contains sensitive authentication data;
-keep it local and outside Git. No secrets are copied into config or SQLite.
+With only one Markdown story directly in `In/`, the story argument can be omitted.
+The command opens a small local page and prints its address. Keep the terminal
+open while using the copy buttons; press Ctrl+C to close the page's local server.
+The page shows the title, optional description/subtitle, counts, source hash, and
+a short preview.
 
-`medium-session` initializes Medium home, waits for observed security verification
-to complete, then navigates by GET to `https://medium.com/me`. It observes the actual
-redirect destination and rendered controls without assuming a profile URL. It
-reports `AUTHENTICATED`, `NOT_AUTHENTICATED`, `UNKNOWN`, or `RATE_LIMITED`.
-Authentication requires completed, unambiguous Medium navigation together with
-a profile's visible Edit profile control, or equally strong account evidence
-(Sign out plus account navigation). Cookies, an avatar, a Write link, and a public
-profile URL alone cannot establish authentication. A uniquely identified account
-menu may be opened using its observed menu semantics. No form is submitted or
-field modified. Sign in, Sign up, Get started, or a Welcome back heading establish
-signed-out UI only without conflicting account/profile evidence. A profile
-destination with signed-out controls returns `UNKNOWN` even without owner controls.
+The shortest workflow is:
 
-After each navigation settles, the session allows up to eight seconds for pending
-verification or rendered account evidence, including one second for rendering
-after completed verification. Incomplete/failed verification, ambiguous redirects,
-and unknown mutations fail closed; rate limits stop immediately without retries.
-Known telemetry stays blocked. The same mutation guard also checks each document
-redirect before transport because Playwright routing alone can skip redirect hops.
-Import and draft-creation destinations remain blocked. Reports include sanitized
-requested/final URLs, HTTP response hops, committed navigation, page title, and
-separate visible account and signed-out controls. A successful check in a new
-command demonstrates that authentication survived browser closure. Manual login
-and the separate import inspector retain their existing verification flow.
+1. Click **Copy Title**, then **Open Medium**. Paste the title in Medium.
+2. Click **Copy Body as Rich Text** and paste it into Medium's body. Numbered
+   story headings are copied as headings, with paragraphs and inline formatting.
+3. If wanted, click **Copy Subtitle** and paste it into Medium's subtitle field.
+   The front-matter `description` is used when present; otherwise `subtitle` is used.
+4. Review the post and click **Publish** yourself.
+5. Record the resulting public URL locally:
 
-`medium-import-inspect` navigates to and inspects Medium's Import interface without
-importing anything. **medium-import-inspect does not create a draft and does not submit a source URL.**
-It first verifies live authentication, discovers visible Stories/Import navigation
-links, and follows their observed, validated destinations. It never assumes the
-help center's menu path is the current UI. Ambiguous links or buttons without clear
-navigation semantics cause it to stop. It does not type, paste, fill, clear, submit,
-or trigger field validation. It reports the heading, empty URL field metadata,
-import button state, explanatory/canonical text, exits, and the last verified
-read-only step. Field entry begins the future Stage 2 boundary because on-input
-behavior cannot be verified without changing the field; the Import control's
-server effects remain untested.
+   ```bash
+   publish-to-all medium-complete https://medium.com/@writer/story-name-123456
+   ```
 
-Read-only commands block non-GET/HEAD/OPTIONS requests, content/import API paths,
-service workers, and WebSockets across the browser context. A small exact list of
-recognizable telemetry endpoints is classified separately but still blocked.
-This includes only the exact Medium origin/path `https://medium.com/cdn-cgi/rum`,
-whose performance-telemetry role is documented by
-[Cloudflare](https://developers.cloudflare.com/web-analytics/data-metrics/data-origin-and-collection/).
-The separate `EXPECTED SECURITY VERIFICATION` classification permits only HTTPS
-POSTs to host `medium.com` (default port or 443, without URL credentials), with
-path matching `^/cdn-cgi/challenge-platform/h/[^/]+/precursor/` and resource type
-`xhr` or `fetch`. The variant between `/h/` and `/precursor/` must be exactly one
-non-empty segment; the observed `b` and `g` values are not fixed identifiers.
-[Cloudflare documents Precursor](https://developers.cloudflare.com/cloudflare-challenges/precursor/)
-as browser session verification, which must be able to complete. These requests
-are reported as `EXPECTED SECURITY VERIFICATION — ALLOWED`; RUM remains
-`EXPECTED NON-MUTATING TELEMETRY — BLOCKED`. Once inspection has stopped, even
-Precursor is blocked. Other `/cdn-cgi/` paths receive no POST exception. Unknown
-POSTs (including GraphQL and other browser challenges) stop inspection;
-there is no generic Medium POST exception and no body inspection. An account UI
-that requires one of these requests needs a separate reviewed investigation, not
-a wider allowlist during this inspection.
+The copy buttons place both HTML and plain text on the clipboard for the body;
+title and subtitle use plain text. The page checks the source hash before each
+copy. If it reports `SOURCE_CHANGED_SINCE_PREPARATION`, rerun `medium-assist`.
+`medium-complete` records the exact story version, URL, and completion time in
+the local SQLite publication history. It requires that version to have been
+prepared, checks the URL's form locally, and warns without creating a duplicate
+when the version is already recorded as published. If several stories are in
+`In/`, pass the same story path after the URL.
 
-Safe JSON diagnostics and screenshots go under the existing local
-`diagnostics/` directory with private permissions. Screenshots redact text,
-images, and form values; JSON includes recognized controls, redacted URLs, and
-safe method/scheme/hostname/origin/path/resource-type/stage metadata for blocked
-requests. Precursor records only method, origin, sanitized path, resource type,
-stage, classification, and transport decision, plus aggregate lifecycle counts.
-Completion means the HTTP exchange finished, not authentication or Cloudflare
-acceptance; rendered account controls remain required. Endpoint paths retain their structure, with sensitive or opaque
-segments selectively replaced by `[redacted]`; page URLs use a fixed public
-path vocabulary, with profile paths represented as `/@[profile redacted]`.
-URL credentials, queries, fragments, cookies, headers, request
-bodies, browser storage, account identifiers, and raw Playwright exceptions are
-never reported. The Precursor variant is replaced by `[variant]`; every segment
-after `/precursor/` is redacted, including short values. Only the narrow security
-exception permits a POST.
-
-These commands need no story or Substack configuration and never open SQLite,
-create a publication attempt, change duplicate-protection state, or migrate the
-database. Medium import execution and final publishing are not implemented.
+The assist server listens only on `127.0.0.1`. It makes no Medium requests and
+does not use Medium authentication, draft IDs, or browser automation. Opening
+Medium is a link you activate yourself. The old Medium experiment is preserved
+on the `archive/medium-automation-experiment` branch. Ignored local browser-profile
+data under `extension-dev/.medium-draft-discovery/` is untouched and can be
+deleted manually later if no longer needed.

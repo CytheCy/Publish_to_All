@@ -529,6 +529,55 @@ class PublicationRepository:
         with self._connection() as connection:
             return self._lookup(connection, source_hash, destination, blocking=True)
 
+    def prepare_manual_publication(self, story: Story, destination: str) -> PublicationRecord:
+        """Remember an exact story version for a user-driven publication."""
+        if destination != "medium":
+            raise StateError("Manual preparation currently supports Medium only.")
+        with self._connection(write=True) as connection:
+            current = self._select_active_cycle(connection, story.source_hash, destination)
+            if current is not None:
+                if current.status not in {PublicationStatus.NOT_STARTED, PublicationStatus.PUBLISHED}:
+                    raise StateError("Existing Medium state cannot be prepared manually.")
+                return current
+            version = self._register(connection, story)
+            now = _now()
+            cursor = connection.execute(
+                """INSERT INTO publications
+                   (story_id, destination, status, created_at, updated_at, last_attempt_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (version.id, destination, PublicationStatus.NOT_STARTED, now, now, now),
+            )
+            connection.execute("UPDATE publications SET cycle_id = ? WHERE id = ?",
+                               (cursor.lastrowid, cursor.lastrowid))
+            return self._record(connection.execute(
+                "SELECT * FROM publications WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone())
+
+    def complete_manual_publication(
+        self, story: Story, destination: str, published_url: str,
+    ) -> tuple[PublicationRecord, bool]:
+        """Record the user's published URL once, without contacting the destination."""
+        if destination != "medium":
+            raise StateError("Manual completion currently supports Medium only.")
+        with self._connection(write=True) as connection:
+            current = self._select_active_cycle(connection, story.source_hash, destination)
+            if current is None:
+                raise StateError("This exact story version was not prepared. Run medium-assist first.")
+            if current.status == PublicationStatus.PUBLISHED:
+                return current, True
+            if current.status != PublicationStatus.NOT_STARTED:
+                raise StateError("Existing Medium state cannot be completed manually.")
+            now = _now()
+            connection.execute(
+                """UPDATE publications SET status = ?, published_url = ?, updated_at = ?
+                   WHERE id = ?""",
+                (PublicationStatus.PUBLISHED, published_url, now, current.id),
+            )
+            result = self._record(connection.execute(
+                "SELECT * FROM publications WHERE id = ?", (current.id,)
+            ).fetchone())
+            return result, False
+
     def latest_retired_publication(
         self, source_hash: str, destination: str,
     ) -> PublicationRecord | None:

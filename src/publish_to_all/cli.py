@@ -17,9 +17,8 @@ from .application import (
     inspect_substack_history, retire_substack_test_publication, start_new_substack_cycle,
 )
 from .browser.substack import AuthenticationState, inspect_substack_session
-from .browser.medium import run_medium, AuthenticationState as MediumAuthenticationState
-from .medium_presentation import format_medium
 from .errors import PublishToAllError
+from .medium_assist import complete_medium, prepare_medium, serve_medium_assist
 from .presentation import (
     format_check, format_preview, format_status, format_substack_body, format_substack_image,
     format_substack_subtitle,
@@ -40,14 +39,6 @@ def _complete_manual_login() -> None:
           "You may open your account menu to inspect your login. Keep the browser open.\n"
           "Do not enter passwords in this terminal. No draft will be created.", flush=True)
     input("When login is complete, press Enter here to verify and close the browser: ")
-
-
-def _complete_medium_login() -> None:
-    print("Complete Medium's supported sign-in flow manually in the browser.\n"
-          "Email links/codes or a third-party provider may be offered.\n"
-          "Keep all credentials and codes in the browser; do not enter them here.\n"
-          "Keep the browser open. Do not import or create a story.", flush=True)
-    input("When finished, press Enter here to check the session and close the browser: ")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,23 +190,28 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("substack-login", help="Log into Substack manually in a visible browser.")
     command = commands.add_parser("substack-session", help="Check the saved Substack browser session.")
     command.add_argument("--debug", action="store_true", help="Show redacted session diagnostics for any result.")
-    for name, description in (
-        ("medium-login", "Establish a persistent Medium browser session manually."),
-        ("medium-session", "Check Medium authentication read-only."),
-        ("medium-import-inspect", "Inspect Medium's Import interface read-only; does not create a draft or submit a source URL."),
-    ):
-        commands.add_parser(name, help=description, description=description)
+    command = commands.add_parser("medium-assist", help="Open a local page for manual Medium copy and paste.")
+    command.add_argument("story", nargs="?", help="Markdown story directly in In/; otherwise discover one story.")
+    command = commands.add_parser("medium-complete", help="Record a Medium URL after you publish manually.")
+    command.add_argument("published_url", help="Published HTTPS medium.com story URL.")
+    command.add_argument("story", nargs="?", help="Story directly in In/ if discovery is ambiguous.")
     args = parser.parse_args(argv)
     try:
-        if args.command in {"medium-login", "medium-session", "medium-import-inspect"}:
-            result = run_medium(
-                Path("."), complete_login=_complete_medium_login if args.command == "medium-login" else None,
-                inspect_import=args.command == "medium-import-inspect",
-            )
-            print(format_medium(result, inspect_import=args.command == "medium-import-inspect"))
-            return 0 if (result.authentication == MediumAuthenticationState.AUTHENTICATED
-                         and not result.stopped_reason
-                         and (args.command != "medium-import-inspect" or result.interface is not None)) else 1
+        if args.command == "medium-assist":
+            prepared, already_published = prepare_medium(Path("."), args.story)
+            if already_published:
+                print("Warning: this exact story version is already recorded as published on Medium.")
+            serve_medium_assist(prepared)
+            return 0
+        if args.command == "medium-complete":
+            record, already_published = complete_medium(Path("."), args.published_url, args.story)
+            if already_published:
+                print("Warning: this exact story version is already recorded as published on Medium."
+                      f"\nRecorded URL: {record.published_url}")
+            else:
+                print(f"Medium publication recorded.\nURL: {record.published_url}"
+                      f"\nCompleted at: {record.updated_at}")
+            return 0
         if args.command == 'substack-publish-reconcile':
             import json
             from .publication_reconcile import reconcile_publication
@@ -360,8 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except (EOFError, KeyboardInterrupt):
-        platform = "Medium" if args.command.startswith("medium-") else "Substack"
-        print(f"{platform} session check cancelled. No draft was created. Nothing was published.", file=sys.stderr)
+        print("Substack session check cancelled. No draft was created. Nothing was published.", file=sys.stderr)
         return 1
     print(report)
     return 0

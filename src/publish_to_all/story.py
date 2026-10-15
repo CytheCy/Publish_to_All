@@ -74,20 +74,24 @@ class ImageInfo:
 IMAGE_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 
 
-def discover_inputs(input_dir: Path) -> Inputs:
-    """Select one direct Markdown child and its unambiguous same-stem cover."""
+def discover_inputs(input_dir: Path, source: Path | None = None) -> Inputs:
+    """Select one direct Markdown child, or an explicit child, and its cover."""
     try:
         entries = sorted(input_dir.iterdir())
-        sources = [p for p in entries if p.suffix.lower() == ".md" and p.is_file()]
-        if not sources:
-            raise StoryError(f"No Markdown story file found in {input_dir}/.")
-        if len(sources) > 1:
-            names = "\n".join(p.name for p in sources)
-            raise StoryError(
-                f"Multiple story files found in {input_dir}/.\n\n{names}\n\n"
-                f"Leave only one story in {input_dir}/ before publishing."
-            )
-        source = sources[0]
+        if source is None:
+            sources = [p for p in entries if p.suffix.lower() == ".md" and p.is_file()]
+            if not sources:
+                raise StoryError(f"No Markdown story file found in {input_dir}/.")
+            if len(sources) > 1:
+                names = "\n".join(p.name for p in sources)
+                raise StoryError(
+                    f"Multiple story files found in {input_dir}/.\n\n{names}\n\n"
+                    f"Leave only one story in {input_dir}/ before publishing."
+                )
+            source = sources[0]
+        elif (source.parent.resolve() != input_dir.resolve()
+              or source.suffix.lower() != ".md" or not source.is_file()):
+            raise StoryError(f"Story must be a readable Markdown file directly in {input_dir}/: {source}")
         images = [p for p in entries if p.stem == source.stem and p.suffix.lower() in IMAGE_FORMATS]
         if len(images) > 1:
             names = "\n".join(p.name for p in images)
@@ -184,8 +188,8 @@ def count_words(tokens: list[Token]) -> int:
     return len(re.findall(r"\b\w+(?:['’\-]\w+)*\b", " ".join(blocks)))
 
 
-def load_story(input_dir: Path) -> Story:
-    inputs = discover_inputs(input_dir)
+def load_story(input_dir: Path, source: Path | None = None) -> Story:
+    inputs = discover_inputs(input_dir, source)
     try:
         source = inputs.source.read_bytes()
         text = source.decode("utf-8-sig")

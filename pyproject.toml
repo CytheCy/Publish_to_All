@@ -18,6 +18,9 @@ dev = ["pytest>=8,<10"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+publish_to_all = ["medium_assist.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
