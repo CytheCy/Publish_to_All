@@ -21,8 +21,8 @@ test("body clipboard item carries rich HTML and readable plain text", async () =
   assert.equal(await (await item.parts["text/plain"]).text(), "01\n\nParagraph");
 });
 
-test("title and subtitle clipboard items carry plain text only", async () => {
-  for (const kind of ["title", "subtitle"]) {
+test("title, subtitle, and topic clipboard items carry plain text only", async () => {
+  for (const kind of ["title", "subtitle", "topic/0"]) {
     const item = clipboardItemFor(kind, Promise.resolve({plain: "Prepared text"}), Item, Blob);
     assert.deepEqual(Object.keys(item.parts), ["text/plain"]);
     assert.equal(await (await item.parts["text/plain"]).text(), "Prepared text");

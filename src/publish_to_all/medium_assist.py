@@ -9,6 +9,8 @@ import secrets
 from urllib.parse import urlsplit
 import webbrowser
 
+from markdown_it import MarkdownIt
+
 from .config import runtime_paths
 from .errors import StoryError
 from .state import PublicationRepository, StateError
@@ -32,6 +34,7 @@ class PreparedMediumStory:
     heading_count: int
     paragraph_count: int
     preview_html: str
+    topics: tuple[str, ...]
 
 
 def load_medium_story(root: Path, source_argument: str | None = None) -> Story:
@@ -47,7 +50,7 @@ def load_medium_story(root: Path, source_argument: str | None = None) -> Story:
 def _inline_plain(token) -> str:
     return "".join(
         child.content if child.type in {"text", "code_inline", "html_inline"}
-        else " " if child.type in {"softbreak", "hardbreak"}
+        else "\n" if child.type in {"softbreak", "hardbreak"}
         else child.content if child.type == "image"
         else ""
         for child in token.children or ()
@@ -72,6 +75,15 @@ def story_blocks(story: Story) -> tuple[tuple[str, str], ...]:
 
 
 def prepare_medium_story(story: Story) -> PreparedMediumStory:
+    topics_path = story.source.with_suffix(".medium-topics.txt")
+    try:
+        topics = tuple(line.strip() for line in topics_path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        topics = ()
+    except (OSError, UnicodeError) as exc:
+        raise StoryError(f"Cannot read Medium topics from {topics_path}.") from exc
+    if len(topics) > 5 or any(not topic for topic in topics) or len(set(topics)) != len(topics):
+        raise StoryError("Medium topics must be one unique, non-empty topic per line (up to five).")
     blocks = story_blocks(story)
     plain = "\n\n".join(text if kind != "rule" else "———"
                          for kind, text in blocks if text or kind == "rule")
@@ -86,10 +98,12 @@ def prepare_medium_story(story: Story) -> PreparedMediumStory:
     return PreparedMediumStory(
         story.source, story.source_hash, story.metadata.title,
         story.metadata.description or story.metadata.subtitle,
-        plain, story.html.strip(), story.word_count, len(plain),
+        plain, MarkdownIt("commonmark", {"html": False, "breaks": True}).render(story.markdown).strip(),
+        story.word_count, len(plain),
         sum(kind == "heading" for kind, _ in blocks),
         sum(kind == "paragraph" for kind, _ in blocks),
         "\n".join(preview),
+        topics,
     )
 
 
@@ -105,6 +119,13 @@ def _page(prepared: PreparedMediumStory, token: str) -> str:
     subtitle = escape(prepared.subtitle) if prepared.subtitle else None
     subtitle_display = f'<p class="subtitle">{subtitle}</p>' if subtitle else ""
     subtitle_button = '<button type="button" data-copy="subtitle">Copy Subtitle</button>' if subtitle else ""
+    topic_buttons = "\n".join(
+        f'<button type="button" data-copy="topic/{index}">Copy {escape(topic)}</button>'
+        for index, topic in enumerate(prepared.topics)
+    )
+    topics_section = (f'<section aria-label="Medium topics"><h2>Topics</h2>'
+                      f'<p>Copy and paste each topic separately in Medium.</p>'
+                      f'<div class="controls">{topic_buttons}</div></section>') if topic_buttons else ""
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -142,6 +163,7 @@ button:hover,.open:hover {{ background:#105337; }}
 <button type="button" data-copy="body">Copy Body as Rich Text</button>
 <a class="open" href="{MEDIUM_WRITE_URL}" target="_blank" rel="noopener noreferrer">Open Medium</a>
 </div>
+{topics_section}
 <p id="copy-status" role="status" aria-live="polite"></p>
 <section class="preview" aria-label="Story preview"><h2>Preview</h2>{prepared.preview_html}</section>
 <p>Paste into Medium, review the post, and click Publish yourself.</p>
@@ -152,6 +174,7 @@ def make_server(prepared: PreparedMediumStory) -> ThreadingHTTPServer:
     token = secrets.token_urlsafe(24)
     script = (Path(__file__).with_name("medium_assist.js")).read_bytes()
     page = _page(prepared, token).encode("utf-8")
+    topic_paths = {f"/copy/topic/{index}": topic for index, topic in enumerate(prepared.topics)}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -188,7 +211,7 @@ def make_server(prepared: PreparedMediumStory) -> ThreadingHTTPServer:
             if not self._local_host():
                 self._respond(403, b"Forbidden", "text/plain; charset=utf-8")
                 return
-            if self.path not in {"/copy/title", "/copy/subtitle", "/copy/body"}:
+            if self.path not in {"/copy/title", "/copy/subtitle", "/copy/body"} | topic_paths.keys():
                 self._respond(404, b"Not found", "text/plain; charset=utf-8")
                 return
             expected_origin = f"http://127.0.0.1:{self.server.server_port}"
@@ -200,6 +223,11 @@ def make_server(prepared: PreparedMediumStory) -> ThreadingHTTPServer:
                 data = {"code": SOURCE_CHANGED,
                         "error": "Prepared source changed. Rerun medium-assist before copying."}
                 self._respond(409, json.dumps(data).encode(), "application/json; charset=utf-8")
+                return
+            if self.path in topic_paths:
+                payload = {"plain": topic_paths[self.path]}
+                self._respond(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                              "application/json; charset=utf-8")
                 return
             kind = self.path.rsplit("/", 1)[1]
             if kind == "subtitle" and prepared.subtitle is None:

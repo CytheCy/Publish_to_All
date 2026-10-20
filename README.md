@@ -1074,15 +1074,18 @@ The shortest workflow is:
    story headings are copied as headings, with paragraphs and inline formatting.
 3. If wanted, click **Copy Subtitle** and paste it into Medium's subtitle field.
    The front-matter `description` is used when present; otherwise `subtitle` is used.
-4. Review the post and click **Publish** yourself.
-5. Record the resulting public URL locally:
+4. If a matching `In/<story-name>.medium-topics.txt` file exists, use its separate
+   topic buttons to copy and paste each topic into Medium's publish dialog.
+   Put one topic per line in that file, with at most five unique topics.
+5. Review the post and click **Publish** yourself.
+6. Record the resulting public URL locally:
 
    ```bash
    publish-to-all medium-complete https://medium.com/@writer/story-name-123456
    ```
 
-The copy buttons place both HTML and plain text on the clipboard for the body;
-title and subtitle use plain text. The page checks the source hash before each
+The copy buttons place both HTML and plain text on the clipboard for the body,
+preserving source line breaks; title and subtitle use plain text. The page checks the source hash before each
 copy. If it reports `SOURCE_CHANGED_SINCE_PREPARATION`, rerun `medium-assist`.
 `medium-complete` records the exact story version, URL, and completion time in
 the local SQLite publication history. It requires that version to have been

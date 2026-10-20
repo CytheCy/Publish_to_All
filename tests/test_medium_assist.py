@@ -164,6 +164,36 @@ def test_body_html_escapes_raw_markup(project):
     assert "<script>" not in prepared.preview_html
 
 
+def test_body_copy_preserves_source_line_breaks(project):
+    (project / "In/story.md").write_text(
+        "---\ntitle: Story\n---\n# 01\nFirst **bold** line.\nSecond *italic* line.\n"
+    )
+    prepared = prepare_medium_story(load_medium_story(project))
+    assert prepared.body_plain == "01\n\nFirst bold line.\nSecond italic line."
+    assert "First <strong>bold</strong> line.<br />" in prepared.body_html
+    assert "Second <em>italic</em> line." in prepared.body_html
+
+
+def test_topics_have_separate_copy_buttons_and_payloads(project):
+    topics = ("SciFi", "Futurism", "Technology", "Emerging Technology", "Speculative Fiction")
+    (project / "In/story.medium-topics.txt").write_text("\n".join(topics) + "\n")
+    prepared = prepare_medium_story(load_medium_story(project))
+    assert prepared.topics == topics
+    with running_server(prepared) as server:
+        _, page, _ = request(server, "/")
+        token = page_token(page)
+        for index, topic in enumerate(topics):
+            assert f'data-copy="topic/{index}">Copy {topic}</button>' in page
+            status, body, _ = request(server, f"/copy/topic/{index}", method="POST", token=token)
+            assert status == 200
+            assert json.loads(body) == {"plain": topic}
+        assert request(server, "/copy/topic/5", method="POST", token=token)[0] == 404
+        (project / "In/story.md").write_text("---\ntitle: Changed\n---\nBody")
+        status, body, _ = request(server, "/copy/topic/0", method="POST", token=token)
+        assert status == 409
+        assert json.loads(body)["code"] == SOURCE_CHANGED
+
+
 def test_loopback_server_copy_payload_guard_and_no_directory_listing(project):
     prepared = prepare_medium_story(load_medium_story(project))
     with running_server(prepared) as server:
