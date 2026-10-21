@@ -12,6 +12,7 @@ from .errors import ConfigurationError
 @dataclass(frozen=True)
 class Config:
     publication_url: str | None = None
+    website_root: Path | None = None
 
     def require_substack(self) -> str:
         if self.publication_url is None:
@@ -31,13 +32,21 @@ def load_config(path: Path) -> Config:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         # Do not echo TOML contents: an incorrectly placed secret may be present.
         raise ConfigurationError(f"Cannot read valid TOML configuration: {path}") from exc
-    if set(data) - {"substack"}:
-        raise ConfigurationError("Only the [substack] configuration section is supported.")
+    if set(data) - {"substack", "website"}:
+        raise ConfigurationError("Only the [substack] and [website] configuration sections are supported.")
+    website = data.get("website", {})
+    if not isinstance(website, dict) or set(website) - {"site_root"}:
+        raise ConfigurationError("[website] accepts only site_root.")
+    website_root = website.get("site_root")
+    if website_root is not None and (not isinstance(website_root, str) or not website_root
+                                     or not Path(website_root).is_absolute()):
+        raise ConfigurationError("[website].site_root must be an absolute directory path.")
+    website_path = Path(website_root) if website_root is not None else None
     section = data.get("substack", {})
     if not isinstance(section, dict) or set(section) - {"publication_url"}:
         raise ConfigurationError("[substack] accepts only publication_url; do not put credentials here.")
     if "publication_url" not in section:
-        return Config()
+        return Config(website_root=website_path)
     value = section["publication_url"]
     message = "publication_url must be an HTTPS publication root URL without credentials, query, or fragment."
     if not isinstance(value, str) or not value or any(c.isspace() for c in value):
@@ -54,7 +63,7 @@ def load_config(path: Path) -> Config:
         valid = False
     if not valid:
         raise ConfigurationError(message)
-    return Config(value.rstrip("/"))
+    return Config(value.rstrip("/"), website_path)
 
 
 @dataclass(frozen=True)

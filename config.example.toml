@@ -1,2 +1,5 @@
 [substack]
 publication_url = "https://MY-PUBLICATION.substack.com"
+
+[website]
+site_root = "/absolute/path/to/in20xx"

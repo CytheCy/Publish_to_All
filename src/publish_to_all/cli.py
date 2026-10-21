@@ -18,6 +18,7 @@ from .application import (
 )
 from .errors import PublishToAllError
 from .medium_assist import complete_medium, prepare_medium, serve_medium_assist
+from .website import publish_website
 from .presentation import (
     format_check, format_preview, format_status, format_substack_body, format_substack_image,
     format_substack_subtitle,
@@ -194,8 +195,16 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("medium-complete", help="Record a Medium URL after you publish manually.")
     command.add_argument("published_url", help="Published HTTPS medium.com story URL.")
     command.add_argument("story", nargs="?", help="Story directly in In/ if discovery is ambiguous.")
+    command = commands.add_parser("website", help="Copy the story and banner to the local In 20xx site and build /read.")
+    command.add_argument("--site-root", type=Path, help="Website checkout root; overrides [website].site_root.")
+    command.add_argument("--replace", action="store_true", help="Update existing website files with this story version.")
     args = parser.parse_args(argv)
     try:
+        if args.command == "website":
+            result = publish_website(Path("."), args.site_root, replace=args.replace)
+            print(f"Website archive built\nStory: {result.source}\nBanner: {result.image}\n"
+                  f"Page: {result.page}\nArchive: {result.index}\nPath: {result.url_path}")
+            return 0
         if args.command == "medium-assist":
             prepared, already_published = prepare_medium(Path("."), args.story)
             if already_published:

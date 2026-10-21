@@ -1,8 +1,8 @@
 # Publish to All
 
 A local Python utility for preparing a finished Markdown story and its cover
-image for publishing destinations. Phase 1 targets Substack drafts for manual
-review, with no automatic final publication.
+image for publishing destinations. It builds stories into the local In 20xx
+website archive and supports guarded Substack publishing workflows.
 
 **Current milestone: guarded title, subtitle, body, and cover stages for a linked Substack draft.**
 `publish-to-all substack` still creates a title-only draft. The separate
@@ -21,6 +21,7 @@ In/
 └── Social.png
 src/publish_to_all/
     application.py            # project inspection and local status queries
+    website.py                # Hugo website copy and local build
     cli.py                    # argparse command entry point
     presentation.py           # human-readable reports
     config.py                 # local TOML and external runtime paths
@@ -92,6 +93,29 @@ Custom HTTPS publication domains are accepted. Credentials, ports, article
 paths, query strings, and fragments are rejected. No connectivity is checked.
 Missing configuration is allowed for offline checks; all Substack browser
 commands require a publication URL and fail clearly if it is missing. Do not put passwords, cookies, or tokens in configuration.
+
+## Publish to the In 20xx website
+
+Set the local Hugo checkout in the Git-ignored `config.toml`:
+
+```toml
+[website]
+site_root = "/home/cport/Git/in20xx"
+```
+
+Then run `publish-to-all website` from this repository. The command validates the
+single Markdown story in `In/` and its same-name banner image, copies both into
+the website's `content/read/`, and runs Hugo to rebuild the local `/read` archive
+and story page. It uses an installed Hugo binary or the website's pinned Podman
+image. The resulting static pages live under the website checkout's `read/`.
+`Social.png` is used only for Substack; the website uses the image matching the
+story filename. Source files in `In/` stay unchanged.
+
+You can override the configured checkout with `--site-root /absolute/path`.
+Existing website files with different content are protected; use `--replace` when
+updating a story already on the site. Re-running with unchanged files is safe.
+The command updates the local checkout only. Website deployment follows that
+repository's normal publishing process.
 
 ## Story format and validation
 

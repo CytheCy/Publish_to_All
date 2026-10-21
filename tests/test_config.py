@@ -19,6 +19,20 @@ def test_publication_root(tmp_path):
     assert load_config(path).require_substack() == "https://stories.example.org"
 
 
+def test_website_root(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(f'[website]\nsite_root = "{tmp_path / "in20xx"}"\n')
+    assert load_config(path).website_root == tmp_path / "in20xx"
+
+
+@pytest.mark.parametrize("value", ['"relative/path"', '12', '""'])
+def test_invalid_website_root(tmp_path, value):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[website]\nsite_root = {value}\n")
+    with pytest.raises(ConfigurationError, match="site_root"):
+        load_config(path)
+
+
 @pytest.mark.parametrize("content", [
     "[broken", '[substack]\npublication_url = "http://example.com"',
     '[substack]\npublication_url = "https://user:secret@example.com"',
